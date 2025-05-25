@@ -19,6 +19,7 @@ event-prediction-in-diabetes-care/
 │   ├── transformer.py                 # Transformer architecture (GPT) + training
 │   ├── train.py                       # Full training pipeline (2-phase)
 │   ├── inference.py                   # Inference pipeline
+│   ├── evaluation.py                  # Evaluation module
 │   └── utils.py                       # Utility functions for the package (plots + loss penalties)
 │
 ├── data/                              # External data folder (for synthetic or real EMR)
@@ -144,7 +145,11 @@ python -m transform_emr.train
 
 python -m transform_emr.inference
 
-# Both modules have a __main__ activation to train / infer on a trained model 
+# Both modules have a __main__ activation to train / infer on a trained model
+
+# Or 
+python -m transform_emr.evaluation
+# NOTE: I would recommend pasting the content of this module to an .ipynb and analyse there.
 ```
 ---
 
@@ -280,6 +285,16 @@ Once the EMR structure is captured, the transformer learns to model sequential d
 |--------------------|---------------------------------------------------------------------------------------------------|
 | `get_token_embedding()` | Select a token and get it's embeddings based on an input embedder.                                 |
 | `infer_event_stream()` | Generate predicted stream of events on an input dataset (Test).                         |
+
+---
+
+### 5. **`evaluation.py`** – Evaluation of the model's performance based on the output .xlsx from `inference.py`.
+
+| Component           | Role                                                                                              |
+|--------------------|---------------------------------------------------------------------------------------------------|
+| `level="3class"` | Was the model able to predict a future RELEASE / COMPLICATION / DEATH?.                                 |
+| `level="multilabel"` | Was the model able to predict a future **specific** OUTCOME (from `dataset.config`).                         |
+| `level="time-aware"` | Was the model able to predict a future **specific** OUTCOME (from `dataset.config`) at the correct time?                         |
 
 ---
 
