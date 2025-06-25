@@ -19,7 +19,7 @@ event-prediction-in-diabetes-care/
 │   ├── transformer.py                 # Transformer architecture (GPT) + training
 │   ├── train.py                       # Full training pipeline (2-phase)
 │   ├── inference.py                   # Inference pipeline
-│   ├── evaluation.py                  # Evaluation module
+│   ├── evaluation.ipynb               # Evaluation notebook
 │   └── utils.py                       # Utility functions for the package (plots + loss penalties)
 │
 ├── data/                              # External data folder (for synthetic or real EMR)
@@ -146,10 +146,6 @@ python -m transform_emr.train
 python -m transform_emr.inference
 
 # Both modules have a __main__ activation to train / infer on a trained model
-
-# Or 
-python -m transform_emr.evaluation
-# NOTE: I would recommend pasting the content of this module to an .ipynb and analyse there.
 ```
 ---
 
@@ -288,13 +284,16 @@ Once the EMR structure is captured, the transformer learns to model sequential d
 
 ---
 
-### 5. **`evaluation.py`** – Evaluation of the model's performance based on the output .xlsx from `inference.py`.
+### 5. **`evaluation.ipynb`** – Evaluation of the model's performance based on dynamic activations of `inference.py`.
 
 | Component           | Role                                                                                              |
 |--------------------|---------------------------------------------------------------------------------------------------|
-| `level="3class"` | Was the model able to predict a future RELEASE / COMPLICATION / DEATH?.                                 |
-| `level="multilabel"` | Was the model able to predict a future **specific** OUTCOME (from `dataset.config`).                         |
-| `level="time-aware"` | Was the model able to predict a future **specific** OUTCOME (from `dataset.config`) at the correct time?                         |
+| `evaluate_events` | Calculates full classification evaluation methods given gold-standard DataFrame and generated DataFrame.                                 |
+| `evaluate_across_k` | Handles Inference + Evaluation from pre-trained model across all K.                 |
+| `plot_metrics_trend` | Plots global evaluation over K. |
+| `build_3x_matrix` | Was the model able to predict a future RELEASE / COMPLICATION EATH?.                                 |
+| `build_full_outcome_matrix` | Was the model able to predict a future **specific** OUTCOME (from `dataset.config`).                         |
+| `build_timeaware_matrix` | Was the model able to predict a future **specific** OUTCOME (from `dataset.config`) at the correct time?                         |
 
 ---
 
