@@ -53,14 +53,24 @@ def get_multi_hot_targets(position_ids, padding_idx, vocab_size, k):
 
 def get_penalty_weight(epoch, max_weight=TRAINING_SETTINGS.get("penalty_weight")):
     """
-    Allows the model slow increase of penalty in order to first learn basic patterns and then improve them.
+    Penalty weight schedule:
+    - [0, warmup): 0.0 (no penalty)
+    - [warmup, 2*warmup): sharp sigmoid ramp-up
+    - [2*warmup, ∞): max_weight
     """
-    # Sigmoid-based non-linear ramp-up over first N epochs
     warmup = TRAINING_SETTINGS.get("warmup_epochs")
-    if epoch >= warmup:
+
+    if epoch < warmup:
+        return 0.0
+    elif epoch >= 2 * warmup:
         return max_weight
-    progress = epoch / warmup
-    return max_weight * (1 / (1 + exp(-12 * (progress - 0.5))))  # S-curve centered at 0.5
+
+    # progress ∈ [0, 1] over the ramp phase
+    progress = (epoch - warmup) / warmup
+    sharpness = 16  # Increase for steeper burst
+    weight = 1 / (1 + exp(-sharpness * (progress - 0.75)))
+
+    return max_weight * weight
 
 
 def penalty_meal_order(predicted_tokens, id2token, device=None):
