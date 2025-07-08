@@ -8,6 +8,8 @@ from tqdm import tqdm
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
+from transform_emr.config.model_config import *
+from transform_emr.utils import get_multi_hot_targets
 
 torch.serialization.add_safe_globals([
     EMRTokenizer,
@@ -25,10 +27,6 @@ torch.serialization.add_safe_globals([
     numpy.bool_,
     numpy.ufunc,
 ])
-
-# ───────── local code ─────────────────────────────────────────────────── #
-from transform_emr.config.model_config import *
-from transform_emr.utils import get_multi_hot_targets
 
 
 class Time2Vec(nn.Module):
@@ -177,7 +175,9 @@ class EMREmbedding(nn.Module):
         ev_vec = self.dropout(ev_vec) / self.scale                         # [B, 1, D]
 
         # --- [CTX] slot ---
-        ctx_vec = self.ctx_token + self.context_proj(patient_contexts)  # [B, D]
+        # Time embedding for context token with abs_ts = 0
+        ctx_time = self.time_proj(self.time2vec_abs(torch.zeros_like(abs_ts[:, :1])))  # [B, 1, D]
+        ctx_vec = self.ctx_token + self.context_proj(patient_contexts) + ctx_time.squeeze(1)  # [B, D]
         ctx_vec = ctx_vec.unsqueeze(1)                                  # [B, 1, D]
 
         seq = torch.cat([ctx_vec, ev_vec], dim=1)                       # [B, T+1, D]

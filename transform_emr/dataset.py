@@ -300,7 +300,15 @@ class EMRTokenizer:
         values = sorted(df['ValueToken'].unique())
         positions = sorted(df['PositionToken'].unique())
 
+        # Sort and inject special tokens in order
+        raw_concepts = [tok for tok in raw_concepts if tok not in special_tokens]
+        concepts = [tok for tok in concepts if tok not in special_tokens]
+        values = [tok for tok in values if tok not in special_tokens]
         positions = [tok for tok in positions if tok not in special_tokens]
+
+        raw_concepts = special_tokens + raw_concepts
+        concepts = special_tokens + concepts
+        values = special_tokens + values
         positions = special_tokens + positions
 
         token2id = {tok: i for i, tok in enumerate(positions)}
@@ -416,39 +424,51 @@ class EMRDataset(Dataset):
         return len(self.patient_ids)
 
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, allow_debug=False):
         """
         Returns the subset of records for 1 patient.
         """
         pid = self.patient_ids[idx]
         df = self.patient_groups[pid]
         
-        # Check each ID column
-        for col_name, vocab_dict in [
-            ("RawConceptID", self.tokenizer.rawconcept2id),
-            ("ConceptID", self.tokenizer.concept2id), 
-            ("ValueID", self.tokenizer.value2id),
-            ("PositionID", self.tokenizer.token2id)
-        ]:
-            ids = df[col_name].values
-            max_valid = len(vocab_dict) - 1
-            
-            if (ids > max_valid).any():
-                bad_ids = ids[ids > max_valid]
-                print(f"ERROR: Patient {pid} has out-of-bounds {col_name}: {bad_ids}")
-                print(f"  Valid range for {col_name}: [0, {max_valid}]")
-                print(f"  Actual range: [{ids.min()}, {ids.max()}]")
+        if allow_debug:
+            # Check each ID column
+            for col_name, vocab_dict in [
+                ("RawConceptID", self.tokenizer.rawconcept2id),
+                ("ConceptID", self.tokenizer.concept2id), 
+                ("ValueID", self.tokenizer.value2id),
+                ("PositionID", self.tokenizer.token2id)
+            ]:
+                ids = df[col_name].values
+                max_valid = len(vocab_dict) - 1
                 
-                # Show some examples of the problematic tokens
-                bad_positions = np.where(ids > max_valid)[0]
-                for pos in bad_positions[:3]:  # Show first 3
-                    print(f"  Position {pos}: {col_name}={ids[pos]}")
-                    if col_name == "PositionID":
-                        # Show the original token that caused this
-                        original_token = df.iloc[pos]["PositionToken"] 
-                        print(f"    Original token: '{original_token}'")
-                
-                raise ValueError(f"Found out-of-bounds {col_name} for patient {pid}")
+                if (ids > max_valid).any():
+                    bad_ids = ids[ids > max_valid]
+                    print(f"ERROR: Patient {pid} has out-of-bounds {col_name}: {bad_ids}")
+                    print(f"  Valid range for {col_name}: [0, {max_valid}]")
+                    print(f"  Actual range: [{ids.min()}, {ids.max()}]")
+                    
+                    # Show some examples of the problematic tokens
+                    bad_positions = np.where(ids > max_valid)[0]
+                    for pos in bad_positions[:3]:  # Show first 3
+                        print(f"  Position {pos}: {col_name}={ids[pos]}")
+                        if col_name == "PositionID":
+                            # Show the original token that caused this
+                            original_token = df.iloc[pos]["PositionToken"] 
+                            print(f"    Original token: '{original_token}'")
+                    
+                    raise ValueError(f"Found out-of-bounds {col_name} for patient {pid}")
+        
+        # === Prepend [CTX] row ===
+        ctx_row = {
+            "RawConceptID": self.tokenizer.rawconcept2id.get("[CTX]", 0),
+            "ConceptID": self.tokenizer.concept2id.get("[CTX]", 0),
+            "ValueID": self.tokenizer.value2id.get("[CTX]", 0),
+            "PositionID": self.tokenizer.token2id.get("[CTX]", 0),
+            "TimePoint": 0.0  # Inject context at time = 0
+        }
+        ctx_df = pd.DataFrame([ctx_row])
+        df = pd.concat([ctx_df, df], ignore_index=True)
 
         return {
             "raw_concept_ids": torch.tensor(df["RawConceptID"].values, dtype=torch.long),
