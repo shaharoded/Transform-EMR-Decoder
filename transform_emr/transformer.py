@@ -161,7 +161,8 @@ class GPT(nn.Module):
         self.abs_t_head = nn.Sequential(
             nn.Linear(cfg["embed_dim"], 16 * cfg["time2vec_dim"]),
             nn.ReLU(),
-            nn.Linear(16 * cfg["time2vec_dim"], 1)  # Output: scalar abs_t
+            nn.Linear(16 * cfg["time2vec_dim"], 1),  # Output: scalar abs_t
+            nn.Sigmoid()  # ← Bound output to [0,1]
         )
 
         self.apply(self._init_weights)
@@ -420,8 +421,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 penalty = training_settings["penalty_weight"] * penalty # Apply penalty weight
 
                 # Predict abs_ts[:, 1:] using model abs_t_head
-                true_delta = torch.clamp(batch["abs_ts"], 0.0, 1.0)  # [B, T], range [0,1]
-                pred_delta = torch.clamp(torch.sigmoid(abs_t_pred[:, 1:]), min=0.0, max=1.0) # shape: [B, T], range [0,1]
+                true_delta = torch.clamp(batch["abs_ts"], min=0.0, max=1.0)  # [B, T], range [0,1]
+                pred_delta = torch.clamp(abs_t_pred[:, 1:], min=0.0, max=1.0) # shape: [B, T], range [0,1]
                 
                 mask = (target_tokens != model.embedder.padding_idx).float()  # [B, T]
                 abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]

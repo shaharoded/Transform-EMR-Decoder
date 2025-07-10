@@ -31,26 +31,27 @@ def get_token_embedding(embedder, token: str) -> torch.Tensor:
 
 def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_position=0, tqdm_desc='Generating'):
     """
-    Generates a stream of events for each patient in the dataset.
-    NOTE: Inference generates a token every 1h for current version. An upgrade might try to infer the next token's 
-          relative time and use that time for generation.
+    Generates a stream of events for each patient in the dataset, using the predicted abs time as input to the next token.
+    If max_len is reached without generating a terminal token, the most probable terminal token is injected.
+
     Args:
         model: Trained GPT model.
         dataset: EMRDataset object (must contain all token components and context).
         max_len: Number of new tokens to generate.
-        temprature: Controls the model's creativity. >1 makes model more creative but can cause hallucinations
+        temperature: Controls the model's creativity. >1 makes model more creative but can cause hallucinations
         tqdm_position: Controls the TQDM hierarchy for the function that can be activated directly or externally.
         tqdm_desc: Controls the TQDM description for the function that can be activated directly or externally.
 
-    
     Returns:
-        DataFrame with PatientID, Step, Token, IsInput, IsOutcome, IsTerminal
+        DataFrame with PatientID, Step, Token, TimePoint, IsInput, IsOutcome, IsTerminal
     """
     tokenizer = model.embedder.tokenizer
     token2id = tokenizer.token2id
     id2token = tokenizer.id2token
     outcome_ids = {token2id[o] for o in OUTCOMES if o in token2id}
     terminal_ids = {token2id[t] for t in TERMINAL_OUTCOMES if t in token2id}
+    pad_id = token2id["[PAD]"]
+    mask_id = token2id["[MASK]"]
     
     device = next(model.parameters()).device
     rows = []
@@ -67,7 +68,6 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
         )
 
     for pid in tqdm(dataset.patient_ids, desc=tqdm_desc, position=tqdm_position, leave=False, dynamic_ncols=True):
-        if tqdm_position == 0: sleep(1)  # only when running from main thread
         df = dataset.patient_groups[pid]
         ctx_vec = torch.tensor(dataset.context_df.loc[pid].values, dtype=torch.float32).unsqueeze(0).to(device)
 
@@ -79,6 +79,8 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
         abs_ts      = torch.tensor([df["TimePoint"].tolist()], dtype=torch.float32, device=device)
 
         seq_len = pos_ids.size(1)
+        terminated = pos_ids[0, -1].item() in terminal_ids # Generated a terminal event
+        steps = 0
 
         # Log all inputs
         rows.append({
@@ -97,10 +99,12 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
                 "IsTerminal": int(tok_id in terminal_ids)
             })
             if tok_id in terminal_ids:
-                break
+                break # early stop on existing terminal
+        
+        if terminated:
+            continue  # skip generation
 
         # Begin autoregressive generation
-        steps = 0
         while steps < max_len:
             with torch.no_grad():
                 logits, abs_t_preds = model(
@@ -112,56 +116,63 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
                     context_vec=ctx_vec
                 )
                 next_logits = logits[:, -1, :]  # shape: [1, V]
-                
-                # Ensure no [MASK] as output
-                mask_id = model.embedder.tokenizer.token2id.get("[MASK]")
-                next_logits[0, mask_id] = -float("inf")
+                next_logits[0, mask_id] = -float("inf") # Ensure no [MASK] as output
+                next_logits[0, pad_id] = -float("inf") # Avoid selecting [PAD] token
 
                 # Softmax
                 next_probs = F.softmax(next_logits / temperature, dim=-1)
-
-                # Avoid selecting [PAD] token
-                pad_id = model.embedder.tokenizer.token2id["[PAD]"]
-                next_probs[0, pad_id] = 0.0
-                next_probs = next_probs / next_probs.sum()  # re-normalize to 1.0
-
                 next_token_id = torch.multinomial(next_probs, num_samples=1).item()
 
-            tok_str = id2token.get(next_token_id, f"<UNK_{next_token_id}>")
-            is_outcome = next_token_id in outcome_ids
-            is_terminal = next_token_id in terminal_ids
+                tok_str = id2token.get(next_token_id, f"<UNK_{next_token_id}>")
+                is_outcome = next_token_id in outcome_ids
+                is_terminal = next_token_id in terminal_ids
 
-            # Get model's prediction (normalized absolute time)
-            pred_abs_t_norm = abs_t_preds[0, -1].item()
-            pred_abs_t = pred_abs_t_norm * 336.0  # denormalize
+                # Get model's prediction (normalized absolute time)
+                # Enforce monotonicity: time must be >= last predicted time
+                pred_abs_t_norm = abs_t_preds[0, -1].item()
+                last_abs = abs_ts[0, -1].item()
+                pred_abs_t_norm = max(pred_abs_t_norm, last_abs)
+                pred_abs_t = pred_abs_t_norm * 336.0
 
-            # Enforce monotonicity: time must be >= last predicted time
-            last_time = abs_ts[0, -1].item() * 336.0
-            pred_abs_t = max(pred_abs_t, last_time)
-            pred_abs_t_norm = pred_abs_t / 336.0  # re-normalize
+                rows.append({
+                    "PatientID": pid,
+                    "Step": raw_ids.shape[1] + 1,
+                    "TimePoint": pred_abs_t,
+                    "Token": tok_str,
+                    "IsInput": 0,
+                    "IsOutcome": int(is_outcome),
+                    "IsTerminal": int(is_terminal)
+                })
 
-            rows.append({
-                "PatientID": pid,
-                "Step": raw_ids.shape[1] + 1,
-                "TimePoint": pred_abs_t,
-                "Token": tok_str,
-                "IsInput": 0,
-                "IsOutcome": int(is_outcome),
-                "IsTerminal": int(is_terminal)
-            })
+                if is_terminal:
+                    break
 
-            if is_terminal:
-                break
-
-            # Get generated tokens components for future decode
-            raw_id, concept_id, value_id = decode_token_components(tok_str)
-
-            raw_ids     = torch.cat([raw_ids, torch.tensor([[raw_id]], device=device)], dim=1)
-            concept_ids = torch.cat([concept_ids, torch.tensor([[concept_id]], device=device)], dim=1)
-            value_ids   = torch.cat([value_ids, torch.tensor([[value_id]], device=device)], dim=1)
-            pos_ids     = torch.cat([pos_ids, torch.tensor([[next_token_id]], device=device)], dim=1)
-            abs_ts = torch.cat([abs_ts, torch.tensor([[pred_abs_t_norm]], device=device)], dim=1)
-            steps += 1
+                # Update inputs
+                # Get generated tokens components for future decode
+                raw_id, concept_id, value_id = decode_token_components(tok_str)
+                raw_ids     = torch.cat([raw_ids, torch.tensor([[raw_id]], device=device)], dim=1)
+                concept_ids = torch.cat([concept_ids, torch.tensor([[concept_id]], device=device)], dim=1)
+                value_ids   = torch.cat([value_ids, torch.tensor([[value_id]], device=device)], dim=1)
+                pos_ids     = torch.cat([pos_ids, torch.tensor([[next_token_id]], device=device)], dim=1)
+                abs_ts      = torch.cat([abs_ts, torch.tensor([[pred_abs_t_norm]], device=device)], dim=1)
+                steps += 1
+        
+        # If max_len reached without terminal, forcibly add most likely terminal token
+        if steps == max_len:
+            with torch.no_grad():
+                terminal_logits = logits[:, -1, list(terminal_ids)]
+                best_idx = torch.argmax(terminal_logits).item()
+                terminal_token_id = list(terminal_ids)[best_idx]
+                terminal_token = id2token[terminal_token_id]
+                rows.append({
+                    "PatientID": pid,
+                    "Step": raw_ids.shape[1] + 1,
+                    "Token": terminal_token,
+                    "TimePoint": pred_abs_t,
+                    "IsInput": 0,
+                    "IsOutcome": 1,
+                    "IsTerminal": 1
+                })
 
     return pd.DataFrame(rows)
 
