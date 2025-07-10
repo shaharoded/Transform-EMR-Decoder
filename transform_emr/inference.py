@@ -119,7 +119,7 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
                 next_logits[0, mask_id] = -float("inf") # Ensure no [MASK] as output
                 next_logits[0, pad_id] = -float("inf") # Avoid selecting [PAD] token
 
-                # Softmax
+                # Softmax on logits + sample next token by this probability
                 next_probs = F.softmax(next_logits / temperature, dim=-1)
                 next_token_id = torch.multinomial(next_probs, num_samples=1).item()
 

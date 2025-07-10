@@ -399,7 +399,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
 
                 # Get predicted token IDs
-                pred_ids = pred_logits.argmax(dim=-1)              # [B, T]
+                pred_ids = pred_logits.argmax(dim=-1) # [B, T] — single token prediction per timestep, full block
 
                 # Debug:
                 if pred_ids.max().item() >= len(model.embedder.tokenizer.token2id):
