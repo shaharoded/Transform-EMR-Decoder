@@ -29,7 +29,7 @@ def get_token_embedding(embedder, token: str) -> torch.Tensor:
     return embedding
 
 
-def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_position=0, tqdm_desc='Generating'):
+def infer_event_stream(model, dataset, max_len=500, tqdm_position=0, tqdm_desc='Generating'):
     """
     Generates a stream of events for each patient in the dataset, using the predicted abs time as input to the next token.
     If max_len is reached without generating a terminal token, the most probable terminal token is injected.
@@ -38,7 +38,6 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
         model: Trained GPT model.
         dataset: EMRDataset object (must contain all token components and context).
         max_len: Number of new tokens to generate.
-        temperature: Controls the model's creativity. >1 makes model more creative but can cause hallucinations
         tqdm_position: Controls the TQDM hierarchy for the function that can be activated directly or externally.
         tqdm_desc: Controls the TQDM description for the function that can be activated directly or externally.
 
@@ -119,9 +118,8 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
                 next_logits[0, mask_id] = -float("inf") # Ensure no [MASK] as output
                 next_logits[0, pad_id] = -float("inf") # Avoid selecting [PAD] token
 
-                # Softmax on logits + sample next token by this probability
-                next_probs = F.softmax(next_logits / temperature, dim=-1)
-                next_token_id = torch.multinomial(next_probs, num_samples=1).item()
+                # Get next most probable token by the logits
+                next_token_id = torch.argmax(next_logits, dim=-1).item()
 
                 tok_str = id2token.get(next_token_id, f"<UNK_{next_token_id}>")
                 is_outcome = next_token_id in outcome_ids
