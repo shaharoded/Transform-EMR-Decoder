@@ -75,7 +75,8 @@ def infer_event_stream(model, dataset, max_len=500, tqdm_position=0, tqdm_desc='
         concept_ids = torch.tensor([df["ConceptID"].tolist()], dtype=torch.long, device=device)
         value_ids   = torch.tensor([df["ValueID"].tolist()], dtype=torch.long, device=device)
         pos_ids     = torch.tensor([df["PositionID"].tolist()], dtype=torch.long, device=device)
-        abs_ts      = torch.tensor([df["TimePoint"].tolist()], dtype=torch.float32, device=device)
+        # Re-normalize hours → [0,1] using the same 336h window (which were de-normalized for the df output)
+        abs_ts      = torch.tensor([df["TimePoint"].tolist()], dtype=torch.float32, device=device) / 336.0
 
         seq_len = pos_ids.size(1)
         terminated = pos_ids[0, -1].item() in terminal_ids # Generated a terminal event
@@ -129,7 +130,9 @@ def infer_event_stream(model, dataset, max_len=500, tqdm_position=0, tqdm_desc='
                 # Enforce monotonicity: time must be >= last predicted time
                 pred_abs_t_norm = abs_t_preds[0, -1].item()
                 last_abs = abs_ts[0, -1].item()
+                # Enforce monotonicity in normalized space
                 pred_abs_t_norm = max(pred_abs_t_norm, last_abs)
+                # de‑normalize for human‑readable time
                 pred_abs_t = pred_abs_t_norm * 336.0
 
                 rows.append({
