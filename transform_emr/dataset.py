@@ -48,6 +48,7 @@ class DataProcessor:
         self._truncate_after_terminal_event()
         self._normalize_time()
         self._expand_tokens()
+        self._insert_null_tokens(gap_hrs=3)
         if self.max_input_days:
             self._cut_after_k_days()
         
@@ -190,12 +191,12 @@ class DataProcessor:
         """
         df = self.df
         rows = []
-        for _, row in df.iterrows():
-            duration_sec = (row['EndDateTime'] - row['StartDateTime']).total_seconds()
+        for row in df.itertuples(index=False):
+            duration_sec = (row.EndDateTime - row.StartDateTime).total_seconds()
             is_state = duration_sec > min_state_duration_sec
 
-            base_token = f"{row['ConceptName']}_{row['Value']}" if row['Value'] not in ("True", "TRUE") else row['ConceptName']
-            concept = row['ConceptName']
+            base_token = f"{row.ConceptName}_{row.Value}" if row.Value not in ("True", "TRUE") else row.ConceptName
+            concept = row.ConceptName
             value = base_token
             if concept.endswith(('_STATE', '_TREND')):
                 raw_concept = concept.rsplit('_', 1)[0]
@@ -205,15 +206,15 @@ class DataProcessor:
 
             if is_state:
                 pos_tokens = ["START", "END"]
-                time_points = [row['RelStartTime'], row['RelEndTime']]
+                time_points = [row.RelStartTime, row.RelEndTime]
             else:
                 pos_tokens = [""]
-                time_points = [row['RelStartTime']]
+                time_points = [row.RelStartTime]
 
             for pos, tp in zip(pos_tokens, time_points):
                 full_token = f"{base_token}_{pos}" if pos else base_token
                 rows.append({
-                    'PatientID': row['PatientID'],
+                    'PatientID': row.PatientID,
                     'RawConcept': raw_concept,
                     'Concept': concept,
                     'ValueToken': value,
@@ -225,6 +226,50 @@ class DataProcessor:
 
         # --- Sort and compute time deltas ---
         self.df = df.sort_values(['PatientID', 'TimePoint'])
+    
+
+    def _insert_null_tokens(self, gap_hrs: int = 3) -> None:
+        """
+        Insert a single synthetic [NULL] token whenever there is a gap > `gap_hrs`
+        *and* no interval is open (open_stack==0).  Token is placed at gap midpoint.
+        """
+        if gap_hrs <= 0:
+            return
+
+        rows_out = []
+        for pid, grp in self.df.groupby("PatientID"):
+            grp = grp.sort_values("TimePoint")            # safety
+            open_stack, last_tp = 0, None
+
+            for row in grp.itertuples(index=False):
+                tp = row.TimePoint
+
+                # ---------- gap check ----------
+                if last_tp is not None:
+                    gap = tp - last_tp
+                    if gap >= gap_hrs and open_stack == 0:
+                        rows_out.append({
+                            "PatientID": pid,
+                            "RawConcept": "[NULL]",
+                            "Concept":    "[NULL]",
+                            "ValueToken": "[NULL]",
+                            "PositionToken": "[NULL]",
+                            "TimePoint":  last_tp + gap / 2
+                        })
+
+                # ---------- interval stack ----------
+                tok = row.PositionToken
+                if tok.endswith("_START"):
+                    open_stack += 1
+                elif tok.endswith("_END"):
+                    open_stack = max(0, open_stack - 1)
+
+                # ---------- keep real event ----------
+                rows_out.append(row._asdict())
+                last_tp = tp
+
+        # Replace dataframe
+        self.df = pd.DataFrame(rows_out)
 
 
     def _cut_after_k_days(self):
