@@ -157,7 +157,7 @@ class GPT(nn.Module):
             f"does not match embedder.position_embed ({vocab_size})"
         )
 
-        # Delta T prediction head (for regression of delta t from admission at each step -> When will each event occur?)
+        # Δt prediction head (for regression of Δt from admission at each step -> When will each event occur?)
         self.abs_t_head = nn.Sequential(
             nn.Linear(cfg["embed_dim"], 16 * cfg["time2vec_dim"]),
             nn.ReLU(),
@@ -345,11 +345,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     Returns:
         None. Saves model checkpoints and plots training curves.
     """
-    def set_embedder_frozen(model, freeze: bool):
-        for p in model.embedder.parameters():
-            p.requires_grad = not freeze
-        model.embedder.eval() if freeze else model.embedder.train()
+    # Create global training lookup Tensors once the tokenizer is available and move to device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    luts = build_luts(model.embedder.tokenizer)
+    luts = {k: v.to(device) if torch.is_tensor(v) else v for k,v in luts.items()}
 
     # Freeze embedder if requested
     # If not freeze, temporarly freeze for warmup phase
@@ -394,11 +393,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     def run_epoch(loader, train_flag=False):
         model.train() if train_flag else model.eval()
-        total_loss = 0.0
-        total_bce, total_penalty, total_dt = 0.0, 0.0, 0.0
+        total_loss = total_bce = total_penalty = total_dt = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
                 batch = {k: v.to(device) for k, v in batch.items()}
+
+                # === Original logits from Model ===
                 logits, abs_t_pred = model(
                     raw_concept_ids=batch["raw_concept_ids"],
                     concept_ids=batch["concept_ids"],
@@ -410,51 +410,64 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # logits is [B, T+1, V] due to [CTX] token prepending
                 # We want to predict tokens 1 to T given context + tokens 0 to T-1
-                pred_logits = logits[:, 1:, :]            # [B, T, V] - predictions for positions 1 to T
-                target_tokens = batch["targets"]          # [B, T] - targets for positions 1 to T
+                pred_logits = logits[:, 1:, :]            # [B, T, V] - predictions for positions 1 to T (no [CTX])
+                target_ids = batch["targets"]          # [B, T] - targets for positions 1 to T
+                
+                # === legality masks from Ground Truth + Targets ===
+                illegal_mask, bonus_mask = compute_legality_masks_tf(
+                                                target_ids,
+                                                luts["is_start"],
+                                                luts["is_end"],
+                                                luts["base_id"],
+                                                luts["start_ids_per_base"],
+                                                luts["end_ids_per_base"],
+                                                luts["meal_rank"],
+                                                luts["meal_pred_rank"],
+                                                luts["K_meals"],
+                                            )
+                # Apply masks BEFORE BCE so gradients learn legality
+                pred_logits = apply_masks_to_logits(
+                    pred_logits, illegal_mask, bonus_mask
+                )
+                # Get predicted token IDs
+                pred_ids = pred_logits.argmax(dim=-1) # [B, T] — single token prediction per timestep, full block
 
                 # Multi-hot targets
                 multi_hot = get_multi_hot_targets(
-                    position_ids=target_tokens,
+                    position_ids=target_ids,
                     padding_idx=model.embedder.padding_idx,
                     vocab_size=logits.size(-1),
                     k=training_settings["bce_k_window"]
                 )
 
-                # Main loss: BCE with logits
+                # === Loss: BCE with logits ===
                 loss_fn = nn.BCEWithLogitsLoss(pos_weight=model.embedder.tokenizer.token_weights.to(logits.device))
                 loss_bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
                 loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 
-                # Get predicted token IDs
-                pred_ids = pred_logits.argmax(dim=-1) # [B, T] — single token prediction per timestep, full block
-
-                # Debug:
-                if pred_ids.max().item() >= len(model.embedder.tokenizer.token2id):
-                    print("ERROR: Model is predicting invalid token IDs!")
-                    print("Check your model architecture - lm_head output size mismatch!")
-
-                # Load and normalize each penalty (∈ [0, 1])
-                generative_penalty = torch.tensor(0.0, device=logits.device)
-                p1 = penalty_meal_order(pred_ids, model.embedder.tokenizer.id2token, logits.device)
-                p2 = penalty_hallucinated_intervals(pred_ids, target_tokens, model.embedder.tokenizer.id2token, device=logits.device)
+                # === Loss: Structural penalties on output ===
+                # Load and normalize each penalty (∈ [0, 1]) -> No grad in functions decorator
+                p_meal = penalty_meal_order(pred_ids, luts["meal_rank"])
+                p_struct = penalty_interval_structure(pred_ids, target_ids, 
+                                                        luts["is_start"], luts["is_end"], luts["base_map"])
 
                 # Average the penalties to bound in [0, 1] + smooth
-                generative_penalty = torch.log1p((p1 + p2) / 2.0)
+                generative_penalty = torch.log1p((p_meal + p_struct) / 2.0)
                 generative_penalty = training_settings["phase2_penalty_weight"] * generative_penalty # Apply penalty weight
 
+                # === Loss: Δt + monotonicity ===
                 # Predict abs_ts[:, 1:] using model abs_t_head
                 true_delta = torch.clamp(batch["abs_ts"], min=0.0, max=1.0)  # [B, T], range [0,1]
                 pred_delta = torch.clamp(abs_t_pred[:, 1:], min=0.0, max=1.0)  # [B, T], range [0,1]
 
-                mask = (target_tokens != model.embedder.padding_idx).float()  # [B, T]
+                mask = (target_ids != model.embedder.padding_idx).float()  # [B, T]
 
                 # Base MSE loss
                 abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
                 abs_t_loss = (abs_t_loss * mask).sum() / mask.sum().clamp(min=1)
                 abs_t_loss = training_settings["phase2_dt_weight"] * abs_t_loss
 
-                # === Temporal Monotonicity Penalty ===
+                # Temporal Monotonicity Penalty ===
                 # Penalize predicted time going backwards: max(0, prev - curr)
                 delta_diff = pred_delta[:, 1:] - pred_delta[:, :-1]  # [B, T-1]
                 monotonic_penalty = F.relu(-delta_diff)              # only penalize decreases
@@ -462,9 +475,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 monotonic_penalty = (monotonic_penalty * monotonic_mask).sum() / monotonic_mask.sum().clamp(min=1)
                 abs_t_loss += training_settings["phase2_dt_monotonic_penalty"] * monotonic_penalty
 
-                # Combine all
+                # === Loss: Total Loss ===
                 loss = loss_bce + generative_penalty + abs_t_loss
 
+                # === Backprop and Log ===
                 if train_flag:
                     optimizer.zero_grad()
                     loss.backward()
