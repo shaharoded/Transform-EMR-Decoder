@@ -153,25 +153,14 @@ python -m transform_emr.inference
 
 Run all tests:
 
+Without validation prints:
 ```bash
 pytest tests/
 ```
 
-📝 If you have **not trained a model yet**, skip inference-related tests:
-
+With validation prints:
 ```bash
-pytest tests/test_dataset.py tests/test_embedder.py tests/test_utils.py tests/test_train_pipeline.py
-```
-
-⚠️ Inference tests assume the presence of:
-- `checkpoints/phase1/best_embedder.pt`
-- `checkpoints/phase1/scaler.pkl`
-- `checkpoints/phase2/best_transformer.pt`
-
-To fix size mismatch errors:
-```bash
-rm -r checkpoints/
-# Then rerun training
+pytest -q -s tests/
 ```
 
 ---

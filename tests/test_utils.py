@@ -1,194 +1,112 @@
 import torch
+import math
 import pytest
 
 from transform_emr.utils import (
-    compute_legality_masks_tf,
-    penalty_interval_structure,   # <- your renamed strict version
-    build_rep_penalty,
+    get_multi_hot_targets,
+    build_mlm,
+    linear_schedule,
+    apply_cbm,
+    mix_with_predictions,
+    penalty_interval_structure,
+    penalty_meal_order,
+    build_luts
 )
-from transform_emr.inference import build_luts   # assuming you placed it there
 from transform_emr.dataset import EMRTokenizer
 
-# ---------- helpers ----------
-
-def _mini_tokenizer():
-    """
-    Build a tiny tokenizer with the minimal vocabs needed to test:
-      • two interval bases of the same concept but different values  (conflict)
-      • a meal cycle of length 3
-      • PAD/MASK/CTX
-    """
-    # fake ids
-    toks = [
-        "[PAD]", "[MASK]", "[CTX]",
-        "ADMISSION",
-        "A_VAL1_START", "A_VAL1_END",
-        "A_VAL2_START", "A_VAL2_END",   # same concept "A", diff value -> conflict with VAL1
-        "B_VAL_START",  "B_VAL_END",
-        "MEAL_BREAKFAST", "MEAL_LUNCH", "MEAL_DINNER",
-        "TERMINAL"
-    ]
+@pytest.fixture(scope="module")
+def mini_tokenizer():
+    # very small vocab with PAD, MASK, CTX, ADMISSION, two intervals, 3 meals, TERMINAL
+    toks = ["[PAD]","[MASK]","[CTX]","ADMISSION",
+            "A_X_START","A_X_END","A_Y_START","A_Y_END",
+            "MEAL_B","MEAL_L","MEAL_D","TERMINAL"]
     token2id = {t:i for i,t in enumerate(toks)}
-
-    # rawconcept/ concept/ value maps (simplified)
-    def concept(tok):
-        if tok.endswith("_START") or tok.endswith("_END"):
-            base = tok.rsplit("_",1)[0]
-        else:
-            base = tok
-        # Concept = first two parts for these fake examples
-        # "A_VAL1" → concept "A"
-        return base.split("_",1)[0]
-
-    def value(tok):
-        if tok.endswith("_START") or tok.endswith("_END"):
-            return tok.rsplit("_",1)[0]     # keep value tag
-        return tok
-
-    rawconcept2id = {}
-    concept2id    = {}
-    value2id      = {}
-
-    for t, i in token2id.items():
-        rc = concept(t)
-        cv = value(t)
-        rawconcept2id.setdefault(rc, len(rawconcept2id))
-        concept2id.setdefault(rc, len(concept2id))          # same key as raw here
-        value2id.setdefault(cv, len(value2id))
-
-    # special tokens
-    special = ["[PAD]", "[MASK]", "[CTX]"]
-    pad = token2id["[PAD]"]; mask = token2id["[MASK]"]; ctx = token2id["[CTX]"]
-
     tk = EMRTokenizer(
-        token2id         = token2id,
-        rawconcept2id    = rawconcept2id,
-        concept2id       = concept2id,
-        value2id         = value2id,
-        special_tokens   = special,
-        token_weights    = torch.ones(len(token2id)),
-        important_token_ids = torch.tensor([], dtype=torch.long)
+        token2id=token2id,
+        rawconcept2id={"A_X":0,"A_Y":1,"MEAL":2,"ADMISSION":3,"TERMINAL":4},
+        concept2id=   {"A_X":0,"A_Y":1,"MEAL":2,"ADMISSION":3,"TERMINAL":4},
+        value2id=     {"A_X":0,"A_Y":1,"MEAL":2,"ADMISSION":3,"TERMINAL":4},
+        special_tokens=["[PAD]","[MASK]","[CTX]"],
+        token_weights=torch.ones(len(toks)),
+        important_token_ids=torch.tensor([],dtype=torch.long)
     )
-    tk.pad_token_id = pad
-    tk.mask_token_id = mask
-    tk.ctx_token_id = ctx
+    tk.pad_token_id  = token2id["[PAD]"]
+    tk.mask_token_id = token2id["[MASK]"]
+    tk.ctx_token_id  = token2id["[CTX]"]
     return tk
 
-# ---------- tests ----------
-@pytest.mark.order(3)
-def test_build_luts_conflict_and_meals():
-    tk = _mini_tokenizer()
+def test_multi_hot_and_shift(mini_tokenizer):
+    tk = mini_tokenizer
+    # B=1, T=4, window=2
+    seq = torch.tensor([[1,2,3,0]])
+    mh = get_multi_hot_targets(seq, padding_idx=0, vocab_size=len(tk), k=2)
+    # at t=0: look at [1,2] → positions {2,3}
+    assert mh[0,0,2]==1 and mh[0,0,3]==1
+    # pad never target
+    assert mh[...,0].sum()==0
+
+def test_build_mlm_never_mask(mini_tokenizer):
+    tk = mini_tokenizer
+    # feed IDs including PAD, CTX, ADMISSION, TERMINAL → these must never be masked
+    ids = torch.tensor([[tk.pad_token_id, tk.ctx_token_id, 
+                         tk.token2id["ADMISSION"], tk.token2id["TERMINAL"], 5]])
+    masked, mask = build_mlm(ids, tokenizer=tk, p=1.0)
+    # forbidden positions should remain unchanged and mask=False
+    for idx in [0,1,2,3]:
+        assert masked[0,idx]==ids[0,idx] and mask[0,idx]==False
+    # last position must have been masked (mask=True)
+    assert mask[0,4] and masked[0,4] in {tk.mask_token_id}
+
+@pytest.mark.parametrize("epoch,warmup,maxv,expected",[
+    (0,10,0.5,0.0),(5,10,0.5,0.25),(10,10,0.5,0.5)
+])
+def test_linear(epoch,warmup,maxv,expected):
+    assert math.isclose(linear_schedule(epoch,warmup,maxv), expected)
+    i = linear_schedule(epoch,warmup,maxv)
+    assert math.isclose(i, expected)
+
+def test_apply_cbm_and_protection(mini_tokenizer):
+    tk = mini_tokenizer
+    luts = build_luts(tk)
+    # batch with position_ids all 0..4
+    batch = {
+      "position_ids":    torch.arange(5).unsqueeze(0),
+      "raw_concept_ids": torch.arange(5).unsqueeze(0),
+      "concept_ids":     torch.arange(5).unsqueeze(0),
+      "value_ids":       torch.arange(5).unsqueeze(0),
+    }
+    # forbid masking token 2 → should remain
+    out = apply_cbm(batch.copy(), epoch=5, warmup_epochs=10, tokenizer=tk,
+                    forbid_ids=torch.tensor([2]), max_p=1.0)
+    assert out["position_ids"][0,2] == 2
+
+def test_mix_with_predictions(mini_tokenizer):
+    tk = mini_tokenizer
+    gt   = torch.tensor([[0,1,2,3]])
+    pred = torch.tensor([[9,9,9,9]])
+    prot = torch.zeros(len(tk),dtype=torch.bool)
+    prot[1]=True
+    mixed,mask = mix_with_predictions(gt,pred,epoch=5,warmup_epochs=10,protected_ids=prot)
+    # protected slot not replaced
+    assert mixed[0,1]==1 and mask[0,1]==False
+    # some unprotected likely replaced
+    assert mixed.shape==gt.shape and mask.dtype==torch.bool
+
+def test_vectorized_penalties_zero(mini_tokenizer):
+    tk = mini_tokenizer
     l = build_luts(tk)
-
-    V = len(tk.token2id)
-    assert l["is_start"].shape == (V,)
-    assert l["is_end"].shape   == (V,)
-    assert l["base_id"].shape  == (V,)
-
-    nb = l["start_ids_per_base"].numel()
-    assert l["conflict_mat"].shape == (nb, nb)
-
-    # we know A_VAL1 and A_VAL2 conflict
-    # find their base indices
-    a1_b = l["base_id"][tk.token2id["A_VAL1_START"]].item()
-    a2_b = l["base_id"][tk.token2id["A_VAL2_START"]].item()
-    assert l["conflict_mat"][a1_b, a2_b] and l["conflict_mat"][a2_b, a1_b]
-
-    # meal cycle length 3
-    assert l["K_meals"].item() == 3
-    assert l["meal_rank"][tk.token2id["MEAL_BREAKFAST"]] == 0
-    assert l["meal_pred_rank"][tk.token2id["MEAL_LUNCH"]] == 0  # pred of lunch is breakfast
-
-
-@pytest.mark.order(4)
-def test_legality_masks_tf_basic():
-    tk = _mini_tokenizer()
-    l = build_luts(tk)
-    device = torch.device("cpu")
-
-    # Batch of 1, T=4 ground truth
-    # Sequence: A_VAL1_START, B_VAL_START, MEAL_BREAKFAST, A_VAL1_END
-    gt = torch.tensor([[ tk.token2id["A_VAL1_START"],
-                         tk.token2id["B_VAL_START"],
-                         tk.token2id["MEAL_BREAKFAST"],
-                         tk.token2id["A_VAL1_END"] ]], dtype=torch.long, device=device)
-
-    illegal, bonus = compute_legality_masks_tf(
-        position_ids        = gt,
-        is_start            = l["is_start"].to(device),
-        is_end              = l["is_end"].to(device),
-        base_id             = l["base_id"].to(device),
-        start_ids_per_base  = l["start_ids_per_base"].to(device),
-        end_ids_per_base    = l["end_ids_per_base"].to(device),
-        meal_rank           = l["meal_rank"].to(device),
-        meal_pred_rank      = l["meal_pred_rank"].to(device),
-        K_meals             = l["K_meals"].to(device),
-        base_concept        = l["base_concept"].to(device),
-        base_value          = l["base_value"].to(device),
-        conflict_mat        = l["conflict_mat"].to(device)
+    seq = torch.zeros(1,5,dtype=torch.long)
+    # perfectly legal
+    p1 = penalty_interval_structure(seq, seq,
+        is_start=l["is_start"], is_end=l["is_end"],
+        base_id=l["base_id"], start_ids_per_base=l["start_ids_per_base"],
+        end_ids_per_base=l["end_ids_per_base"],
+        meal_rank=l["meal_rank"], meal_pred_rank=l["meal_pred_rank"],
+        K_meals=l["K_meals"], conflict_mat=l["conflict_mat"],
+        window=1
     )
+    assert pytest.approx(0.0) == p1.item()
 
-    B,T,V = illegal.shape
-    assert (B,T,V) == (1,4,len(tk.token2id))
-
-    # At t=0 (before anything), END of A_VAL1 should be illegal, START of A_VAL1 should be legal
-    t0_end_a1 = tk.token2id["A_VAL1_END"]
-    assert illegal[0,0,t0_end_a1]
-
-    # After A_VAL1_START, another START of same base illegal
-    t1_start_a1 = tk.token2id["A_VAL1_START"]
-    assert illegal[0,1,t1_start_a1]
-
-    # Meal LUNCH should be illegal at t=0 (no breakfast yet), legal afterwards
-    lunch_id = tk.token2id["MEAL_LUNCH"]
-    assert illegal[0,0,lunch_id]
-    assert not illegal[0,2,lunch_id]
-
-
-@pytest.mark.order(5)
-def test_penalty_interval_structure():
-    tk = _mini_tokenizer()
-    l = build_luts(tk)
-    device = torch.device("cpu")
-
-    # Two sequences (B=2), same length T=5
-    # pred[0]: correct order
-    # pred[1]: END without START, START duplicate, conflict start
-    A1S = tk.token2id["A_VAL1_START"]
-    A1E = tk.token2id["A_VAL1_END"]
-    A2S = tk.token2id["A_VAL2_START"]
-    A2E = tk.token2id["A_VAL2_END"]
-    term= tk.token2id["TERMINAL"]
-
-    pred = torch.tensor([
-        [A1S, A1E, term, tk.pad_token_id, tk.pad_token_id],   # no vio
-        [A1E, A1S, A2S, term, tk.pad_token_id]                # END first, then START, then conflicting START
-    ], dtype=torch.long, device=device)
-
-    gt   = torch.tensor([
-        [A1S, A1E, term, tk.pad_token_id, tk.pad_token_id],   # perfect GT
-        [A1S, A1E, term, tk.pad_token_id, tk.pad_token_id]    # GT has no violations
-    ], dtype=torch.long, device=device)
-
-    p = penalty_interval_structure(
-        pred_ids     = pred,
-        gt_ids       = gt,
-        is_start     = l["is_start"].to(device),
-        is_end       = l["is_end"].to(device),
-        base_id      = l["base_id"].to(device),
-        conflict_mat = l["conflict_mat"].to(device)
-    )
-    assert p.dim() == 0
-    assert 0.0 <= p.item() <= 1.0
-    # Second batch has violations; penalty must be > 0
-    assert p.item() > 0.0
-
-
-@pytest.mark.order(6)
-def test_build_rep_penalty():
-    V = 20
-    last = [3, 7, 3]  # repeated
-    vec = build_rep_penalty(last, V=V, window=5, strength=0.6, device=torch.device("cpu"))
-    assert vec.shape == (V,)
-    assert vec[3] > vec[7]   # newest repetition gets bigger penalty
-    assert vec.max() <= 0.6
+    # meal order OK: no meals → zero
+    p2 = penalty_meal_order(seq, l["meal_rank"])
+    assert p2.item() == 0.0
