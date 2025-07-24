@@ -110,6 +110,11 @@ def set_embedder_frozen(model, freeze: bool):
     model.embedder.eval() if freeze else model.embedder.train()
     
 
+def linear_schedule(epoch: int, warmup: int, max_val: float) -> float:
+    """Simple linear ramp from 0→max_val over `warmup` epochs."""
+    return max_val * min(epoch / warmup, 1.0)
+
+
 def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.15):
     """
     Transformer CBM (Curriculum by Masking) Helper.
@@ -126,13 +131,7 @@ def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.15):
     forbid_ids: LongTensor of ids that must never be masked (PAD, CTX, ADMISSION, TERMINALS...)
     max_ratio: float, max masking ratio of the input
     """    
-    def cbm_ratio(epoch, warmup_epochs, max_i=0.05, max_e=0.15):
-        frac = min(epoch / warmup_epochs, 1.0)
-        return max_i * frac, max_e * frac
-    
-    p = cbm_ratio(epoch, warmup_epochs, max_p)
-    if p <= 1e-6:  # nothing to do
-        return batch
+    p = linear_schedule(epoch, warmup_epochs, max_p)
 
     pos_ids = batch["position_ids"]
     device = pos_ids.device
@@ -177,6 +176,7 @@ def mix_with_predictions(
         epoch: int,
         warmup_epochs: int,
         protected_ids: torch.BoolTensor,
+        max_rate: float=0.3
     ) -> tuple[torch.LongTensor, torch.BoolTensor]:
     """
     Utility to mix ground-truth and predicted tokens in-batch,
@@ -187,21 +187,19 @@ def mix_with_predictions(
     Args:
       gt_ids        : [B, T] LongTensor of ground-truth token IDs
       pred_ids      : [B, T] LongTensor of argmax predictions
-      epoch         : int [0, max_epochs] Current epochs in training process
-      epoch         : int Number of warmup epochs in training process
+      epoch         : int [0, max_epochs], Current epochs in training process
+      warmup_epochs : int, Number of warmup epochs in training process
       protected_ids : [V] BoolTensor, True for tokens to keep from GT
+      max_rate      : float, Max ratio of real predictions in Teacher's Forcing batch.
+
 
     Returns:
       mixed_ids : [B, T] LongTensor
       mix_mask  : [B, T] BoolTensor, True where pred_ids replaced GT
-    """
-    def get_ss_rates(epoch, warmup_epochs, max_i=0.05, max_e=0.30):
-        frac = min(epoch / warmup_epochs, 1.0)
-        return max_i * frac, max_e * frac
-    
+    """    
     device = gt_ids.device
     B, T = gt_ids.shape
-    ss_rate = get_ss_rates(epoch, warmup_epochs)
+    ss_rate = linear_schedule(epoch, warmup_epochs, max_rate)
 
     # 1) Random swap mask
     rand_mask = torch.rand(B, T, device=device) < ss_rate
