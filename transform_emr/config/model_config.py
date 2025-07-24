@@ -23,14 +23,14 @@ MODEL_CONFIG = {
 TRAINING_SETTINGS = {
     "phase1_n_epochs": 100,
     "phase2_n_epochs": 80,
-    "warmup_epochs": 10,
-    "patience": 10,
+    "warmup_epochs": 5,
+    "patience": 5,
     "phase1_learning_rate": 5e-4,
     "phase2_learning_rate": 3e-4,
     "weight_decay": 1e-3,
     "max_cbm_ratio": 0.15, # Maximum ratio of [MASK] (curriculum) within the model's context window at batch.
     "batch_size": 8, # Number of patients processed concurrently
-    "bce_k_window": 5, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
+    "bce_k_window": 10, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
     "phase1_bce_weight": 1.0, # BCE loss weight, should be 1.
     "phase1_mlm_weight": 0.2, # MLM loss regulizer weight on the phase1 training task (= phase1_bce_weight / bce_k_window)
     "phase1_dt_weight": 0.1, # Weight for time regression loss component during phase 1

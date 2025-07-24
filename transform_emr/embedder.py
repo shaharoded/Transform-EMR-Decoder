@@ -308,6 +308,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     """
     Trains an EMREmbedding model using weighted k-step prediction loss, to allow for a softer loss penalty.
     IDEA: The exact order of the token is not really important, only the existance of important tokens and patterns.
+    Total Loss = λ1 * BCE + λ2 * MLM + λ3 * Time Loss (τt)
 
     Args:
         embedder (EMREmbedding): The embedding model with decoder.
@@ -443,15 +444,18 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         # Save last checkpoint
         embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last)
 
-        # Save best model
-        if vl_tot < best_val - 1e-4:
+        # Save best model        
+        if (vl_tot < best_val - 1e-4) and (epoch >= training_settings["warmup_epochs"]):
             best_val = vl_tot
             embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path)
+            bad_epochs = 0
+        elif epoch >= training_settings["warmup_epochs"]:
+            bad_epochs += 1
+            if bad_epochs >= training_settings["patience"]:
+                print("[Phase 1]: Early stopping triggered.")
+                break
         else:
-            if epoch >= training_settings["warmup_epochs"]:
-                bad_epochs += 1
-                if bad_epochs >= training_settings["patience"]:
-                    print("[Phase 1] Early stopping triggered.")
-                    break
+            # If warmup isn't complete - do nothing.
+            continue
 
     return embedder, train_losses, val_losses

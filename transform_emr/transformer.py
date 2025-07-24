@@ -329,10 +329,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     """
     Trains a Transformer-based EMR sequence model in Phase 2 (decoder stage),
     using a pretrained embedder and structured multi-loss optimization.
-    Total Loss = BCE + λ1 * Penalty + λ2 * Time Loss (τt)
+    Total Loss = λ1 * BCE + λ2 * Penalty + λ3 * Time Loss (τt)
 
-    Freezes the embedder for the initial `warmup_epochs`, then unfreezes and reconfigures
-    the optimizer to include it. Supports resume-from-checkpoint training.
+    Gradually applying curriculum and CBM during `warmup_epochs`, then implements early stopping based on best total loss. 
+    Supports resume-from-checkpoint training.
 
     Args:
         model (nn.Module): GPT decoder with attached EMREmbedding.
@@ -344,17 +344,19 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     Returns:
         None. Saves model checkpoints and plots training curves.
+
+    NOTE: Despite intention, this function currently not implementing curriculum. in order to do so, one must add after 
+    pred_ids are calculated (in run_epoch) the following additions:
+    if train_flag -> mix_with_predictions() from utils.py -> rebuild raw/concept/value from predicted position (define LUT?) ->
+    apply mix_mask to all modalities -> Second forward pass on mixed inputs.
     """
     # Create global training lookup Tensors once the tokenizer is available and move to device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     luts = build_luts(model.embedder.tokenizer)
     luts = {k: v.to(device) if torch.is_tensor(v) else v for k,v in luts.items()}
 
-    # Freeze embedder if requested
-    # If not freeze, temporarly freeze for warmup phase
-    freeze_epochs = training_settings["warmup_epochs"]
-    set_embedder_frozen(model, freeze=True)
-
+    # Allow embedder weights to update starting epoch 1
+    set_embedder_frozen(model, freeze=False)
     model.to(device)
     model.embedder.tokenizer.token_weights = model.embedder.tokenizer.token_weights.to(device)
     
@@ -372,8 +374,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     start_epoch = 0
     best_val = float("inf")
-    patience = training_settings.get("patience", 5)
-    wait = 0
+    bad_epochs = 0
 
     if resume and ckpt_last.exists():
         print(f"[GPT]: Resuming from checkpoint: {ckpt_last}")
@@ -391,12 +392,22 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     train_losses, val_losses = [], []
 
-    def run_epoch(loader, train_flag=False):
+    def run_epoch(loader, epoch, train_flag=False):
         model.train() if train_flag else model.eval()
         total_loss = total_bce = total_penalty = total_dt = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
                 batch = {k: v.to(device) for k, v in batch.items()}
+
+                # === Apply CBM on training batchs ===
+                if train_flag:
+                    batch = apply_cbm(batch, 
+                                      epoch, 
+                                      training_settings["warmup_epochs"], 
+                                      model.embedder.tokenizer, 
+                                      luts["forbid_mask_ids"], 
+                                      max_p=0.15
+                                      )
 
                 # === Original logits from Model ===
                 logits, abs_t_pred = model(
@@ -433,6 +444,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Get predicted token IDs
                 pred_ids = pred_logits.argmax(dim=-1) # [B, T] — single token prediction per timestep, full block
 
+                # === Loss: BCE with logits ===
                 # Multi-hot targets
                 multi_hot = get_multi_hot_targets(
                     position_ids=target_ids,
@@ -440,14 +452,13 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     vocab_size=logits.size(-1),
                     k=training_settings["bce_k_window"]
                 )
-
-                # === Loss: BCE with logits ===
+                # Calculate BCE loss
                 loss_fn = nn.BCEWithLogitsLoss(pos_weight=model.embedder.tokenizer.token_weights.to(logits.device))
                 loss_bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
                 loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 
                 # === Loss: Structural penalties on output ===
-                # Load and normalize each penalty (∈ [0, 1]) -> No grad in functions decorator
+                # Load and normalize each penalty (∈ [0, 1]) -> Active grad on penalty functions
                 p_meal = penalty_meal_order(pred_ids, luts["meal_rank"])
                 p_struct = penalty_interval_structure(pred_ids, target_ids, 
                                                         luts["is_start"], luts["is_end"], 
@@ -503,18 +514,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         )
     
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        # Handle unfreezing the embedder
-        if epoch == freeze_epochs:
-            print(f"[GPT]: Unfreezing embedder after {freeze_epochs} epochs.")
-            set_embedder_frozen(model, freeze=False)
-            # Re-initiate optimizer now that the embedder will update as well
-            optimizer = model.configure_optimizers(
-                weight_decay=training_settings["weight_decay"],
-                learning_rate=training_settings["phase2_learning_rate"],
-                betas=(0.9, 0.95)
-            )
-        tr_loss, tr_bce, tr_pen, tr_dt = run_epoch(train_dl, train_flag=True)
-        vl_loss, vl_bce, vl_pen, vl_dt = run_epoch(val_dl, train_flag=False)
+        tr_loss, tr_bce, tr_pen, tr_dt = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_pen, vl_dt = run_epoch(val_dl, epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
@@ -526,15 +527,18 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         # Save latest
         model.save(ckpt_last, epoch, best_val, optimizer, scheduler)
 
-        if vl_loss < best_val - 1e-3:
+        # Save best model 
+        if (vl_loss < best_val - 1e-3) and (epoch >= training_settings["warmup_epochs"]):
             best_val = vl_loss
             model.save(ckpt_path, epoch, best_val, optimizer, scheduler)
-            wait = 0
+            bad_epochs = 0
+        elif epoch >= training_settings["warmup_epochs"]:
+            bad_epochs += 1
+            if bad_epochs >= training_settings["patience"]:
+                print("[GPT]: Early stopping triggered.")
+                break
         else:
-            if epoch >= training_settings["warmup_epochs"]:
-                wait += 1
-                if wait >= patience:
-                    print("[GPT]: Early stopping triggered.")
-                    break
+            # If warmup isn't complete - do nothing.
+            continue
 
     plot_losses(train_losses, val_losses)
