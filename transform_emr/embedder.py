@@ -374,8 +374,9 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             if train_flag:
                 optimizer.zero_grad()
             
+            mlm_input_pos_ids = batch["position_ids"].clone() # To avoid in place modifications of the batch
             masked_pos_ids, mlm_mask = build_mlm(
-                batch["position_ids"],
+                mlm_input_pos_ids,
                 tokenizer=embedder.tokenizer,
                 p=0.15
             ) # MLM mask
@@ -439,9 +440,9 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         train_losses.append(tr_tot)
         val_losses.append(vl_tot)
 
-        print(f"[Phase-1] Epoch {epoch:03d} | "
-            f"--> Train={tr_tot:.4f} (BCE={tr_bce:.4f}  MLM={tr_mlm:.4f}  Δt={tr_dt:.4f}) | "
-            f"--> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  MLM={val_mlm:.4f}  Δt={vl_dt:.4f})")
+        print(f"""[Phase-1] Epoch {epoch:03d}
+            --> Train={tr_tot:.4f} (BCE={tr_bce:.4f}  MLM={tr_mlm:.4f}  Δt={tr_dt:.4f})
+            --> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  MLM={val_mlm:.4f}  Δt={vl_dt:.4f})""")
 
         # Save last checkpoint
         embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last)

@@ -43,26 +43,27 @@ def get_multi_hot_targets(position_ids: torch.Tensor,
     B, T = position_ids.shape
     device = position_ids.device
 
-    # One-hot: [B, T, V]
+    # One‐hot: [B, T, V]
     oh = F.one_hot(position_ids.clamp(min=0), num_classes=vocab_size).to(torch.float32)
-
-    # Cumulative sum over time dimension
     csum = oh.cumsum(dim=1)  # [B, T, V]
 
-    # Shifted cumulative sum by k steps to get counts at t+k
-    pad_tail = torch.zeros(B, k, vocab_size, device=device, dtype=csum.dtype)
-    csum_k = torch.cat([csum[:, k:], pad_tail], dim=1)  # [B, T, V]
+    # Build csum_k by shifting left k, then for tail positions repeat the last csum row
+    # 1) core = csum[:, k:] gives shape [B, T–k, V]
+    core   = csum[:, k:]                # sums through position k..T–1
+    # 2) tail = last csum vector repeated k times
+    last   = csum[:, -1:]               # shape [B, 1, V]
+    tail   = last.repeat(1, k, 1)       # shape [B, k, V]
+    # 3) concat back to length T
+    csum_k = torch.cat([core, tail], dim=1)  # [B, T, V]
 
-    # Tokens in (t+1 .. t+k]  => difference of cum-sums
+    # future counts in (t+1 .. t+k] = csum_k – csum
     future = (csum_k - csum).clamp_min_(0.0)
 
-    # Remove pad token if present
+    # never supervise PAD
     if 0 <= padding_idx < vocab_size:
         future[..., padding_idx] = 0.0
 
-    # Convert to binary multi-hot
-    targets = (future > 0).to(torch.float32)
-    return targets
+    return (future > 0).to(torch.float32)
 
 
 def build_mlm(ids, tokenizer, p=0.15):

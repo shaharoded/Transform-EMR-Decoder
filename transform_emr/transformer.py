@@ -520,9 +520,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        print(f"[Training Transformer]: Epoch {epoch:02d} | "
-            f"\n--> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, Pen={tr_pen:.4f}, Δt={tr_dt:.4f}) | "
-            f"\n--> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Δt={vl_dt:.4f})")
+        print(f"""[Training Transformer]: Epoch {epoch:02d}
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, Pen={tr_pen:.4f}, Δt={tr_dt:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Δt={vl_dt:.4f})""")
 
         # Save latest
         model.save(ckpt_last, epoch, best_val, optimizer, scheduler)
