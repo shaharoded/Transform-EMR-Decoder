@@ -317,13 +317,14 @@ class EMRTokenizer:
         special_tokens (List[str]): Special tokens like ["MASK"].
         token_weights (torch.Tensor): Weights used in loss to emphasize important tokens.
         important_token_ids (torch.Tensor): Token IDs with weight > 1.0.
+        token_counts (torch.Tensor): Token counts (distribution).
         pad_token_id (int): ID for padding token.
         mask_token_id (int): ID for MASK token.
         ctx_token_id (int): ID for context token.
         null_token_id (int): ID for NULL token.
     """
     def __init__(self, token2id, rawconcept2id, concept2id, value2id, special_tokens, 
-                 token_weights, important_token_ids):
+                 token_weights, important_token_ids, token_counts):
         self.token2id = token2id
         self.id2token = {i: tok for tok, i in token2id.items()}
         self.rawconcept2id = rawconcept2id
@@ -332,6 +333,7 @@ class EMRTokenizer:
         self.special_tokens = special_tokens
         self.token_weights = token_weights
         self.important_token_ids = important_token_ids
+        self.token_counts = token_counts
         
         # Validate presence of mandatory special tokens
         required_specials = ["[PAD]", "[MASK]", "[NULL]", "[CTX]"]
@@ -386,7 +388,14 @@ class EMRTokenizer:
         
         important_token_ids = (token_weights > 1.0).nonzero(as_tuple=True)[0]
 
-        return cls(token2id, rawconcept2id, concept2id, value2id, special_tokens, token_weights, important_token_ids)
+        # Add token distribution
+        count_series = df["PositionToken"].value_counts()
+        counts_vec   = torch.zeros(len(token2id), dtype=torch.long)
+        for tok, cnt in count_series.items():
+            counts_vec[token2id[tok]] = cnt
+
+        return cls(token2id, rawconcept2id, concept2id, value2id,special_tokens, token_weights, 
+                   important_token_ids, counts_vec)
     
 
     def save(self, path=os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
@@ -398,6 +407,7 @@ class EMRTokenizer:
             'special_tokens': self.special_tokens,
             'token_weights': self.token_weights,
             'important_token_ids': self.important_token_ids,
+            'token_counts': self.token_counts,
             'fingerprint': self.fingerprint()
         }, path)
 
@@ -414,7 +424,8 @@ class EMRTokenizer:
             value2id=obj['value2id'],
             special_tokens=obj['special_tokens'],
             token_weights=obj['token_weights'].to(device),
-            important_token_ids=obj['important_token_ids'].to(device)
+            important_token_ids=obj['important_token_ids'].to(device),
+            token_counts=obj['token_counts'].to(device)
         )
         tokenizer._loaded_fingerprint = obj.get('fingerprint')
         return tokenizer

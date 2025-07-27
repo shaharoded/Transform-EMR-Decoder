@@ -358,7 +358,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     # Allow embedder weights to update starting epoch 1
     set_embedder_frozen(model, freeze=False)
     model.to(device)
-    model.embedder.tokenizer.token_weights = model.embedder.tokenizer.token_weights.to(device)
     
     optimizer = model.configure_optimizers(
         weight_decay=training_settings["weight_decay"],
@@ -367,6 +366,15 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     )
 
     scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
+
+    criterion = FocalBCELoss.from_counts(
+                    counts=model.embedder.tokenizer.token_counts,
+                    beta=0.999,
+                    min_count=5,
+                    clip_max=8.0,
+                    gamma=1.5,
+                    reduction="mean",
+                ).to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -455,12 +463,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 multi_hot[illegal_mask] = 0   # zero‑out illegal targets
                 
                 # Label smoothing
-                ε = 0.05
-                multi_hot = multi_hot * (1 - ε) + ε       # ones → 0.95, zeros → 0.05
+                eps = 0.05
+                multi_hot = multi_hot * (1 - eps) + eps       # ones → 0.95, zeros → 0.05
                 
                 # Calculate Focal BCE loss
-                loss_fn  = FocalBCELoss(token_weights=model.embedder.tokenizer.token_weights.to(logits.device), gamma=1.5)
-                loss_bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
+                loss_bce = criterion(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
                 loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 
                 # === Loss: Structural penalties on output ===
@@ -476,10 +483,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # Average the penalties to bound in [0, 1] + smooth
                 generative_penalty = torch.log1p((p_meal + p_struct) / 2.0)
-                λpen = linear_schedule(epoch, 
+                lambda_pen = linear_schedule(epoch, 
                                        training_settings['warmup_epochs'], 
                                        training_settings["phase2_penalty_weight"])
-                generative_penalty = λpen * generative_penalty # Apply penalty weight
+                generative_penalty = lambda_pen * generative_penalty # Apply penalty weight
 
                 # === Loss: Δt + monotonicity ===
                 # Predict abs_ts[:, 1:] using model abs_t_head
@@ -491,10 +498,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Base MSE loss
                 abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
                 abs_t_loss = (abs_t_loss * mask).sum() / mask.sum().clamp(min=1)
-                λt = linear_schedule(epoch, 
+                lambda_t = linear_schedule(epoch, 
                         training_settings['warmup_epochs'], 
                         training_settings["phase2_dt_weight"])
-                abs_t_loss = λt * abs_t_loss
+                abs_t_loss = lambda_t * abs_t_loss
 
                 # Temporal Monotonicity Penalty ===
                 # Penalize predicted time going backwards: max(0, prev - curr)
@@ -502,10 +509,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 monotonic_penalty = F.relu(-delta_diff)              # only penalize decreases
                 monotonic_mask = mask[:, 1:] * mask[:, :-1]          # valid when both t and t-1 are not PAD
                 monotonic_penalty = (monotonic_penalty * monotonic_mask).sum() / monotonic_mask.sum().clamp(min=1)
-                λt_monotonic = linear_schedule(epoch, 
+                lambda_t_monotonic = linear_schedule(epoch, 
                         training_settings['warmup_epochs'], 
                         training_settings["phase2_dt_monotonic_penalty"])
-                abs_t_loss += λt_monotonic * monotonic_penalty
+                abs_t_loss += lambda_t_monotonic * monotonic_penalty
 
                 # === Loss: Total Loss ===
                 loss = loss_bce + generative_penalty + abs_t_loss

@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+from typing import Optional, Union
 
 
 # ───────── local code ─────────────────────────────────────────────────── #
@@ -18,44 +20,69 @@ from transform_emr.config.dataset_config import (
 
 class FocalBCELoss(nn.Module):
     """
-    Class-balanced focal BCE
-    • API-compatible with nn.BCEWithLogitsLoss
-    • token_weights  - per-token α vector  (Tensor[V])
-    • gamma          - focusing parameter (1-3 works well)
+    Focal BCE - drop-in for nn.BCEWithLogitsLoss to balance loss on rare tokens.
+    --------------------------------------------------
+    • Either pass a ready α-vector (same shape as `token_weights`)
+      OR build one from raw counts via `from_counts`.
+    • Everything (clipping, min_count floor, focal γ) is self-contained.
     """
+
+    # -------- factory ----------------------------------------------------
+    @classmethod
+    def from_counts(cls,
+                    counts: Union[torch.Tensor, np.ndarray],
+                    *,
+                    beta: float = 0.999,
+                    min_count: int = 5,
+                    clip_max: float = 8.0,
+                    gamma: float = 1.5,
+                    reduction: str = "mean"):
+        alpha = cls._calc_alpha(counts, beta=beta,
+                                min_count=min_count, clip_max=clip_max)
+        return cls(alpha_vector=alpha,
+                   gamma=gamma, reduction=reduction)
+
+    # -------- ctor -------------------------------------------------------
     def __init__(self,
-                 token_weights: torch.Tensor,
+                 alpha_vector: torch.Tensor,
+                 *,
                  gamma: float = 1.5,
-                 reduction: str = "mean"):
+                 reduction: str = "mean",
+                 clip_max: Optional[float] = 8.0):
         super().__init__()
-        self.register_buffer("alpha", token_weights.float().clone())
-        self.gamma     = gamma
+        alpha = alpha_vector.float().clone()
+        if clip_max is not None:
+            alpha.clamp_(max=clip_max)
+        self.register_buffer("alpha", alpha)
+        self.gamma = gamma
         self.reduction = reduction
 
-    def forward(self,
-                logits:  torch.Tensor,      # [B, T, V] or [*, V]
-                targets: torch.Tensor):     # same shape, {0,1}
-        # Binary cross‑entropy per element
+    # -------- fwd --------------------------------------------------------
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+        targets = targets.float()
+
         bce = F.binary_cross_entropy_with_logits(
             logits, targets, reduction="none")
 
-        # Probabilities and modulating factor
         probs   = torch.sigmoid(logits)
-        p_t     = probs*targets + (1-probs)*(1-targets)           # [*, V]
+        p_t     = probs*targets + (1.0 - probs)*(1.0 - targets)
         mod_fac = (1.0 - p_t).pow(self.gamma)
 
-        # Class‑balance α – broadcast to match logits shape
-        alpha_t = self.alpha.view(*([1]*(logits.ndim-1)), -1)     # […, V]
-        alpha_t = alpha_t*targets + (1-alpha_t)*(1-targets)
+        alpha = self.alpha.view(*([1]*(logits.ndim - 1)), -1)
+        alpha = alpha*targets + (1.0 - alpha)*(1.0 - targets)
 
-        loss = alpha_t * mod_fac * bce
+        loss = alpha * mod_fac * bce
+        if self.reduction == "mean": return loss.mean()
+        if self.reduction == "sum":  return loss.sum()
+        return loss  # "none"
 
-        if self.reduction == "mean":
-            return loss.mean()
-        elif self.reduction == "sum":
-            return loss.sum()
-        else:                       # "none"
-            return loss
+    # -------- helper -----------------------------------------------------
+    @staticmethod
+    def _calc_alpha(counts, *, beta, min_count, clip_max):
+        counts = torch.as_tensor(counts).float().clamp(min=min_count)
+        eff    = 1.0 - torch.pow(beta, counts)
+        alpha  = (1.0 - beta) / (eff + 1e-6)
+        return alpha.clamp(max=clip_max)
 
 
 def get_multi_hot_targets(position_ids: torch.Tensor,
