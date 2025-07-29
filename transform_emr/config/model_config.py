@@ -12,7 +12,7 @@ MODEL_CONFIG = {
       "ctx_dim": 20, # Fill manually once defined your context data.
       "time2vec_dim": 64,
       "embed_dim": 512,
-      "block_size": 512,  # //e.g. sequence length, number of tokens processed concurrently
+      "block_size": 1536,  # //e.g. sequence length, number of tokens processed concurrently
       "n_head": 8,
       "n_layer": 8,
       "dropout": 0.1,
@@ -23,8 +23,8 @@ MODEL_CONFIG = {
 TRAINING_SETTINGS = {
     "phase1_n_epochs": 100,
     "phase2_n_epochs": 100,
-    "warmup_epochs": 10,
-    "patience": 10,
+    "warmup_epochs": 5,
+    "patience": 5,
     
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 1e-4,
