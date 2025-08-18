@@ -335,6 +335,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     Gradually applying curriculum and CBM during `warmup_epochs`, then implements early stopping based on best total loss. 
     Supports resume-from-checkpoint training.
 
+    Logits are masked to ensure only legal tokens are predicted, targets are masked to ensure proper loss denominator,
+    and penalties are applied to encourage valid event sequences.
+
     Args:
         model (nn.Module): GPT decoder with attached EMREmbedding.
         train_dl (DataLoader): Training data loader.
@@ -471,11 +474,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = (target_ids != model.embedder.padding_idx).unsqueeze(-1)  # [B,T,1]
                 allowed   = (~illegal_mask) & valid_pos               
-                multi_hot[illegal_mask] = 0                   # zero‑out illegal targets
+                multi_hot &= ~illegal_mask    # zero‑out illegal targets
                 
-                # Calculate Focal BCE loss
-                eps = 0.01 # Label smoothing
-                raw_bce   = criterion(pred_logits, multi_hot * (1 - eps)) # [B,T,V], 1 → 0.95, 0 → 0
+                # Calculate Focal BCE loss (only valid positions)
+                eps = 0.01 # Label smoothing to avoid overconfidence
+                raw_bce   = criterion(pred_logits, multi_hot * (1 - eps)) # [B,T,V], 1 → 0.99, 0 → 0
                 loss_bce  = (raw_bce * allowed.float()).sum() / allowed.float().sum().clamp(min=1.0)
                 loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 
