@@ -20,7 +20,8 @@ event-prediction-in-diabetes-care/
 │   ├── train.py                       # Full training pipeline (2-phase)
 │   ├── inference.py                   # Inference pipeline
 │   ├── evaluation.ipynb               # Evaluation notebook
-│   └── utils.py                       # Utility functions for the package (plots + loss penalties)
+│   ├── utils.py                       # Utility functions for the package (plots + loss penalties)
+│   └── debug_tools.py                 # Debug loop for epochs (logits)
 │
 ├── data/                              # External data folder (for synthetic or real EMR)
 │   ├── generate_synthetic_data.ipynb  # A notebook that generates synthetic data similar in structure to original

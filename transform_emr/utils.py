@@ -527,6 +527,16 @@ def build_luts(tokenizer):
     }
     forbid_mask_ids = torch.tensor([tid for tid in forbid if tid is not None],
                                    dtype=torch.long)
+    
+    # ---- forbid list for Decoder ----
+    forbid = {
+        tokenizer.pad_token_id,
+        tokenizer.mask_token_id,
+        getattr(tokenizer, "ctx_token_id", None),
+        tokenizer.token2id.get(ADMISSION_TOKEN),
+    }
+    predict_block = torch.tensor([tid for tid in forbid if tid is not None],
+                                   dtype=torch.long)
 
     return {
         # per-token
@@ -546,6 +556,7 @@ def build_luts(tokenizer):
         "end_ids":   end_ids,
         "K_meals":   torch.tensor(K, dtype=torch.long, device=device),
         "forbid_mask_ids": forbid_mask_ids,
+        "predict_block": predict_block
     }
 
 
@@ -558,7 +569,8 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
                               meal_rank: torch.LongTensor,
                               meal_pred_rank: torch.LongTensor,
                               K_meals: torch.Tensor,
-                              conflict_mat: torch.BoolTensor):
+                              conflict_mat: torch.BoolTensor,
+                              predict_block: torch.BoolTensor):
     """
     Vectorized legality/bonus masks from GOLD prefix (teacher forcing).
 
@@ -686,6 +698,9 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
             # 4) apply to illegal/bonus
             illegal[:,:,v_ids] |= ~ok
             bonus  [:,:,v_ids] |=  ok
+    
+    # ---- Specials never to be predicted ----
+    illegal |= predict_block.view(1, 1, -1)   # broadcast [V] -> [B,T,V]
 
     return illegal, bonus
 

@@ -391,7 +391,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     illegal_ok, bonus_ok = compute_legality_masks_tf(
         seq_ok, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat']
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
     )
     for t_idx, tok in enumerate([low_s, low_e, pad]):
         assert not illegal_ok[0, t_idx, tok], (
@@ -403,7 +403,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     illegal_rev, _ = compute_legality_masks_tf(
         seq_rev, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat']
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
     )
     assert illegal_rev[0,0,low_e], "FSM violation should flag END when no START"
 
@@ -412,7 +412,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     illegal_conf, _ = compute_legality_masks_tf(
         seq_conf, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat']
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
     )
     assert illegal_conf[0,1,high_s], "CNF violation should flag conflicting High START"
 
@@ -421,7 +421,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     illegal_dup, _ = compute_legality_masks_tf(
         seq_dup, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat']
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
     )
     assert illegal_dup[0,1,low_s], "DUP violation should flag second START illegal"
 
@@ -437,7 +437,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     illegal_cycle, _ = compute_legality_masks_tf(
         seq_cycle, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat']
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
     )
     for t_idx, tok in enumerate([l_id, d, n, b, l_id]):
         assert not illegal_cycle[0, t_idx, tok], (
@@ -448,7 +448,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     illegal_bad, _ = compute_legality_masks_tf(
         seq_bad, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat']
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
     )
     assert illegal_bad[0, 1, b], "Meal order violation should flag Breakfast at t=1 for L→B"
 
@@ -468,7 +468,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     illegal_mix2, _ = compute_legality_masks_tf(
         seq_mix2, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat']
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
     )
     # dinner at pos2 should be legal (Lunch at pos0, low_s in between shouldn't matter)
     assert not illegal_mix2[0, 2, d], (
@@ -518,12 +518,12 @@ def test_penalty_interval_structure_and_meal_order(mini_tokenizer):
     )
     illegal_pred, _ = compute_legality_masks_tf(pred2, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'])
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block'])
     pred_illegal = illegal_pred.gather(2, pred2.unsqueeze(-1)).squeeze(-1)
     print("pred_illegal:", pred_illegal)          # e.g. tensor([[False, False,  True]])
     gt_illegal = compute_legality_masks_tf(gt2, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'])[0] \
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block'])[0] \
                     .gather(2, gt2.unsqueeze(-1)).squeeze(-1)
     print("gt_illegal:  ", gt_illegal)            # e.g. tensor([[ True, False, False]])
     gt_win = F.max_pool1d(

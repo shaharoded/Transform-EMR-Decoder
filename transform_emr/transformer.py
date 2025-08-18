@@ -375,7 +375,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     min_count=5,
                     clip_max=8.0,
                     gamma=1.0,
-                    reduction="mean",
+                    reduction="none",
                 ).to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
@@ -450,7 +450,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                                 luts["meal_rank"],
                                                 luts["meal_pred_rank"],
                                                 luts["K_meals"],
-                                                luts["conflict_mat"]
+                                                luts["conflict_mat"],
+                                                luts["predict_block"]
                                             )
                 # Apply masks BEFORE BCE so gradients learn legality
                 pred_logits = apply_masks_to_logits(
@@ -464,16 +465,18 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 multi_hot = get_multi_hot_targets(
                     position_ids=target_ids,
                     padding_idx=model.embedder.padding_idx,
-                    vocab_size=logits.size(-1),
+                    vocab_size=pred_logits.size(-1),
                     k=training_settings["bce_k_window"]
-                )                
-                # Label smoothing
-                eps = 0.05
-                multi_hot = multi_hot * (1 - eps)             # 1 → 0.95, 0 → 0
+                )  
+                # mask out illegal classes AND PAD steps from the denominator
+                valid_pos = (target_ids != model.embedder.padding_idx).unsqueeze(-1)  # [B,T,1]
+                allowed   = (~illegal_mask) & valid_pos               
                 multi_hot[illegal_mask] = 0                   # zero‑out illegal targets
                 
                 # Calculate Focal BCE loss
-                loss_bce = criterion(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
+                eps = 0.01 # Label smoothing
+                raw_bce   = criterion(pred_logits, multi_hot * (1 - eps)) # [B,T,V], 1 → 0.95, 0 → 0
+                loss_bce  = (raw_bce * allowed.float()).sum() / allowed.float().sum().clamp(min=1.0)
                 loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 
                 # === Loss: Structural penalties on output ===
