@@ -11,9 +11,11 @@ event-prediction-in-diabetes-care/
 │
 ├── transform_emr/                     # Core Python package
 │   ├── config/                        # Configuration modules
+│   │   ├── __init__.py
 │   │   ├── dataset_config.py
 │   │   └── model_config.py
 │   │
+│   ├── __init__.py                    
 │   ├── dataset.py                     # Dataset, DataPreprocess and Tokenizer
 │   ├── embedder.py                    # Embedding model (EMREmbedding) + training
 │   ├── transformer.py                 # Transformer architecture (GPT) + training
@@ -24,11 +26,11 @@ event-prediction-in-diabetes-care/
 │   └── debug_tools.py                 # Debug loop for epochs (logits)
 │
 ├── data/                              # External data folder (for synthetic or real EMR)
-│   ├── generate_synthetic_data.ipynb  # A notebook that generates synthetic data similar in structure to original
+│   ├── generate_synthetic_data.ipynb  # A notebook that generates synthetic data similar in structure to original (for tests)
 │   ├── train/
 │   └── test/
 │
-├── unittests/                         # Unit and integration tests
+├── unittests/                         # Unit and integration tests (dataset / model / utils)
 │
 ├── .gitignore
 ├── requirements.txt
