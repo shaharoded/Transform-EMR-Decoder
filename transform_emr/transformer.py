@@ -480,7 +480,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 allowed   = (~illegal_mask) & valid_pos                                 # [B,T,V] bool               
 
                 # Calculate BCE loss (only valid positions) 
-                loss_bce, bce_info = criterion(pred_logits, multi_hot, allowed) * training_settings["phase2_bce_weight"] # Applying weight
+                loss_bce, bce_info = criterion(pred_logits, multi_hot, allowed)
+                loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 
                 # === Loss: Structural penalties on output ===
                 # Load and normalize each penalty (∈ [0, 1]) -> Active grad on penalty functions
