@@ -19,6 +19,7 @@ from tqdm import tqdm
 from transform_emr.embedder import EMREmbedding
 from transform_emr.config.model_config import *
 from transform_emr.utils import *
+from transform_emr.loss import MaskedFocalBCE
 
 
 # ───────── helpers ─────────────────────────────────────────────────────────── #
@@ -370,16 +371,15 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     )
 
     scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
-
-    criterion = FocalBCELoss.from_counts(
-                    counts=model.embedder.tokenizer.token_counts,
-                    token_weights=model.embedder.tokenizer.token_weights,
-                    beta=0.999,
-                    min_count=5,
-                    clip_max=8.0,
-                    gamma=1.0,
-                    reduction="none",
-                ).to(device)
+    
+    # Build criterion once
+    criterion = MaskedFocalBCE.from_counts(
+        counts=model.embedder.tokenizer.token_counts,
+        token_weights=model.embedder.tokenizer.token_weights,
+        beta=0.999, min_count=5, clip_max=8.0, gamma=1.0,
+        tau=0.5, neg_bounds=(0.05, 0.5), label_smoothing=0.01,
+        hard_neg_k=None,   # or 32 for hard-negative mining
+    ).to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -472,15 +472,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     k=training_settings["bce_k_window"]
                 )  
                 # mask out illegal classes AND PAD steps from the denominator
-                valid_pos = (target_ids != model.embedder.padding_idx).unsqueeze(-1)  # [B,T,1]
-                allowed   = (~illegal_mask) & valid_pos               
+                valid_pos = (target_ids != model.embedder.padding_idx).unsqueeze(-1)    # [B,T,1] bool
+                allowed   = (~illegal_mask) & valid_pos                                 # [B,T,V] bool               
                 multi_hot.masked_fill_(illegal_mask, 0.0)    # zero‑out illegal targets
-                
-                # Calculate Focal BCE loss (only valid positions)
-                eps = 0.01 # Label smoothing to avoid overconfidence
-                raw_bce   = criterion(pred_logits, multi_hot * (1 - eps)) # [B,T,V], 1 → 0.99, 0 → 0
-                loss_bce  = (raw_bce * allowed.float()).sum() / allowed.float().sum().clamp(min=1.0)
-                loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
+
+                # Calculate BCE loss (only valid positions) 
+                loss_bce, bce_info = criterion(pred_logits, multi_hot, allowed) * training_settings["phase2_bce_weight"] # Applying weight
 
                 # === Loss: Structural penalties on output ===
                 # Load and normalize each penalty (∈ [0, 1]) -> Active grad on penalty functions

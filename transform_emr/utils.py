@@ -6,100 +6,13 @@ General util functions for the package
 """
 import matplotlib.pyplot as plt
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 import pandas as pd
-from typing import Optional, Union
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import (
     ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, MEAL_TOKENS
 )
-
-
-class FocalBCELoss(nn.Module):
-    """
-    Focal BCE - class-balanced BCE with focal modulation.
-
-    Loss:  –αₜ · (1 - pₜ)^γ · log pₜ,   pₜ = σ(logits) of the ground-truth bit.
-
-    Hyper-params
-    ------------
-    α / counts :  pass an α-vector directly **or** call `from_counts(counts, …)`
-                  to derive it from token frequencies.
-    beta       :  smoothing for α; larger β ⇒ rarer tokens get larger weights
-                  (default 0.999).
-    min_count  :  floor on counts before weighting (default 5).
-    clip_max   :  hard cap on α to avoid extreme gradients (default 8.0).
-    gamma      :  focal exponent. 0 → plain BCE; 0.5 mild; 1 standard;
-                  >1 strongly focuses on hard / rare tokens.
-    reduction  :  "none" | "mean" | "sum" (as in PyTorch losses).
-
-    Usage
-    -----
-    >>> crit = FocalBCELoss.from_counts(token_counts, gamma=0.5).to(device)
-    """
-    # -------- factory ----------------------------------------------------
-    @classmethod
-    def from_counts(cls,
-                    counts: Union[torch.Tensor, np.ndarray],
-                    *,
-                    token_weights: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                    beta: float = 0.999,
-                    min_count: int = 5,
-                    clip_max: float = 8.0,
-                    gamma: float = 1.0,
-                    reduction: str = "mean"):
-        alpha = cls._calc_alpha(counts, beta=beta,
-                                min_count=min_count, clip_max=clip_max)
-        if token_weights is not None:
-            token_weights = torch.as_tensor(token_weights).float()
-            alpha *= token_weights
-        return cls(alpha_vector=alpha,
-                   gamma=gamma, reduction=reduction)
-
-    # -------- ctor -------------------------------------------------------
-    def __init__(self,
-                 alpha_vector: torch.Tensor,
-                 *,
-                 gamma: float = 1.5,
-                 reduction: str = "mean",
-                 clip_max: Optional[float] = 8.0):
-        super().__init__()
-        alpha = alpha_vector.float().clone()
-        if clip_max is not None:
-            alpha.clamp_(max=clip_max)
-        self.register_buffer("alpha", alpha)
-        self.gamma = gamma
-        self.reduction = reduction
-
-    # -------- fwd --------------------------------------------------------
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
-        targets = targets.float()
-
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets, reduction="none")
-
-        probs   = torch.sigmoid(logits)
-        p_t     = probs*targets + (1.0 - probs)*(1.0 - targets)
-        mod_fac = (1.0 - p_t).pow(self.gamma)
-
-        alpha = self.alpha.view(*([1]*(logits.ndim - 1)), -1)
-        alpha = alpha*targets + (1.0 - alpha)*(1.0 - targets)
-
-        loss = alpha * mod_fac * bce
-        if self.reduction == "mean": return loss.mean()
-        if self.reduction == "sum":  return loss.sum()
-        return loss  # "none"
-
-    # -------- helper -----------------------------------------------------
-    @staticmethod
-    def _calc_alpha(counts, *, beta, min_count, clip_max):
-        counts = torch.as_tensor(counts).float().clamp(min=min_count)
-        eff    = 1.0 - torch.pow(beta, counts)
-        alpha  = (1.0 - beta) / (eff + 1e-6)
-        return alpha.clamp(max=clip_max)
 
 
 class F1Aggregator:
