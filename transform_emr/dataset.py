@@ -542,17 +542,6 @@ class EMRDataset(Dataset):
                             print(f"    Original token: '{original_token}'")
                     
                     raise ValueError(f"Found out-of-bounds {col_name} for patient {pid}")
-        
-        # === Prepend [CTX] row ===
-        ctx_row = {
-            "RawConceptID": self.tokenizer.rawconcept2id.get("[CTX]", 0),
-            "ConceptID": self.tokenizer.concept2id.get("[CTX]", 0),
-            "ValueID": self.tokenizer.value2id.get("[CTX]", 0),
-            "PositionID": self.tokenizer.token2id.get("[CTX]", 0),
-            "TimePoint": 0.0  # Inject context at time = 0
-        }
-        ctx_df = pd.DataFrame([ctx_row])
-        df = pd.concat([ctx_df, df], ignore_index=True)
 
         return {
             "raw_concept_ids": torch.tensor(df["RawConceptID"].values, dtype=torch.long),
