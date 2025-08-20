@@ -190,7 +190,11 @@ class DataProcessor:
 
             return group
 
-        self.df = self.df.groupby("PatientID", group_keys=False).apply(process_group).reset_index(drop=True)
+        self.df = (
+            self.df.groupby("PatientID", group_keys=False)[self.df.columns]
+                .apply(process_group)
+                .reset_index(drop=True)
+        )
     
 
     def _normalize_time(self):
