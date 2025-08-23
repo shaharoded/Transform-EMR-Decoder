@@ -39,7 +39,7 @@ TRAINING_SETTINGS = {
     
     "phase2_bce_weight": 1.0, # BCE loss weight, should be 1.
     # Balance each penalty to be 20% - 30% of the BCE loss
-    "phase2_penalty_weight": 0.1, # Weight for special penalties given on next token loss function (phase 2).
-    "phase2_dt_weight": 3.0, # Weight loss on the abs_t prediction, which is combined with regular loss. Currently as calculated (phase 2).
-    "phase2_dt_monotonic_penalty": 0.3, # Weight for penalties given on time MSE if predicted time is not monotonically increasing (phase 2).
+    "phase2_penalty_weight": 0.15, # Weight for special penalties given on next token loss function (phase 2).
+    "phase2_dt_weight": 2.0, # Weight loss on the abs_t prediction, which is combined with regular loss. Currently as calculated (phase 2).
+    "phase2_dt_monotonic_penalty": 0.6, # Weight for penalties given on time MSE if predicted time is not monotonically increasing (phase 2).
 }

@@ -1,10 +1,15 @@
 from __future__ import annotations
 import math
+import numpy as np
 from collections import Counter
 from typing import Dict, List, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
+
+from sklearn.metrics import roc_curve, precision_recall_curve, auc
+from scipy.stats import spearmanr
+
 
 from transform_emr.utils import (
     build_luts, get_multi_hot_targets, compute_legality_masks_tf,
@@ -281,7 +286,6 @@ def embedder_representation_report(
             x = x[idx]; y = y[idx]
             return torch.trapz(y, x).item()
         # ROC
-        from sklearn.metrics import roc_curve, precision_recall_curve, auc
         try:
             fpr, tpr, _ = roc_curve(Y.cpu().numpy(), prob.cpu().numpy())
             roc_auc = auc(fpr, tpr)
@@ -374,10 +378,6 @@ def transformer_training_report(
       • Uses the **same masking** and **MaskedFocalBCE** config you train with (gamma, hard_neg_k, etc.).
       • “Hard-neg” numbers are approximate (computed outside the criterion) but good enough to judge settings.
     """
-    import numpy as np
-    import torch
-    import torch.nn.functional as F
-
     model.eval()
     if device is None:
         device = next(model.parameters()).device
@@ -405,8 +405,7 @@ def transformer_training_report(
             c = obj.to(device).float().flatten()
             return c[:V] if c.numel() >= V else torch.cat([c, torch.zeros(V - c.numel(), device=device)], 0)
         try:
-            import numpy as _np
-            if isinstance(obj, (list, tuple, _np.ndarray)):
+            if isinstance(obj, (list, tuple, np.ndarray)):
                 c = torch.as_tensor(obj, device=device, dtype=torch.float32).flatten()
                 return c[:V] if c.numel() >= V else torch.cat([c, torch.zeros(V - c.numel(), device=device)], 0)
         except Exception:
@@ -426,7 +425,7 @@ def transformer_training_report(
         beta=training_settings.get("beta", 0.999),
         min_count=training_settings.get("min_count", 5),
         clip_max=training_settings.get("clip_max", 8.0),
-        gamma=training_settings.get("gamma", 2.0),
+        gamma=training_settings.get("gamma", 1.2),
         tau=training_settings.get("tau", 0.8),
         neg_bounds=training_settings.get("neg_bounds", (0.05, 0.5)),
         label_smoothing=training_settings.get("label_smoothing", 0.01),
@@ -642,7 +641,6 @@ def transformer_training_report(
         y_pred = torch.cat(dt_pred_all).numpy()
         mae = float(np.abs(y_pred - y_true).mean())
         r2  = float(1.0 - (np.var(y_true - y_pred) / (np.var(y_true) + 1e-8)))
-        from scipy.stats import spearmanr
         rho = float(spearmanr(y_true, y_pred).correlation) if y_true.size > 3 else 0.0
     else:
         mae = r2 = rho = 0.0

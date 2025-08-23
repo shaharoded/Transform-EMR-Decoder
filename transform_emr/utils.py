@@ -1023,6 +1023,31 @@ def soft_meal_order_penalty(
     return pen / denom
 
 
+def soft_illegal_mass_penalty(
+    logits_pre_mask: torch.Tensor,    # [B,T,V] BEFORE apply_masks_to_logits
+    illegal_mask: torch.Tensor,       # [B,T,V] booleans from compute_legality_masks_tf
+    nonpad_mask: torch.Tensor,        # [B,T]   booleans (targets != PAD)
+    margin: float = 0.02,             # small safety margin; set 0 to disable
+    power: float = 1.0                # >1 accentuates heavy offenders
+) -> torch.Tensor:
+    """
+    Penalize probability mass placed on illegal classes *before* masking.
+    Scale ~[0,1]. Fully differentiable w.r.t. logits_pre_mask.
+
+    NOTE: This penalty is applied *before* masking, so it can affect the logits directly,
+    learning from illegality and not just blocking it.
+    """
+    P = torch.softmax(logits_pre_mask, dim=-1)                     # [B,T,V]
+    mass = (P * illegal_mask).sum(dim=-1)                          # [B,T]
+    if margin > 0:
+        mass = F.relu(mass - margin)                               # hinge around margin
+    num = (mass * nonpad_mask.float()).sum()
+    den = nonpad_mask.float().sum().clamp_min(1.0)
+    pen = num / den
+    return pen.pow(power)
+
+
+
 def apply_masks_to_logits(logits, illegal_mask, bonus_mask, bonus_boost=0.2):
     """
     logits: [B,T,V] *after* slicing (no [CTX])

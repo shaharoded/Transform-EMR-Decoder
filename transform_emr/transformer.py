@@ -377,11 +377,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
-        gamma=1.5,         # focal strength
-        tau=0.75,           # pos/neg balance anchor
+        gamma=1.2,         # focal strength
+        tau=0.8,           # pos/neg balance anchor
         neg_bounds=(0.05, 0.5),   # clamp for stability
         label_smoothing=0.01,     # optional
-        hard_neg_k=128               # or e.g., 64 for hard-neg mining
+        hard_neg_k=64               # or e.g., 64 for hard-neg mining
     ).to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
@@ -459,10 +459,22 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                                 luts["conflict_mat"],
                                                 luts["predict_block"]
                                             )
-                # Apply masks BEFORE BCE so gradients learn legality
+                
+                # Soft illegal-mass penalty (pre-mask)
+                nonpad = (target_ids != model.embedder.padding_idx)                # [B,T]
+                p_illegal = soft_illegal_mass_penalty(
+                    logits_pre_mask=pred_logits,
+                    illegal_mask=illegal_mask,
+                    nonpad_mask=nonpad,
+                    margin=0.02,           # good starting point (see notes)
+                    power=1.0
+                )
+
+                # Apply masks BEFORE BCE so gradients learn legality only
                 pred_logits = apply_masks_to_logits(
                     pred_logits, illegal_mask, bonus_mask
                 )
+
                 # Get predicted token IDs
                 pred_ids = pred_logits.argmax(dim=-1) # [B, T] — single token prediction per timestep, full block
 
@@ -476,11 +488,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 ).masked_fill_(illegal_mask, 0.0)    # zero‑out illegal targets  
                 
                 # mask out illegal classes AND PAD steps from the denominator
-                valid_pos = (target_ids != model.embedder.padding_idx).unsqueeze(-1)    # [B,T,1] bool
-                allowed   = (~illegal_mask) & valid_pos                                 # [B,T,V] bool               
+                valid_pos = nonpad.unsqueeze(-1)            # [B,T,1] bool
+                allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool               
 
                 # Calculate BCE loss (only valid positions) 
-                loss_bce, bce_info = criterion(pred_logits, multi_hot, allowed)
+                loss_bce, _ = criterion(pred_logits, multi_hot, allowed)
                 loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 
                 # === Loss: Structural penalties on output ===
@@ -493,6 +505,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     luts["conflict_mat"],
                     alpha=10.0               # sharpness; 8–12 worked in tests
                 )
+                
                 p_meal = soft_meal_order_penalty(
                     pred_logits,             # keep grads
                     allowed,
@@ -507,7 +520,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     training_settings['warmup_epochs'],
                     training_settings["phase2_penalty_weight"]
                 )
-                generative_penalty = lambda_pen * (0.5 * (p_struct + p_meal))
+                generative_penalty = (p_illegal + p_struct + p_meal) / 3.0
+                generative_penalty = lambda_pen * generative_penalty
 
                 # === Loss: Δt + monotonicity ===
                 # Predict abs_ts[:, 1:] using model abs_t_head
