@@ -425,9 +425,9 @@ def transformer_training_report(
         beta=training_settings.get("beta", 0.999),
         min_count=training_settings.get("min_count", 5),
         clip_max=training_settings.get("clip_max", 8.0),
-        gamma=training_settings.get("gamma", 1.2),
-        tau=training_settings.get("tau", 0.8),
-        neg_bounds=training_settings.get("neg_bounds", (0.05, 0.5)),
+        gamma=training_settings.get("gamma", 1.0),
+        tau=training_settings.get("tau", 0.7),
+        neg_bounds=training_settings.get("neg_bounds", (0.05, 0.3)),
         label_smoothing=training_settings.get("label_smoothing", 0.01),
         hard_neg_k=training_settings.get("hard_neg_k", 64),
     ).to(device)

@@ -159,11 +159,11 @@ class GPT(nn.Module):
         )
 
         # Δt prediction head (for regression of Δt from admission at each step -> When will each event occur?)
+        # --- TIME HEAD (monotone-by-design, allows Δt=0) ---
         self.abs_t_head = nn.Sequential(
-            nn.Linear(cfg["embed_dim"], 16 * cfg["time2vec_dim"]),
+            nn.Linear(cfg["embed_dim"], cfg["time2vec_dim"]),
             nn.ReLU(),
-            nn.Linear(16 * cfg["time2vec_dim"], 1),  # Output: scalar abs_t
-            nn.Sigmoid()  # ← Bound output to [0,1]
+            nn.Linear(cfg["time2vec_dim"], 1)  # Output: scalar abs_t, raw per-step delta logits
         )
 
         self.apply(self._init_weights)
@@ -280,9 +280,20 @@ class GPT(nn.Module):
         
         x = self.ln_f(x)
         logits = self.lm_head(x)            # (B, T+1, V)
-        abs_t_pred = self.abs_t_head(x)     # (B, T+1, 1)
 
-        return logits, abs_t_pred.squeeze(-1)  # loss is computed in train.py, squeeze for easier MSE
+        # Absolute time prediction (monotonic)
+        delta_raw = self.abs_t_head(x[:, 1:, :]).squeeze(-1)     # [B, T]
+        # Non-negative deltas with exact-zero option and good gradient at 0
+        # softplus(0) = ln(2); so softplus(z) - ln(2) == 0 when z==0
+        delta_pos = F.softplus(delta_raw) - math.log(2.0)        # [B, T]  ≥ 0
+
+        # Absolute time via cumulative sum (monotone-by-design)
+        csum = torch.cumsum(delta_pos, dim=1)                    # [B, T]
+
+        # Squash to [0,1] smoothly without forcing the last step to 1
+        abs_t_pred = 1.0 - torch.exp(-csum)                      # [B, T] in [0,1)
+
+        return logits, abs_t_pred
     
 
     def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None):
@@ -377,9 +388,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
-        gamma=1.2,         # focal strength
-        tau=0.8,           # pos/neg balance anchor
-        neg_bounds=(0.05, 0.5),   # clamp for stability
+        gamma=1.0,         # focal strength
+        tau=0.7,           # pos/neg balance anchor
+        neg_bounds=(0.05, 0.3),   # clamp for stability
         label_smoothing=0.01,     # optional
         hard_neg_k=64               # or e.g., 64 for hard-neg mining
     ).to(device)
@@ -526,7 +537,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # === Loss: Δt + monotonicity ===
                 # Predict abs_ts[:, 1:] using model abs_t_head
                 true_delta = torch.clamp(batch["abs_ts"], min=0.0, max=1.0)  # [B, T], range [0,1]
-                pred_delta = torch.clamp(abs_t_pred[:, 1:], min=0.0, max=1.0)  # [B, T], range [0,1]
+                pred_delta = abs_t_pred  # already [B, T] in [0,1], monotone
 
                 mask = (target_ids != model.embedder.padding_idx).float()  # [B, T]
 
@@ -534,17 +545,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
                 abs_t_loss = (abs_t_loss * mask).sum() / mask.sum().clamp(min=1)
                 abs_t_loss = abs_t_loss * training_settings["phase2_dt_weight"]
-
-                # Temporal Monotonicity Penalty (with scheduler) ===
-                # Penalize predicted time going backwards: max(0, prev - curr)
-                delta_diff = pred_delta[:, 1:] - pred_delta[:, :-1]  # [B, T-1]
-                monotonic_penalty = F.relu(-delta_diff)              # only penalize decreases
-                monotonic_mask = mask[:, 1:] * mask[:, :-1]          # valid when both t and t-1 are not PAD
-                monotonic_penalty = (monotonic_penalty * monotonic_mask).sum() / monotonic_mask.sum().clamp(min=1)
-                lambda_t_monotonic = linear_schedule(epoch, 
-                        training_settings['warmup_epochs'], 
-                        training_settings["phase2_dt_monotonic_penalty"])
-                abs_t_loss += lambda_t_monotonic * monotonic_penalty
 
                 # === Loss: Total Loss ===
                 loss = loss_bce + generative_penalty + abs_t_loss
