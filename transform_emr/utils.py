@@ -1071,7 +1071,7 @@ def apply_masks_to_logits(logits, illegal_mask, bonus_mask, bonus_boost=0.2):
     NOTE: Logits mask uses large negative number to avoid nan in BCE loss.
           Illegal targets must also be masked to avoid large backpropagations.
     """
-    # illegal → -inf
+    # illegal → - (~inf)
     logits = logits.masked_fill(illegal_mask, -1e9)
     # bonus → add small boost
     if bonus_boost > 0:
