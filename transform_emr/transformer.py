@@ -57,7 +57,7 @@ class CausalSelfAttention(nn.Module):
         d_k = q.size(-1)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            scores = scores.masked_fill(mask == 0, -1e9)
         attn_weights = F.softmax(scores, dim=-1)
         return torch.matmul(attn_weights, v)
     
@@ -286,12 +286,14 @@ class GPT(nn.Module):
         # Non-negative deltas with exact-zero option and good gradient at 0
         # softplus(0) = ln(2); so softplus(z) - ln(2) == 0 when z==0
         delta_pos = F.softplus(delta_raw) - math.log(2.0)        # [B, T]  ≥ 0
-
+        # drop PAD deltas, aligned to the time-head length (handles with/without [CTX])
+        delta_pos = delta_pos * (position_ids != self.embedder.padding_idx).to(delta_pos.dtype)[:, :delta_pos.size(1)]
+        
         # Absolute time via cumulative sum (monotone-by-design)
         csum = torch.cumsum(delta_pos, dim=1)                    # [B, T]
 
         # Squash to [0,1] smoothly without forcing the last step to 1
-        abs_t_pred = 1.0 - torch.exp(-csum)                      # [B, T] in [0,1)
+        abs_t_pred = csum / (1.0 + csum)
 
         return logits, abs_t_pred
     
@@ -502,7 +504,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     padding_idx=model.embedder.padding_idx,
                     vocab_size=pred_logits.size(-1),
                     k=training_settings["bce_k_window"]
-                ).masked_fill_(illegal_mask, 0.0)    # zero‑out illegal targets  
+                )
+                multi_hot = multi_hot.masked_fill(illegal_mask, 0.0) # zero‑out illegal targets, no in-place torch operation  
                 
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = nonpad.unsqueeze(-1)            # [B,T,1] bool
@@ -549,16 +552,18 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 generative_penalty = (p_illegal + p_struct + p_meal) / 3.0
                 generative_penalty = lambda_pen * generative_penalty
 
-                # === Loss: Δt + monotonicity ===
-                # Predict abs_ts[:, 1:] using model abs_t_head
-                true_delta = torch.clamp(batch["abs_ts"], min=0.0, max=1.0)  # [B, T], range [0,1]
-                pred_delta = abs_t_pred  # already [B, T] in [0,1], monotone
+                # === Loss: Δt (time) ===
+                # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T])
+                # 1) sanitize model output once (no NaN/Inf can leak into loss)
+                pred_delta = torch.nan_to_num(abs_t_pred, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+                true_delta = batch["abs_ts"].clamp(0.0, 1.0)
 
-                mask = (target_ids != model.embedder.padding_idx).float()  # [B, T]
+                # 2) mask PAD steps BEFORE any arithmetic so they contribute *nothing*
+                diff = (pred_delta - true_delta).masked_fill(~nonpad, 0.0)  # [B,T]
 
-                # Base MSE loss (no scheduler on MSE)
-                abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
-                abs_t_loss = (abs_t_loss * mask).sum() / mask.sum().clamp(min=1)
+                # 3) stable MSE with correct denominator (count of non-PAD steps)
+                denom = nonpad.float().sum().clamp_min(1.0)
+                abs_t_loss = diff.square().sum() / denom
                 abs_t_loss = abs_t_loss * training_settings["phase2_dt_weight"]
 
                 # === Loss: Total Loss ===
