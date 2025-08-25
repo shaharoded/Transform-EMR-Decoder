@@ -1068,7 +1068,12 @@ def apply_masks_to_logits(logits, illegal_mask, bonus_mask, bonus_boost=0.2):
 def plot_losses(train_losses, val_losses):
     """
     Plot train vs. validation loss to inspect training quality.
+
+    Ignores loss at first step (major instability).
     """
+    train_losses = train_losses[1:]
+    val_losses = val_losses[1:]
+
     epochs = range(1, len(train_losses) + 1)
     plt.figure()
     plt.plot(epochs, train_losses, label="Train loss")

@@ -395,7 +395,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         hard_neg_k=32               # or e.g., 64 for hard-neg mining
     ).to(device)
 
-    CEcriterion = MaskedSetCE.from_counts(
+    CEcriterion = MaskedSetCE(
         label_smoothing=0.0,     # optional
     ).to(device)
 

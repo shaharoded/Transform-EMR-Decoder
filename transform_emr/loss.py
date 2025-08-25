@@ -191,17 +191,21 @@ class MaskedSetCE(nn.Module):
         allowed = allowed.bool()
 
         # only evaluate steps that actually have any positives
-        pos_steps = (targets.sum(dim=-1, keepdim=True) > 0) & allowed.any(dim=-1, keepdim=True)
+        in_set  = (targets > 0) & allowed                    # [B,T,V]
+        has_pos = in_set.any(dim=-1)                          # [B,T]
+        has_dom = allowed.any(dim=-1)                         # [B,T]
+        use     = has_pos & has_dom                           # compute only where domain & positives exist
 
-        logits_masked = logits.masked_fill(~allowed, float("-inf"))   # [B,T,V]
-        logZ = torch.logsumexp(logits_masked, dim=-1)                 # [B,T]
+        # Masked softmax ⇒ probabilities only over allowed classes
+        logits_masked = logits.masked_fill(~allowed, -1e9)    # avoid -inf to keep logsumexp finite
+        logZ = torch.logsumexp(logits_masked, dim=-1, keepdim=True)  # [B,T,1]
+        P = torch.exp(logits_masked - logZ) * allowed.float()        # [B,T,V], sums to 1 on allowed
 
-        in_set = (targets > 0) & allowed
-        logSet = torch.logsumexp(logits_masked.masked_fill(~in_set, float("-inf")), dim=-1)  # [B,T]
+        set_mass = (P * in_set.float()).sum(dim=-1)           # [B,T]
+        set_ce   = -torch.log(set_mass.clamp_min(1e-8))       # [B,T]
 
-        set_ce = -(logSet - logZ)                                     # [B,T]
-        denom = pos_steps.squeeze(-1).float().sum().clamp(min=1.0)
-        loss = (set_ce * pos_steps.squeeze(-1).float()).sum() / denom
-
+        # average only over valid steps
+        denom = use.float().sum().clamp_min(1.0)
+        loss  = (set_ce * use.float()).sum() / denom
         info = {"denom": float(denom.detach().cpu())}
         return loss, info
