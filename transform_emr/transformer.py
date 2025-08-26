@@ -264,6 +264,15 @@ class GPT(nn.Module):
             position_ids (torch.Tensor)      - padded token ids, (B, T)
             abs_ts (torch.Tensor)            - relative start times from ADMISSION (hours), (B, T)
             context_vec (torch.Tensor)       - age/gender or [] if not used, (B, C)
+        
+        Returns:
+        logits (FloatTensor): [B, T+1, V]
+            Next-token logits for the sequence with a prepended [CTX].
+            Index 0 corresponds to the [CTX] position.
+        abs_t_pred (FloatTensor): [B, T+1]
+            Monotone absolute time in [0, 1). By convention:
+              - abs_t_pred[:, 0] == 0.0 is the [CTX] slot
+              - training uses abs_t_pred[:, 1:] to align with targets of length T
         """
         def _forward(block, x):
             """Allows gradient checkpointing on blocks -> Memory efficient"""
@@ -286,7 +295,8 @@ class GPT(nn.Module):
         # Non-negative deltas with exact-zero option and good gradient at 0
         # softplus(0) = ln(2); so softplus(z) - ln(2) == 0 when z==0
         delta_pos = F.softplus(delta_raw) - math.log(2.0)        # [B, T]  ≥ 0
-        # drop PAD deltas, aligned to the time-head length (handles with/without [CTX])
+
+        # Drop PAD deltas *before* cum-sum
         delta_pos = delta_pos * (position_ids != self.embedder.padding_idx).to(delta_pos.dtype)[:, :delta_pos.size(1)]
         
         # Absolute time via cumulative sum (monotone-by-design)
@@ -294,6 +304,9 @@ class GPT(nn.Module):
 
         # Squash to [0,1] smoothly without forcing the last step to 1
         abs_t_pred = csum / (1.0 + csum)
+
+        # prepend CTX time = 0  -> [B, T+1]
+        abs_t_pred = torch.cat([torch.zeros_like(abs_t_pred[:, :1]), abs_t_pred], dim=1)
 
         return logits, abs_t_pred
     
@@ -554,16 +567,18 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # === Loss: Δt (time) ===
                 # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T])
-                # 1) sanitize model output once (no NaN/Inf can leak into loss)
-                pred_delta = torch.nan_to_num(abs_t_pred, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-                true_delta = batch["abs_ts"].clamp(0.0, 1.0)
+                # targets and mask
+                true_delta = batch["abs_ts"].clamp_(0.0, 1.0)                    # [B,T]
+                nonpad = (target_ids != model.embedder.padding_idx)              # [B,T] bool
+                pred_delta = abs_t_pred[:, 1:]                                   # [B,T] to match targets
 
-                # 2) mask PAD steps BEFORE any arithmetic so they contribute *nothing*
-                diff = (pred_delta - true_delta).masked_fill(~nonpad, 0.0)  # [B,T]
+                # numerically safe deltas
+                pred_delta = torch.nan_to_num(pred_delta, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
 
-                # 3) stable MSE with correct denominator (count of non-PAD steps)
-                denom = nonpad.float().sum().clamp_min(1.0)
-                abs_t_loss = diff.square().sum() / denom
+                # single masked MSE
+                sq = (pred_delta - true_delta).pow(2)
+                den = nonpad.float().sum().clamp_min(1.0)
+                abs_t_loss = (sq * nonpad).sum() / den
                 abs_t_loss = abs_t_loss * training_settings["phase2_dt_weight"]
 
                 # === Loss: Total Loss ===
