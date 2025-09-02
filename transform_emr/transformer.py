@@ -462,7 +462,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     bad_epochs = 0
 
     if resume and ckpt_last.exists():
-        print(f"[GPT]: Resuming from checkpoint: {ckpt_last}")
+        print(f"[GPT]: Loading model from checkpoint: {ckpt_last}")
         loaded_model, start_epoch, best_val, opt_state, sch_state  = GPT.load(ckpt_last, embedder=model.embedder, map_location=device)
         model.load_state_dict(loaded_model.state_dict())
         optimizer.load_state_dict(opt_state)
@@ -471,9 +471,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
         scheduler.load_state_dict(sch_state)
         start_epoch += 1
-        print(f"[GPT]: Resumed training at epoch {start_epoch} (best val_loss so far: {best_val:.4f})")
+        print(f"[Phase-2]: Resumed training at epoch {start_epoch} (best val_loss so far: {best_val:.4f})")
     else:
-        print("[GPT]: Starting transformer training loop...")
+        print("[Phase-2]: Starting transformer training loop...")
 
     train_losses, val_losses = [], []
     pr_tracker = OutcomePRTracker(
@@ -680,6 +680,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         if (vl_loss < best_val - 1e-4) and (epoch >= training_settings["warmup_epochs"]):
             best_val = vl_loss
             model.save(ckpt_path, epoch, best_val, optimizer, scheduler)
+            print("[Phase-2]: Current best model saved.")
             bad_epochs = 0
         elif epoch >= training_settings["warmup_epochs"]:
             bad_epochs += 1

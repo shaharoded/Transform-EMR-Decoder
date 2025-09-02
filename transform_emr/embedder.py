@@ -368,7 +368,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     bad_epochs = 0
     
     if resume and ckpt_last.exists():
-        print(f"[Phase 1] Resuming from checkpoint: {ckpt_last}")
+        print(f"[Phase-1] Resuming from checkpoint: {ckpt_last}")
         embedder, start_epoch, best_val, optim_state, scheduler_state = EMREmbedding.load(ckpt_last, tokenizer=embedder.tokenizer, map_location=device)
         embedder.to(device)
         optimizer.load_state_dict(optim_state)
@@ -489,11 +489,12 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         if (vl_tot < best_val - 1e-4) and (epoch >= training_settings["warmup_epochs"]):
             best_val = vl_tot
             embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path)
+            print("[Phase-1]: Current best model saved.")
             bad_epochs = 0
         elif epoch >= training_settings["warmup_epochs"]:
             bad_epochs += 1
             if bad_epochs >= training_settings["patience"]:
-                print("[Phase 1]: Early stopping triggered.")
+                print("[Phase-1]: Early stopping triggered.")
                 break
         else:
             # If warmup isn't complete - do nothing.
