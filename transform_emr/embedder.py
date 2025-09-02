@@ -10,7 +10,7 @@ from tqdm import tqdm
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
 from transform_emr.config.model_config import *
-from transform_emr.utils import get_multi_hot_targets, build_mlm, plot_losses
+from transform_emr.utils import compute_legality_masks_tf, get_multi_hot_targets, build_mlm, plot_losses, build_luts
 
 torch.serialization.add_safe_globals([
     EMRTokenizer,
@@ -323,6 +323,18 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     IDEA: The exact order of the token is not really important, only the existance of important tokens and patterns.
     Total Loss = λ1 * BCE + λ2 * MLM + λ3 * Time Loss (τt)
 
+    Legality-aware BCE notes:
+     - We compute BCE per element (reduction="none") and then mask out illegal classes.
+     - Illegal classes are excluded from both numerator and denominator, so they produce no gradient.
+     - We also zero targets at illegal indices to avoid any accidental positive supervision there.
+     - pos_weight is still applied element-wise by BCEWithLogits; masking happens AFTER the per-element loss,
+       so class balancing remains intact but is computed only over the allowed set at each (b,t).
+     - The final normalization divides by weights.sum() (the count of allowed elements), not B*T*V.
+
+    Because masking happens after per-element BCE, class rebalancing via pos_weight is preserved but applied 
+    only over the legal subset at each (b, t). This prevents the model from learning to suppress tokens merely because 
+    they were illegal at that step, aligning Phase-1 supervision with Phase-2 decoding constraints.
+
     Args:
         embedder (EMREmbedding): The embedding model with decoder.
         train_loader (DataLoader): Training dataloader.
@@ -334,7 +346,10 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     Returns:
         Tuple: (trained model, train_losses, val_losses)
     """
+    # Create global training lookup Tensors once the tokenizer is available and move to device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    luts = build_luts(embedder.tokenizer)
+    luts = {k: v.to(device) if torch.is_tensor(v) else v for k,v in luts.items()}
     embedder.to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
@@ -344,7 +359,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     # ----- Loss & Optimizer -----
     optimizer = torch.optim.AdamW(embedder.parameters(), lr=training_settings["phase1_learning_rate"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=embedder.tokenizer.token_weights.to(device))
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=embedder.tokenizer.token_weights.to(device), reduction="none")
 
     # ----- Resume logic -----
     train_losses, val_losses = [], []
@@ -384,15 +399,34 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             # BCE Logits + Loss
             bce_logits = embedder.forward_with_decoder(batch)  # [B, T, V]
 
+            # build legality with teacher forcing (same LUTs as phase-2)
+            illegal, _ = compute_legality_masks_tf(
+                position_ids=batch["position_ids"],
+                is_start=luts["is_start"],
+                is_end=luts["is_end"],
+                base_id=luts["base_id"],
+                start_ids_per_base=luts["start_ids_per_base"],
+                end_ids_per_base=luts["end_ids_per_base"],
+                meal_rank=luts["meal_rank"],
+                meal_pred_rank=luts["meal_pred_rank"],
+                K_meals=luts["K_meals"],
+                conflict_mat=luts["conflict_mat"],
+                predict_block=luts["predict_block"],   # PAD/MASK/CTX only
+            )
+
             multi_hot_targets = get_multi_hot_targets(
                                                     position_ids=batch["position_ids"], 
                                                     padding_idx=embedder.padding_idx, 
                                                     vocab_size=bce_logits.size(-1), 
                                                     k=training_settings["bce_k_window"]
-                                                    )
+                                                    ).masked_fill(illegal, 0.0)
 
-            bce_loss = loss_fn(bce_logits, multi_hot_targets)
-            bce_loss *= training_settings["phase1_bce_weight"] # Applying weight
+            raw = loss_fn(bce_logits, multi_hot_targets)       # [B, T, V], Per-element loss
+            weights = ((~illegal) & (batch["position_ids"] != embedder.padding_idx).unsqueeze(-1)).float()  # [B,T,V]
+            den = weights.sum().clamp_min(1.0)
+            bce_loss = (raw * weights).sum() / den
+
+            bce_loss *= training_settings["phase1_bce_weight"] # Applying weight (scale)
             
             # MLM Logits + Loss
             mlm_logits = embedder.forward_with_mlm(
@@ -437,6 +471,10 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         tr_tot, tr_bce, tr_dt, tr_mlm = run_epoch(train_loader, train_flag=True)
         vl_tot, vl_bce, vl_dt, val_mlm = run_epoch(val_loader,   train_flag=False)
 
+        # Step the plateau scheduler on the validation total
+        scheduler.step(vl_tot)
+
+        # Collect losses
         train_losses.append(tr_tot)
         val_losses.append(vl_tot)
 
