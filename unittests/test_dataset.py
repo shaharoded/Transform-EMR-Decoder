@@ -1,12 +1,41 @@
 import pandas as pd
 from torch.utils.data import DataLoader
 import pytest
+import pickle
+import os
 
 from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr
 
+# --- Mocks for TAK Repository ---
+class MockTAK:
+    def __init__(self, name, derived_from=None, family=None):
+        self.name = name
+        self.derived_from = derived_from
+        self.family = family
+
+class MockRepo:
+    def __init__(self, items):
+        self.items = items
+    def get(self, name):
+        return self.items.get(name)
+
+@pytest.fixture
+def mock_tak_repo(tmp_path):
+    # Create a mock repository with concepts A and B
+    # A is a raw concept, B is derived from A
+    repo = MockRepo({
+        "A": MockTAK("A", family="raw-concept"),
+        "B": MockTAK("B", derived_from=["A"]),
+    })
+    
+    repo_path = tmp_path / "tak_repo.pkl"
+    with open(repo_path, "wb") as f:
+        pickle.dump(repo, f)
+    return str(repo_path)
+
 
 @pytest.mark.order(1)
-def test_synthetic_data_pipeline(tmp_path, capsys):
+def test_synthetic_data_pipeline(tmp_path, capsys, mock_tak_repo):
     # --- create a tiny two‑patient temporal table ---
     df = pd.DataFrame({
         'PatientID':     [1, 1, 2, 2],
@@ -24,9 +53,11 @@ def test_synthetic_data_pipeline(tmp_path, capsys):
     })
 
     # run preprocessing with and without max_input_days
-    proc_t = DataProcessor(df, ctx, max_input_days=1)
+    # Pass mock repo and tmp_path for checkpoints
+    proc_t = DataProcessor(df, ctx, tak_repo_path=mock_tak_repo, max_input_days=1, checkpoint_path=str(tmp_path))
     temporal_df_t, _ = proc_t.run()
-    proc = DataProcessor(df, ctx)
+    
+    proc = DataProcessor(df, ctx, tak_repo_path=mock_tak_repo, checkpoint_path=str(tmp_path))
     temporal_df, context_df = proc.run()
 
     # lengths should differ when max_input_days=1
@@ -42,7 +73,7 @@ def test_synthetic_data_pipeline(tmp_path, capsys):
 
     # now build tokenizer & dataset on full temporal_df
     tokenizer = EMRTokenizer.from_processed_df(temporal_df)
-    tokenizer.save()
+    tokenizer.save(os.path.join(tmp_path, 'tokenizer.pt'))
     ds = EMRDataset(temporal_df, context_df, tokenizer=tokenizer)
 
     # collate one batch of size 2
@@ -51,7 +82,7 @@ def test_synthetic_data_pipeline(tmp_path, capsys):
 
     # expecting these tensors in batch and correct batch dimension
     expected_keys = (
-        'raw_concept_ids', 'concept_ids', 'value_ids',
+        'parent_raw_ids', 'concept_ids', 'value_ids',
         'position_ids', 'abs_ts', 'context_vec', 'targets'
     )
     for key in expected_keys:
