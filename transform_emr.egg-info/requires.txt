@@ -1,9 +1,0 @@
-pandas
-numpy
-torch
-scikit-learn
-matplotlib>=3.7.0
-tqdm
-pytest
-pytest-order
-openpyxl
