@@ -153,7 +153,7 @@ class DataProcessor:
         (same patient), shift the *start* forward by `epsilon` to preserve
         START/END ordering for tokenisation.
         """
-        df = self.df.sort_values(['PatientID', 'StartDateTime']).copy()
+        df = self.df.sort_values(['PatientID', 'StartDateTime']).reset_index(drop=True).copy()
 
         same_time = (
             (df['StartDateTime']

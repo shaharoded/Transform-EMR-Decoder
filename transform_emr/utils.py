@@ -852,7 +852,8 @@ def soft_interval_penalty(
     w_dup_start: float = 1.0,
     w_conflict: float = 1.0,
     w_unclosed: float = 0.5,
-    return_details: bool = False
+    return_details: bool = False,
+    eps: float = 1e-8,              # numerical stability for denominators
 ):
     """
     Differentiable interval structure penalty.
@@ -865,7 +866,6 @@ def soft_interval_penalty(
         penalty: scalar in [0,1]
         details: dict of raw & normalized components (if return_details=True)
     """
-    eps = 1e-8
     B, T, V = logits.shape
     device = logits.device
 
