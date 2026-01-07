@@ -2,6 +2,8 @@
 
 This repository implements a two-phase deep learning pipeline for modeling longitudinal Electronic Medical Records (EMRs). The architecture combines temporal embeddings, patient context, and Transformer-based sequence modeling to predict or impute patient events over time.
 
+<img src="images/Model Scheme.png" width="100%">
+
 This repo is part of an unpublished thesis and will be finalized post-submission. **Please do not reuse without permission**.
 
 The results shown here (in `evaluation.ipynb`) are on random data, as my research dataset is private. This model will be used on actual EMR data, stored in a closed environment. For that, it is organized as a package that can be installed:

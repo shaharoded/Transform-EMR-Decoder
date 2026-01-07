@@ -6,6 +6,5 @@ venv/
 .venv/
 __pycache__/
 checkpoints/
-images/
 transform_emr_temp/
 *.egg-info/
