@@ -41,6 +41,8 @@ event-prediction-in-diabetes-care/
 └── README.md
 ```
 
+As noted, this model feeds of the output of the Mediator [Mediator](https://github.com/shaharoded/Mediator) temporal abstraction engine.
+
 ---
 
 ## 🛠️ Installation
