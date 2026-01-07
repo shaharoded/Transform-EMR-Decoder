@@ -252,7 +252,7 @@ class EMREmbedding(nn.Module):
         Returns:
             mlm_logits [B, T, vocab_size]
         """
-        seq = self.forward(
+        seq, _ = self.forward(
         parent_raw_ids=batch["parent_raw_ids"],
         concept_ids=batch["concept_ids"],
         value_ids=batch["value_ids"],

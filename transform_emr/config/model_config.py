@@ -51,7 +51,7 @@ TRAINING_SETTINGS = {
     # Phase-2 auxiliary settings
     "phase2_bce_weight": 1.0, # BCE loss weight, should be 1.
     "phase2_ce_weight": 0.15, # Cross-entropy loss weight, used as a nudge to the BCE.
-    "phase2_outcome_weight": 5.0, # Weight for outcome bce loss component during phase 2
+    "phase2_outcome_weight": 0.15, # Weight for outcome bce loss component during phase 2
     # Balance each penalty to be 20% - 30% of the BCE loss
     "phase2_penalty_weight": 0.22, # Weight for special penalties given on next token loss function (phase 2).
     "phase2_dt_weight": 0.2, # Weight loss on the abs_t prediction, which is combined with regular loss. Currently as calculated (phase 2).

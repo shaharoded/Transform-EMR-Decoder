@@ -38,33 +38,57 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(cfg["dropout"])
     
     def forward(self, x, key_pad_mask=None):
-        B, T, C = x.shape
-        qkv = self.qkv(x)                      # [B, T, 3C]
-        q, k, v = qkv.split(C, dim=-1)         # each [B, T, C]
+            B, T, C = x.shape
+            qkv = self.qkv(x)                      # [B, T, 3C]
+            q, k, v = qkv.split(C, dim=-1)         # each [B, T, C]
 
-        # -- reshape to (B, h, T, d) so SDPA attends along time --
-        hd = C // self.n_head
-        q = q.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
-        k = k.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
-        v = v.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
+            # -- reshape to (B, h, T, d) so SDPA attends along time --
+            hd = C // self.n_head
+            q = q.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
+            k = k.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
+            v = v.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
 
-        # boolean key mask: True==keep, False==pad → convert to "mask these keys"
-        attn_mask = None
-        if key_pad_mask is not None:
-            # key_pad_mask: [B, T] (includes CTX=True at col 0)
-            attn_mask = (~key_pad_mask).unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T], True means "mask"
+            if key_pad_mask is not None:
+                # --- Manual Masking Path (Required when padding is present) ---
+                # SDPA throws RuntimeError if we pass both attn_mask and is_causal=True.
+                # We must construct a combined mask [B, 1, T, T] containing both:
+                # 1. Padding constraints (Cols)
+                # 2. Causal constraints (Upper Triangle)
 
-        # Flash Attention (is_causal=True handles the triangular mask internally)
-        attn = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_dropout.p if self.training else 0.0,
-            is_causal=True
-        )  # -> [B, h, T, d]
+                # 1. Padding Mask: [B, 1, 1, T] -> Broadcast to [B, 1, T, T]
+                # key_pad_mask is True(Keep), False(Pad). ~key_pad_mask is True(Mask Out).
+                padding_mask = (~key_pad_mask).unsqueeze(1).unsqueeze(2)
+                
+                # 2. Causal Mask: [1, 1, T, T] 
+                # triu(1) gives upper triangle (future) as True -> Mask Out.
+                causal_mask = torch.ones((T, T), device=x.device, dtype=torch.bool).triu(1).view(1, 1, T, T)
+                
+                # 3. Combine: Mask out if it's Padding OR Future
+                combined_mask = padding_mask | causal_mask
+                
+                # 4. Convert to float mask for SDPA (-inf for mask, 0.0 for keep)
+                # Using zeros_like ensures we match dtype (e.g. float16/bfloat16)
+                attn_mask = torch.zeros_like(combined_mask, dtype=q.dtype).masked_fill(combined_mask, float("-inf"))
+                
+                attn = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    is_causal=False  # We handled causality manually in the mask
+                )
+            else:
+                # --- Optimized Path (No padding, e.g. Inference) ---
+                # Here we can let SDPA handle the causal mask efficiently
+                attn = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    is_causal=True
+                )
 
-        y = attn.transpose(1, 2).contiguous().view(B, T, C)         # -> [B, T, C]
-        y = self.proj(y)
-        return self.resid_dropout(y)
+            y = attn.transpose(1, 2).contiguous().view(B, T, C)         # -> [B, T, C]
+            y = self.proj(y)
+            return self.resid_dropout(y)
 
 
 class MLP(nn.Module):
@@ -208,8 +232,23 @@ class GPT(nn.Module):
 
         # Outcome Head (designed to propogate signal to the hidden state that there is an expected outcome soon)
         # This head maps the embedding dimension to the unique outcome classes (e.g., Death, Sepsis, Hypoglycemia, Release)
-        # A simple MLP classifier
-        self.outcome_names = list(set(OUTCOMES + TERMINAL_OUTCOMES))
+        all_config_outcomes = sorted(list(set(OUTCOMES + TERMINAL_OUTCOMES)))
+        valid_outcomes, missing_outcomes = [], []
+        for n in all_config_outcomes:
+            if n in self.embedder.tokenizer.token2id:
+                valid_outcomes.append(n)
+            else:
+                missing_outcomes.append(n)
+        if missing_outcomes:
+            print(f"[GPT] The following configured outcomes were NOT found in the tokenizer and will be ignored: {missing_outcomes}")
+            
+        # Hard Error if nothing is left (Training cannot proceed)
+        if not valid_outcomes:
+            raise ValueError(
+                f"[GPT] No valid outcomes found! Configured outcomes: {all_config_outcomes}. "
+                "None of these exist in the tokenizer vocabulary. Check your dataset configuration or tokenizer build."
+            )
+        self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
         
         # A simple MLP classifier
