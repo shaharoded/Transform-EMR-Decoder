@@ -33,7 +33,7 @@ def mini_tokenizer():
     toks = [
         "[PAD]", "[MASK]", "[CTX]", "[NULL]",
         # Admission context
-        "ADMISSION",
+        "ADMISSION_EVENT",
         # Intervals for A_X with two values
         "A_STATE_Low_START", "A_STATE_Low_END",
         "A_STATE_High_START", "A_STATE_High_END",
@@ -41,27 +41,29 @@ def mini_tokenizer():
         "A_TREND_dec_START", "A_TREND_dec_END",
         "A_TREND_inc_START", "A_TREND_inc_END",
         # Meals
-        "MEAL_Breakfast", "MEAL_Lunch", "MEAL_Dinner", "MEAL_Night",
+        "MEAL_CONTEXT_Breakfast", "MEAL_CONTEXT_Lunch", "MEAL_CONTEXT_Dinner", "MEAL_CONTEXT_Night-Snack",
         # Outcomes
-        "DEATH", "RELEASE"
+        "DEATH_EVENT", "RELEASE_EVENT",
+        # Regular events (eligible for CBM masking)
+        "GLUCOSE_READING_EVENT", "INSULIN_DOSE_EVENT"
     ]
     token2id = {tok: i for i, tok in enumerate(toks)}
     # Raw concept mapping: group by top-level concept
     rawconcept2id = {
         "A": 0,
-        "MEAL": 1,
-        "ADMISSION": 2,
-        "DEATH": 3,
-        "RELEASE": 4
+        "MEAL_CONTEXT": 1,
+        "ADMISSION_EVENT": 2,
+        "DEATH_EVENT": 3,
+        "RELEASE_EVENT": 4
     }
     # Concept-level mapping
     concept2id = {
         "A_STATE": 0,
         "A_TREND": 1,
-        "MEAL": 2,
-        "ADMISSION": 3,
-        "DEATH": 4,
-        "RELEASE": 5
+        "MEAL_CONTEXT": 2,
+        "ADMISSION_EVENT": 3,
+        "DEATH_EVENT": 4,
+        "RELEASE_EVENT": 5
     }
     # Value-level mapping (e.g., high/low categories)
     value2id = {
@@ -69,13 +71,13 @@ def mini_tokenizer():
         "A_STATE_High": 1,
         "A_TREND_dec": 2,
         "A_TREND_inc": 3,
-        "MEAL_Breakfast": 4,
-        "MEAL_Lunch": 5,
-        "MEAL_Dinner": 6,
-        "MEAL_Night": 7,
-        "ADMISSION": 8,
-        "DEATH": 9,
-        "RELEASE": 10
+        "MEAL_CONTEXT_Breakfast": 4,
+        "MEAL_CONTEXT_Lunch": 5,
+        "MEAL_CONTEXT_Dinner": 6,
+        "MEAL_CONTEXT_Night-Snack": 7,
+        "ADMISSION_EVENT": 8,
+        "DEATH_EVENT": 9,
+        "RELEASE_EVENT": 10
     }
     special_tokens = ["[PAD]", "[MASK]", "[CTX]", "[NULL]"]
     token_weights = torch.ones(len(toks))
@@ -192,7 +194,7 @@ def test_linear_schedule_visual_and_assert():
     maxv   = 1.0
     # test a range of epochs before, at, and after warmup
     for epoch in [0, 1, 2, 5, 6, 10]:
-        val = linear_schedule(epoch, warmup, maxv)
+        val = linear_schedule(epoch=epoch, start_epoch=0, end_epoch=warmup, max_val=maxv)
         expected = min(epoch / warmup, 1.0) * maxv
         # print for visual inspection
         print(f"epoch={epoch} | expected={expected:.3f} | actual={val:.3f}")
@@ -210,14 +212,13 @@ def test_build_mlm_masking_visual_and_assert(mini_tokenizer):
     # One-row batch covering forbidden & eligible IDs
     seq_ids = [
         tk.pad_token_id,                      # forbidden
-        tk.ctx_token_id,                      # forbidden
         tk.null_token_id,                     # forbidden
-        tk.token2id["ADMISSION"],             # forbidden
-        tk.token2id["DEATH"],                 # forbidden
-        tk.token2id["RELEASE"],               # forbidden
+        tk.token2id["ADMISSION_EVENT"],       # forbidden
+        tk.token2id["DEATH_EVENT"],           # forbidden
+        tk.token2id["RELEASE_EVENT"],         # forbidden
         tk.token2id["A_STATE_High_START"],    # eligible
         tk.token2id["A_TREND_inc_START"],     # eligible
-        tk.token2id["MEAL_Breakfast"],        # eligible
+        tk.token2id["MEAL_CONTEXT_Breakfast"],# eligible
         tk.token2id["A_TREND_inc_END"],       # eligible
         tk.token2id["A_STATE_High_END"],      # eligible
     ]
@@ -227,11 +228,10 @@ def test_build_mlm_masking_visual_and_assert(mini_tokenizer):
 
     forbidden = {
         tk.pad_token_id,
-        tk.ctx_token_id,
         tk.null_token_id,
-        tk.token2id["ADMISSION"],
-        tk.token2id["DEATH"],
-        tk.token2id["RELEASE"],
+        tk.token2id["ADMISSION_EVENT"],
+        tk.token2id["DEATH_EVENT"],
+        tk.token2id["RELEASE_EVENT"],
     }
 
     for pos, orig in enumerate(seq_ids):
@@ -281,10 +281,10 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
             "value_ids": in_seq.clone()
         }
         out = apply_cbm(
-            batch.copy(), epoch=5, warmup_epochs=5,
+            batch.copy(),
             tokenizer=tk,
             forbid_ids=torch.tensor(sorted(luts["forbid_mask_ids"].tolist()), dtype=torch.long),
-            max_p=1.0
+            p=1.0
         )
         out_seq = out["position_ids"][0]
         print(f"test_apply_cbm (no eligible): input={in_seq[0].tolist()}, output={out_seq.tolist()}")
@@ -303,10 +303,10 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
             "value_ids": in_seq.clone()
         }
         out = apply_cbm(
-            batch.copy(), epoch=10, warmup_epochs=10,
+            batch.copy(),
             tokenizer=tk,
             forbid_ids=torch.tensor(sorted(luts["forbid_mask_ids"].tolist()), dtype=torch.long),
-            max_p=1.0
+            p=1.0
         )
         out_seq = out["position_ids"][0]
         print(f"test_apply_cbm (with eligible): input ={in_seq[0].tolist()}")
@@ -333,8 +333,8 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
             "value_ids": in_seq3.clone()
         }
         out3 = apply_cbm(
-            batch3.copy(), epoch=1, warmup_epochs=1,
-            tokenizer=tk, forbid_ids=minimal_forbid, max_p=1.0
+            batch3.copy(),
+            tokenizer=tk, forbid_ids=minimal_forbid, p=1.0
         )
         out3_seq = out3["position_ids"][0]
         print(f"test_apply_cbm (minimal forbid): input ={in_seq3[0].tolist()}, output={out3_seq.tolist()}")
@@ -490,10 +490,10 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 
     # --- Meal ordering ---
     print("K_meals =", l['K_meals'].item(), "meal_rank:", l['meal_rank'])
-    b    = tk.token2id['MEAL_Breakfast']
-    l_id = tk.token2id['MEAL_Lunch']
-    d    = tk.token2id['MEAL_Dinner']
-    n    = tk.token2id['MEAL_Night']
+    b    = tk.token2id['MEAL_CONTEXT_Breakfast']
+    l_id = tk.token2id['MEAL_CONTEXT_Lunch']
+    d    = tk.token2id['MEAL_CONTEXT_Dinner']
+    n    = tk.token2id['MEAL_CONTEXT_Night-Snack']
 
     # 5) Legal full cycle: L → D → N → B → L
     seq_cycle = torch.tensor([[l_id, d, n, b, l_id]])
@@ -543,10 +543,10 @@ def test_penalty_interval_structure_and_meal_order(mini_tokenizer):
     l  = build_luts(tk)
     
     # --- Define tokens ---
-    b    = tk.token2id['MEAL_Breakfast']
-    lu = tk.token2id['MEAL_Lunch']
-    d    = tk.token2id['MEAL_Dinner']
-    n    = tk.token2id['MEAL_Night']
+    b    = tk.token2id['MEAL_CONTEXT_Breakfast']
+    lu = tk.token2id['MEAL_CONTEXT_Lunch']
+    d    = tk.token2id['MEAL_CONTEXT_Dinner']
+    n    = tk.token2id['MEAL_CONTEXT_Night-Snack']
     low_s  = tk.token2id['A_STATE_Low_START']
     low_e  = tk.token2id['A_STATE_Low_END']
     pad    = tk.pad_token_id
@@ -695,10 +695,10 @@ def test_soft_meal_penalty_recency_and_successor(mini_tokenizer):
     l  = build_luts(tk)
 
     V = len(tk.token2id)
-    b = tk.token2id['MEAL_Breakfast']
-    lu = tk.token2id['MEAL_Lunch']
-    d = tk.token2id['MEAL_Dinner']
-    n = tk.token2id['MEAL_Night']
+    b = tk.token2id['MEAL_CONTEXT_Breakfast']
+    lu = tk.token2id['MEAL_CONTEXT_Lunch']
+    d = tk.token2id['MEAL_CONTEXT_Dinner']
+    n = tk.token2id['MEAL_CONTEXT_Night-Snack']
 
     allowed = torch.ones(1, 3, V, dtype=torch.bool)
     for bid in [tk.pad_token_id, tk.mask_token_id, tk.ctx_token_id, tk.null_token_id]:
@@ -810,8 +810,8 @@ def test_soft_penalties_agree_with_hard_in_peaked_limit(mini_tokenizer):
     pad = tk.pad_token_id
     low_s = tk.token2id['A_STATE_Low_START']
     low_e = tk.token2id['A_STATE_Low_END']
-    lu = tk.token2id['MEAL_Lunch']
-    b = tk.token2id['MEAL_Breakfast']
+    lu = tk.token2id['MEAL_CONTEXT_Lunch']
+    b = tk.token2id['MEAL_CONTEXT_Breakfast']
 
     allowed = torch.ones(1, 2, V, dtype=torch.bool)
     for bid in [tk.pad_token_id, tk.mask_token_id, tk.ctx_token_id, tk.null_token_id]:
@@ -845,7 +845,7 @@ def test_soft_penalties_agree_with_hard_in_peaked_limit(mini_tokenizer):
 
     # Meals: L→B (bad) vs L→D (ok)
     logits_mb = torch.full((1,2,V), -scale); logits_mb[0,0,lu]=scale; logits_mb[0,1,b]=scale
-    logits_md = torch.full((1,2,V), -scale); logits_md[0,0,lu]=scale; logits_md[0,1,tk.token2id['MEAL_Dinner']]=scale
+    logits_md = torch.full((1,2,V), -scale); logits_md[0,0,lu]=scale; logits_md[0,1,tk.token2id['MEAL_CONTEXT_Dinner']]=scale
     soft_mb = soft_meal_order_penalty(logits_mb, allowed, l['meal_rank'], decay=0.9, beta=8.0)
     soft_md = soft_meal_order_penalty(logits_md, allowed, l['meal_rank'], decay=0.9, beta=8.0)
     assert soft_mb.item() > soft_md.item(), "Illegal L→B should be penalized more than legal L→D"

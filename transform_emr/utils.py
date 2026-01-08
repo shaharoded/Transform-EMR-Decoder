@@ -330,7 +330,7 @@ def mix_with_predictions(
     """    
     device = gt_ids.device
     B, T = gt_ids.shape
-    ss_rate = linear_schedule(epoch, warmup_epochs, max_rate)
+    ss_rate = linear_schedule(epoch, 0, warmup_epochs, max_rate)
 
     # 1) Random swap mask
     rand_mask = torch.rand(B, T, device=device) < ss_rate

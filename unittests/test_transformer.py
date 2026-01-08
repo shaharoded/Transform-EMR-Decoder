@@ -8,12 +8,12 @@ from transform_emr.dataset import EMRTokenizer
 @pytest.fixture(scope="module")
 def mini_tokenizer():
     # Minimal EMRTokenizer fixture for Transformer tests
-    toks = ["[PAD]", "[MASK]", "[CTX]", "[NULL]", "A_START", "A_END"]
+    toks = ["[PAD]", "[MASK]", "[NULL]", "A_START", "A_END", "DEATH_EVENT", "RELEASE_EVENT"]
     token2id = {t: i for i, t in enumerate(toks)}
-    rawconcept2id = {"A": 0, "[NULL]": 1}
-    concept2id = {"A": 0, "[NULL]": 1}
-    value2id = {"A": 0, "[NULL]": 1}
-    special_tokens = toks[:4]
+    rawconcept2id = {"A": 0, "[NULL]": 1, "DEATH_EVENT": 2, "RELEASE_EVENT": 3}
+    concept2id = {"A": 0, "[NULL]": 1, "DEATH_EVENT": 2, "RELEASE_EVENT": 3}
+    value2id = {"A": 0, "[NULL]": 1, "DEATH_EVENT": 2, "RELEASE_EVENT": 3}
+    special_tokens = ["[PAD]", "[MASK]", "[NULL]"]
     token_weights = torch.ones(len(toks))
     outcome_weights = torch.ones(len(toks))
     important_ids = torch.tensor([], dtype=torch.long)
@@ -40,7 +40,6 @@ def mini_tokenizer():
     # assign special token attributes
     tk.pad_token_id = token2id['[PAD]']
     tk.mask_token_id = token2id['[MASK]']
-    tk.ctx_token_id = token2id['[CTX]']
     tk.null_token_id = token2id['[NULL]']
     return tk
 

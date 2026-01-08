@@ -430,14 +430,14 @@ def test_tokenizer_outcome_weights(tmp_path, mock_tak_repo):
     # Setup: 4 Patients. 1 Death (P1). 3 Survivors.
     df = pd.DataFrame({
         'PatientID': [1, 2, 3, 4],
-        'PositionToken': ['DEATH', 'A', 'A', 'A'], 
+        'PositionToken': ['DEATH_EVENT', 'A', 'A', 'A'], 
         'StartDateTime': [pd.Timestamp('2020-01-01')] * 4,
         'EndDateTime': [pd.Timestamp('2020-01-01')] * 4,
-        'ConceptName': ['DEATH', 'A', 'A', 'A'],
+        'ConceptName': ['DEATH_EVENT', 'A', 'A', 'A'],
         'Value': [1, 1, 1, 1],
-        'ParentRawConcepts': [['DEATH'], ['A'], ['A'], ['A']],
-        'Concept': ['DEATH', 'A', 'A', 'A'],
-        'ValueToken': ['DEATH', 'A', 'A', 'A']
+        'ParentRawConcepts': [['DEATH_EVENT'], ['A'], ['A'], ['A']],
+        'Concept': ['DEATH_EVENT', 'A', 'A', 'A'],
+        'ValueToken': ['DEATH_EVENT', 'A', 'A', 'A']
     })
     
     # Run tokenizer build
@@ -448,8 +448,8 @@ def test_tokenizer_outcome_weights(tmp_path, mock_tak_repo):
     assert tokenizer.outcome_weights.shape[0] == len(tokenizer.token2id)
     
     # Verify Logic
-    # DEATH: 1 Positive, 3 Negative -> Weight = 3.0
-    death_id = tokenizer.token2id["DEATH"]
+    # DEATH_EVENT: 1 Positive, 3 Negative -> Weight = 3.0
+    death_id = tokenizer.token2id["DEATH_EVENT"]
     w_death = tokenizer.outcome_weights[death_id].item()
     assert abs(w_death - 3.0) < 0.01, f"Expected 3.0, got {w_death}"
     

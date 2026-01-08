@@ -563,6 +563,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         raise ValueError("warmup_epochs must be less than total phase2_n_epochs")
     if foundational_epochs >= warmup_epochs:
         raise ValueError("foundational_epochs must be less than warmup_epochs, as phase-2 adds tasks after foundational training.")
+    if warmup_epochs < 2*foundational_epochs:
+        print("[Warning][train_transformer]: warmup_epochs should be at least 2x foundational_epochs to allow proper scheduling of all tasks, and ensure ramp-up is not too drastic.")
 
     # Get outcomes weights (from Tokenizer) for pos_weight in BCE loss
     valid_outcomes = [n for n in model.outcome_names if n in model.embedder.tokenizer.token2id]
