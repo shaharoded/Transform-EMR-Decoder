@@ -184,8 +184,11 @@ Remove-Item -Recurse -Force .\transform_emr_temp -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path .\transform_emr_temp | Out-Null
 
 # Copy only what's needed
-Copy-Item -Path .\transform_emr\* -Destination .\transform_emr_temp\transform_emr -Recurse
+Copy-Item -Path .\transform_emr -Destination .\transform_emr_temp -Recurse
 Copy-Item -Path .\setup.py, .\evaluation.ipynb, .\README.md, .\requirements.txt -Destination .\transform_emr_temp
+
+# Remove __pycache__ folders (platform-specific bytecode, not for distribution)
+Get-ChildItem -Path .\transform_emr_temp -Filter __pycache__ -Recurse -Directory | Remove-Item -Recurse -Force
 
 # Zip it
 Compress-Archive -Path .\transform_emr_temp\* -DestinationPath .\emr_model.zip -Force
