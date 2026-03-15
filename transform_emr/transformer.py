@@ -619,11 +619,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         device=device
     ) # For epoch evaluation
 
-    # Compile model for GPU speedup (PyTorch >= 2.0).
-    # Done after resume so we always compile the final live model.
-    if torch.cuda.is_available():
-        model = torch.compile(model, dynamic=True)
-
     def run_epoch(loader, epoch, train_flag=False):
         if train_flag:
             model.train()

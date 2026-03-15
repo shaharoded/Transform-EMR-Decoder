@@ -246,7 +246,7 @@ class EMREmbedding(nn.Module):
         )  # → returns only [B,T,D]
 
         # Context Dropout (Crucial for Phase 2 compatibility)
-        # Use tensor-side branch to avoid a graph break under torch.compile.
+        # Keep tensor-side branch for stable, vectorized execution.
         if self.training:
             drop = torch.rand(1, device=cond.device) < context_dropout_prob
             cond_for_addition = torch.where(drop, torch.zeros_like(cond), cond)
@@ -282,7 +282,7 @@ class EMREmbedding(nn.Module):
         )    # [B,T,D]
 
         # Context Dropout (Crucial for Phase 2 compatibility)
-        # Use tensor-side branch to avoid a graph break under torch.compile.
+        # Keep tensor-side branch for stable, vectorized execution.
         if self.training:
             drop = torch.rand(1, device=cond.device) < context_dropout_prob
             cond_for_addition = torch.where(drop, torch.zeros_like(cond), cond)
@@ -411,11 +411,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         optimizer.load_state_dict(optim_state)
         scheduler.load_state_dict(scheduler_state)
         start_epoch += 1
-
-    # Compile embedder for GPU speedup (PyTorch >= 2.0).
-    # Done after resume so we always compile the final live model.
-    if torch.cuda.is_available():
-        embedder = torch.compile(embedder, dynamic=True)
 
     # ----- Epoch function -----
     def run_epoch(loader, train_flag=False):

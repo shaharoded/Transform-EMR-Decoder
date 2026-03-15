@@ -15,17 +15,6 @@ from transform_emr.config.dataset_config import (
 )
 
 
-def _compile(fn):
-    """Apply torch.compile(dynamic=True) only when a CUDA GPU is present.
-    On CPU-only Windows, Inductor requires MSVC (cl.exe) which may not be
-    available. Skipping compile on CPU keeps correctness while still giving
-    full speedup on GPU training machines.
-    """
-    if torch.cuda.is_available():
-        return torch.compile(fn, dynamic=True)
-    return fn
-
-
 class OutcomePRTracker:
     """
     Tracks precision/recall at a few thresholds and max-F1 per outcome
@@ -105,7 +94,6 @@ class OutcomePRTracker:
         self.tp.zero_(); self.fp.zero_(); self.fn.zero_()
     
 
-@_compile
 def get_multi_hot_targets(position_ids: torch.Tensor,
                           padding_idx: int,
                           vocab_size: int,
@@ -522,7 +510,6 @@ def build_luts(tokenizer):
     }
 
 
-@_compile
 def compute_legality_masks_tf(position_ids: torch.LongTensor,
                               is_start: torch.BoolTensor,
                               is_end:   torch.BoolTensor,

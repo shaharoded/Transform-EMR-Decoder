@@ -10,9 +10,9 @@ TRANSFORMER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'ckpt_best.pt')
 
 # MODEL_CONFIG = {
 #       "ctx_dim": 45, # Fill manually once defined your context data.
-#       "time2vec_dim": 512,
-#       "embed_dim": 512,
-#       "block_size": 2560,  # //e.g. sequence length, number of tokens processed concurrently
+#       "time2vec_dim": 64,
+#       "embed_dim": 264,
+#       "block_size": 512,  # //e.g. sequence length, number of tokens processed concurrently
 #       "n_head": 8,
 #       "n_layer": 8,
 #       "dropout": 0.1,
