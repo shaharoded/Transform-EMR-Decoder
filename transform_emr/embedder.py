@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from transform_emr.dataset import EMRTokenizer
 from transform_emr.config.model_config import *
 from transform_emr.utils import compute_legality_masks_tf, get_multi_hot_targets, build_mlm, plot_losses, build_luts
+from transform_emr.schedulers import LambdaScheduleController
 
 torch.serialization.add_safe_globals([
     EMRTokenizer,
@@ -329,7 +330,7 @@ class EMREmbedding(nn.Module):
             optimizer_state (dict): State dict for optimizer
             scheduler_state (dict): State dict for LR scheduler
         """
-        ckpt = torch.load(path, map_location=map_location)
+        ckpt = torch.load(path, map_location=map_location, weights_only=True)
         config = ckpt["config"]
 
         # === Safety check: tokenizer vocab consistency ===
@@ -412,13 +413,26 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         scheduler.load_state_dict(scheduler_state)
         start_epoch += 1
 
+    phase1_caps = training_settings.get("phase1_aux_fraction_caps", {})
+    phase1_schedule_cfg = training_settings.get("phase1_dynamic_schedule", {})
+    mlm_ramp_epochs = max(1, int(phase1_schedule_cfg.get("mlm_ramp_epochs", 1)))
+    dt_ramp_epochs = max(1, int(phase1_schedule_cfg.get("dt_ramp_epochs", 1)))
+    aux_default_fraction = float(training_settings.get("aux_max_fraction_default", 0.2))
+    
+    # Use unified LambdaScheduleController for Phase-1 (automatically detects configuration)
+    schedule_controller = LambdaScheduleController(
+        training_settings=training_settings,
+        start_epoch=start_epoch
+    )
+
     # ----- Epoch function -----
-    def run_epoch(loader, train_flag=False):
+    def run_epoch(loader, epoch, train_flag=False):
         """
-        Returns Tuple: total_loss, bce_loss, time_loss, mlm_loss (for logging in train_embedder and validation)
+        Returns weighted and raw component losses for logging and scheduler calibration.
         """
         embedder.train() if train_flag else embedder.eval()
         total_loss, total_bce, total_dt, total_mlm = 0.0, 0.0, 0.0, 0.0
+        total_dt_raw, total_mlm_raw = 0.0, 0.0
 
         for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -471,22 +485,23 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                                                 mlm_mask=mlm_mask,
                                                 masked_pos_ids=masked_pos_ids)
             mlm_labels = batch["position_ids"][mlm_mask]          # ground truth
-            mlm_loss = F.cross_entropy(
+            mlm_raw = F.cross_entropy(
                 mlm_logits,
                 mlm_labels,
                 reduction="mean"
             )
-            mlm_loss *= training_settings["phase1_mlm_weight"]
+            lambdas = schedule_controller.get_lambdas(epoch)
+            mlm_loss = mlm_raw * lambdas["mlm"]
             
             # Δt regression supervision
             # Predict normalised absolute time for every step
             pred_t = embedder.predict_time(batch["abs_ts"])            # [B,T,1]
-            time_loss = F.mse_loss(
+            dt_raw = F.mse_loss(
                 pred_t.squeeze(-1),                                    # [B,T]
                 batch["abs_ts"],                                       # [B,T]
                 reduction='mean'
             )
-            time_loss *= training_settings["phase1_dt_weight"] # Scale
+            time_loss = dt_raw * lambdas["dt"]
             loss = bce_loss + time_loss + mlm_loss
 
             if train_flag:
@@ -498,14 +513,33 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             total_bce  += bce_loss.item()
             total_dt   += time_loss.item()
             total_mlm   += mlm_loss.item()
+            total_dt_raw += dt_raw.item()
+            total_mlm_raw += mlm_raw.item()
 
         n = len(loader)
-        return (total_loss / n, total_bce / n, total_dt / n, total_mlm / n)
+        return (
+            total_loss / n,
+            total_bce / n,
+            total_dt / n,
+            total_mlm / n,
+            total_dt_raw / n,
+            total_mlm_raw / n,
+        )
 
     # ----- Training loop -----
     for epoch in range(start_epoch, training_settings["phase1_n_epochs"] + 1):
-        tr_tot, tr_bce, tr_dt, tr_mlm = run_epoch(train_loader, train_flag=True)
-        vl_tot, vl_bce, vl_dt, val_mlm = run_epoch(val_loader,   train_flag=False)
+        tr_tot, tr_bce, tr_dt, tr_mlm, _, _ = run_epoch(train_loader, epoch=epoch, train_flag=True)
+        vl_tot, vl_bce, vl_dt, val_mlm, vl_dt_raw, vl_mlm_raw = run_epoch(val_loader, epoch=epoch, train_flag=False)
+
+        # Update auxiliary scheduler (calibration for MLM and DT auxiliaries)
+        schedule_events = schedule_controller.update(
+            epoch=epoch,
+            vl_main=vl_bce,
+            vl_mlm_raw=vl_mlm_raw,
+            vl_dt_raw=vl_dt_raw,
+        )
+        for msg in schedule_events:
+            print(msg)
 
         # Step the plateau scheduler on the validation total
         scheduler.step(vl_tot)
@@ -516,7 +550,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
 
         print(f"""[Phase-1] Epoch {epoch:03d}
             --> Train={tr_tot:.4f} (BCE={tr_bce:.4f}  MLM={tr_mlm:.4f}  Δt={tr_dt:.4f})
-            --> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  MLM={val_mlm:.4f}  Δt={vl_dt:.4f})""")
+            --> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  MLM={val_mlm:.4f}  Δt={vl_dt:.4f})
+            --> Aux-λ {schedule_controller.status_line(epoch)}""")
 
         # Save last checkpoint
         embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last)

@@ -13,6 +13,7 @@ import pandas as pd
 from transform_emr.config.dataset_config import (
     ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, MEAL_TOKENS
 )
+from transform_emr.schedulers import linear_schedule
 
 
 class OutcomePRTracker:
@@ -218,20 +219,6 @@ def set_embedder_frozen(model, freeze: bool):
     for p in model.embedder.parameters():
         p.requires_grad = not freeze
     model.embedder.eval() if freeze else model.embedder.train()
-    
-
-def linear_schedule(epoch: int, start_epoch: int, end_epoch: int, max_val: float) -> float:
-    """
-    Ramps from 0 -> max_val, but ONLY starts ramping after `start_epoch`.
-    Will reach max_val at `end_epoch`.
-    """
-    if epoch < start_epoch:
-        return 0.0
-    
-    # How many epochs have we been active?
-    active_epochs = epoch - start_epoch
-    
-    return max_val * min(active_epochs / end_epoch, 1.0)
 
 
 def apply_cbm(batch, tokenizer, forbid_ids, p=0.25):

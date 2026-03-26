@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import pytest
+import transform_emr.utils as utils_module
 
 from transform_emr.utils import (
     get_multi_hot_targets,
@@ -19,7 +20,93 @@ from transform_emr.utils import (
     build_rep_penalty,
     soft_unclosed_interval_penalty
 )
+from transform_emr.schedulers import LambdaScheduleController, linear_schedule as sched_linear_schedule
 from transform_emr.dataset import EMRTokenizer
+
+
+def test_linear_schedule_import_is_from_schedulers():
+    """Ensure utils.linear_schedule remains the scheduler-exported function (import compatibility)."""
+    assert linear_schedule is sched_linear_schedule
+    assert utils_module.linear_schedule is sched_linear_schedule
+
+
+def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activation():
+    """
+    Phase-1 scheduling contract:
+      - Aux keys are mlm/dt with ramp=1 (immediate full λ after calibration).
+      - update() accepts training-style aliases (vl_mlm_raw, vl_dt_raw).
+    """
+    cfg = {
+        "aux_max_fraction_default": 0.20,
+        "phase1_aux_fraction_caps": {"mlm": 0.20, "dt": 0.20},
+        "phase1_dynamic_schedule": {"mlm_ramp_epochs": 1, "dt_ramp_epochs": 1},
+    }
+    controller = LambdaScheduleController(training_settings=cfg, start_epoch=0)
+
+    # Before calibration everything should be zero.
+    l0 = controller.get_lambdas(epoch=0)
+    assert l0["mlm"] == 0.0 and l0["dt"] == 0.0
+
+    # Calibrate using alias keys exactly as training loop provides.
+    events = controller.update(epoch=0, vl_main=2.0, vl_mlm_raw=1.0, vl_dt_raw=0.5)
+    assert len(events) >= 2
+
+    # With ramp=1 and start_epoch=0, λ should be at full calibrated value immediately.
+    l1 = controller.get_lambdas(epoch=0)
+    assert l1["mlm"] == pytest.approx(0.4)   # 0.2 * 2.0 / 1.0
+    assert l1["dt"] == pytest.approx(0.8)    # 0.2 * 2.0 / 0.5
+
+    # Calibration is frozen; second update with different losses should not change λ_max.
+    controller.update(epoch=1, vl_main=10.0, vl_mlm_raw=10.0, vl_dt_raw=10.0)
+    l2 = controller.get_lambdas(epoch=1)
+    assert l2["mlm"] == pytest.approx(l1["mlm"])
+    assert l2["dt"] == pytest.approx(l1["dt"])
+
+
+def test_unified_lambda_schedule_controller_phase2_ramp_progression():
+    """
+    Phase-2 scheduling contract:
+      - CE/DT start together at epoch 0.
+      - Ramp follows configured epochs.
+      - Penalty/Outcome keep zero before unlock (dynamic mode enabled).
+    """
+    cfg = {
+        "aux_max_fraction_default": 0.20,
+        "phase2_aux_fraction_caps": {"ce": 0.20, "dt": 0.20, "penalty": 0.20, "outcome": 0.20},
+        "phase2_dynamic_schedule": {
+            "enabled": True,
+            "ce_ramp_epochs": 5,
+            "dt_ramp_epochs": 5,
+            "penalty_ramp_epochs": 5,
+            "outcome_ramp_epochs": 5,
+            "plateau_min_delta": 1e-4,
+            "base_plateau_patience": 3,
+            "penalty_plateau_patience": 3,
+            "min_base_epochs": 5,
+            "min_penalty_epochs": 5,
+        },
+    }
+    controller = LambdaScheduleController(training_settings=cfg, start_epoch=0)
+
+    # Calibrate CE/DT using training-style alias keys.
+    controller.update(epoch=0, vl_main=2.0, vl_ce_raw=1.0, vl_dt_raw=0.5)
+
+    # Target lambdas: ce=0.4, dt=0.8; at epoch=0 ramp starts at 0.
+    lam0 = controller.get_lambdas(epoch=0)
+    assert lam0["ce"] == pytest.approx(0.0)
+    assert lam0["dt"] == pytest.approx(0.0)
+    assert lam0["penalty"] == pytest.approx(0.0)
+    assert lam0["outcome"] == pytest.approx(0.0)
+
+    # Mid-ramp check at epoch=2 with ramp=5.
+    lam2 = controller.get_lambdas(epoch=2)
+    assert lam2["ce"] == pytest.approx(0.4 * (2 / 5), rel=1e-6)
+    assert lam2["dt"] == pytest.approx(0.8 * (2 / 5), rel=1e-6)
+
+    # End-ramp at epoch=5 reaches full λ_max.
+    lam5 = controller.get_lambdas(epoch=5)
+    assert lam5["ce"] == pytest.approx(0.4, rel=1e-6)
+    assert lam5["dt"] == pytest.approx(0.8, rel=1e-6)
 
 @pytest.fixture(scope="module")
 def mini_tokenizer():

@@ -40,20 +40,64 @@ TRAINING_SETTINGS = {
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 5e-4,
     "weight_decay": 1e-3,
+
+    # Default cap used by auxiliary schedulers when no component-specific cap is provided.
+    # Interpretation: at calibration epoch, weighted auxiliary contribution is targeted
+    # to be at most this fraction of validation BCE (main task loss).
+    "aux_max_fraction_default": 0.20,
     
     "batch_size": 64, # Number of patients processed concurrently
     "bce_k_window": 10, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
     
-    # Phase-1 auxiliary settings
-    "phase1_bce_weight": 1.0, # BCE loss weight, should be 1.
-    "phase1_mlm_weight": 0.05, # MLM loss regulizer weight on the phase1 training task (used as a nudge to the BCE.)
-    "phase1_dt_weight": 0.1, # Weight for time regression loss component during phase 1
+    # Phase-1 loss settings
+    "phase1_bce_weight": 1.0, # Main objective anchor. Keep as 1.0.
+    # For each auxiliary component, cap weighted contribution relative to BCE.
+    # Lambda max is calibrated ONCE when first available (using validation losses),
+    # then kept fixed for the rest of training.
+    "phase1_aux_fraction_caps": {
+        "mlm": 0.20, # MLM auxiliary capped to 20% of BCE at calibration point
+        "dt": 0.20,  # Time regression auxiliary capped to 20% of BCE at calibration point
+    },
+
+    # Phase-1 scheduler settings (same pattern as phase-2, but minimal by default).
+    # Keep both at 1 to make activation nearly immediate after first calibration.
+    "phase1_dynamic_schedule": {
+        "mlm_ramp_epochs": 1, # Ramp MLM lambda to its frozen calibrated max
+        "dt_ramp_epochs": 1,  # Ramp Δt lambda to its frozen calibrated max
+    },
     
-    # Phase-2 auxiliary settings
-    "phase2_bce_weight": 1.0, # BCE loss weight, should be 1.
-    "phase2_ce_weight": 0.15, # Cross-entropy loss weight, used as a nudge to the BCE.
-    "phase2_outcome_weight": 0.15, # Weight for outcome bce loss component during phase 2
-    # Balance each penalty to be 20% - 30% of the BCE loss
-    "phase2_penalty_weight": 0.22, # Weight for special penalties given on next token loss function (phase 2).
-    "phase2_dt_weight": 0.2, # Weight loss on the abs_t prediction, which is combined with regular loss. Currently as calculated (phase 2).
+    # Phase-2 loss settings
+    "phase2_bce_weight": 1.0, # Main objective anchor. Keep as 1.0.
+    # Same fixed-at-calibration cap policy for phase-2 auxiliaries.
+    # Stage gating/ramp decides when each aux becomes active; these set each aux max.
+    "phase2_aux_fraction_caps": {
+        "ce": 0.20,       # Next-token CE nudge cap
+        "penalty": 0.20,  # Structural legality penalty cap
+        "outcome": 0.20,  # Future-outcome auxiliary cap
+        "dt": 0.20,       # Time regression cap
+    },
+
+    # Dynamic curriculum for phase-2:
+    # - Unlock penalty only after base task plateaus.
+    # - Unlock outcome only after penalty-augmented task plateaus.
+    # - Warmup ends dynamically after the outcome ramp completes.
+    "phase2_dynamic_schedule": {
+        "enabled": True,          # If False, use static epoch-based schedule
+        "plateau_min_delta": 1e-4, # Minimum improvement to reset plateau counter
+        "base_plateau_patience": 3, # Patience before unlocking penalty stage
+        "penalty_plateau_patience": 3, # Patience before unlocking outcome stage
+
+        # Guardrails so transitions don't happen too early.
+        "min_base_epochs": 5,    # Minimum epochs before penalty can unlock
+        "min_penalty_epochs": 5, # Minimum epochs before outcome can unlock
+
+        # Ramp lengths after each stage is unlocked.
+        "penalty_ramp_epochs": 5, # Ramp penalty lambda from 0 to calibrated max
+        "outcome_ramp_epochs": 5, # Ramp outcome lambda from 0 to calibrated max
+
+        # Optional ramps for always-available phase-2 auxiliaries.
+        # Set to 1 for near-immediate activation after first calibration.
+        "ce_ramp_epochs": 1,
+        "dt_ramp_epochs": 1,
+    },
 }

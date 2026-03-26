@@ -24,6 +24,7 @@ event-prediction-in-diabetes-care/
 │   ├── train.py                       # Full training pipeline (2-phase)
 │   ├── inference.py                   # Inference pipeline
 │   ├── loss.py                        # Utility module for special loss criterias
+│   ├── schedulers.py                  # Utility module for auxillary lambda schedulers
 │   ├── utils.py                       # Utility functions for the package (plots + penalties)
 │   └── debug_tools.py                 # Debug loop for epochs (logits)
 ├── data/                              # External data folder (for synthetic or real EMR)

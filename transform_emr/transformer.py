@@ -20,6 +20,7 @@ from transform_emr.embedder import EMREmbedding
 from transform_emr.config.model_config import *
 from transform_emr.utils import *
 from transform_emr.loss import MaskedFocalBCE, MaskedSetCE
+from transform_emr.schedulers import LambdaScheduleController
 
 
 # ───────── components ─────────────────────────────────────────────────────────── #
@@ -451,7 +452,7 @@ class GPT(nn.Module):
     
     @classmethod
     def load(cls, path, embedder, map_location="cpu"):
-        ckpt = torch.load(path, map_location=map_location)
+        ckpt = torch.load(path, map_location=map_location, weights_only=True)
 
         # === Vocab safety check ===
         expected_vocab = ckpt["vocab_size"]
@@ -558,13 +559,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     # Training Dynamics
     warmup_epochs = training_settings["warmup_epochs"]
     foundational_epochs = training_settings["foundational_epochs"]
-    secondary_epochs = math.ceil(foundational_epochs / 2.0) # Half way through the foundational phase
-    if warmup_epochs >= training_settings["phase2_n_epochs"]:
-        raise ValueError("warmup_epochs must be less than total phase2_n_epochs")
-    if foundational_epochs >= warmup_epochs:
-        raise ValueError("foundational_epochs must be less than warmup_epochs, as phase-2 adds tasks after foundational training.")
-    if warmup_epochs < 2*foundational_epochs:
-        print("[Warning][train_transformer]: warmup_epochs should be at least 2x foundational_epochs to allow proper scheduling of all tasks, and ensure ramp-up is not too drastic.")
 
     # Get outcomes weights (from Tokenizer) for pos_weight in BCE loss
     valid_outcomes = [n for n in model.outcome_names if n in model.embedder.tokenizer.token2id]
@@ -612,6 +606,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     else:
         print("[Phase-2]: Starting transformer training loop...")
 
+    schedule_controller = LambdaScheduleController(
+        training_settings=training_settings,
+        start_epoch=start_epoch
+    )
+
     train_losses, val_losses = [], []
     pr_tracker = OutcomePRTracker(
         tokenizer=model.embedder.tokenizer,
@@ -626,6 +625,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
             model.eval()
 
         total_loss = total_bce = total_ce = total_penalty = total_outcome = total_dt = 0.0
+        total_ce_raw = total_penalty_raw = total_outcome_raw = total_dt_raw = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -728,16 +728,15 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 
                 # === Loss: CE nudge (next token generation task) ===
                 # Foundational task to complement BCE, start at epoch 0, no schedule
-                loss_ce, _ = CEcriterion(pred_logits, multi_hot, allowed)
-                lambda_ce = training_settings["phase2_ce_weight"]
-                loss_ce = loss_ce * lambda_ce
+                loss_ce_raw, _ = CEcriterion(pred_logits, multi_hot, allowed)
+                lambdas = schedule_controller.get_lambdas(epoch)
+                loss_ce = loss_ce_raw * lambdas["ce"]
 
                 # === Loss: Δt (time) ===
                 # Foundational task, start at epoch 0, no schedule
                 # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T-1])
-                abs_t_loss = F.mse_loss(pred_abs[nonpad], true_abs[nonpad], reduction="mean")
-                lambda_time = training_settings["phase2_dt_weight"]
-                abs_t_loss = abs_t_loss * lambda_time
+                abs_t_loss_raw = F.mse_loss(pred_abs[nonpad], true_abs[nonpad], reduction="mean")
+                abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
                 # === Loss: Structural penalties on output ===
                 # Mid-foundational task, starts halfway through foundational phase
@@ -763,22 +762,15 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                 )
 
                 # Average the penalties to bound in [0, 1]
-                lambda_pen = linear_schedule(
-                    epoch=epoch,
-                    start_epoch=secondary_epochs,
-                    end_epoch=secondary_epochs + foundational_epochs,
-                    max_val=training_settings["phase2_penalty_weight"]
-                )
-                
                 # A little more agressive on teaching against illegal steps, heuristic.
-                generative_penalty = (2 * p_illegal + p_unclosed) / 3.0
-                generative_penalty = lambda_pen * generative_penalty
+                generative_penalty_raw = (2 * p_illegal + p_unclosed) / 3.0
+                generative_penalty = lambdas["penalty"] * generative_penalty_raw
 
                 # === Outcome Loss Calculation === 
                 # Post-foundational task, starts after foundational phase               
                 # Targets: "Does outcome K happen in future relative to t?"
                 all_outcome_targets = get_future_outcome_targets(
-                    full_targets,           # [B, T]
+                    full_targets,         # [B, T]
                     outcome_token_ids     # [K]
                 )
                 
@@ -786,15 +778,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 outcome_targets = all_outcome_targets[:, :-1, :] # [B, T-1, K]
                 
                 # Only learn from valid (non-pad) time steps.
-                lambda_outcome = linear_schedule(
-                    epoch=epoch,
-                    start_epoch=foundational_epochs,
-                    end_epoch=warmup_epochs,
-                    max_val=training_settings["phase2_outcome_weight"]
-                )
                 loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T-1, K]
-                loss_outcome = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
-                loss_outcome = lambda_outcome * loss_outcome
+                loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+                loss_outcome = lambdas["outcome"] * loss_outcome_raw
 
                 # === Loss: Total Loss ===
                 loss = loss_bce + loss_ce + generative_penalty + loss_outcome + abs_t_loss
@@ -817,6 +803,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 total_penalty += generative_penalty.item()
                 total_outcome += loss_outcome.item()
                 total_dt += abs_t_loss.item()
+                total_ce_raw += loss_ce_raw.item()
+                total_penalty_raw += generative_penalty_raw.item()
+                total_outcome_raw += loss_outcome_raw.item()
+                total_dt_raw += abs_t_loss_raw.item()
         
         if train_flag:
             val_eval = None
@@ -833,12 +823,16 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
             total_penalty / n_batches,
             total_outcome / n_batches,
             total_dt / n_batches,
+            total_ce_raw / n_batches,
+            total_penalty_raw / n_batches,
+            total_outcome_raw / n_batches,
+            total_dt_raw / n_batches,
             val_eval
         )
     
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_pen, tr_outcome, tr_dt, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_pen, vl_outcome, vl_dt, val_eval = run_epoch(val_dl, epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_pen, tr_outcome, tr_dt, _, _, _, _, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_pen, vl_outcome, vl_dt, vl_ce_raw, vl_pen_raw, vl_outcome_raw, vl_dt_raw, val_eval = run_epoch(val_dl, epoch=epoch, train_flag=False)
 
         # convenience values for printing
         rel_f1 = val_eval["per_class_maxF1"].get("RELEASE", 0.0)
@@ -854,17 +848,32 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Pen={vl_pen:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f})
         --> Val-F1  RELEASE:{rel_f1:.4f}  DEATH:{dth_f1:.4f}  COMPLICATION:{cmp_f1:.4f}""")
 
+        schedule_events = schedule_controller.update(
+            epoch=epoch,
+            vl_main=vl_bce,
+            vl_ce_raw=vl_ce_raw,
+            vl_pen_raw=vl_pen_raw,
+            vl_out_raw=vl_outcome_raw,
+            vl_dt_raw=vl_dt_raw,
+        )
+        for msg in schedule_events:
+            print(msg)
+        if schedule_controller.dynamic_enabled:
+            print(schedule_controller.status_line(epoch))
+
 
         # Save latest
         model.save(ckpt_last, epoch, best_val, optimizer, scheduler)
 
         # Save best model 
-        if (vl_loss < best_val - 1e-4) and (epoch >= warmup_epochs):
+        warmup_gate = schedule_controller.current_warmup_end_epoch()
+
+        if (vl_loss < best_val - 1e-4) and (epoch >= warmup_gate):
             best_val = vl_loss
             model.save(ckpt_path, epoch, best_val, optimizer, scheduler)
             print("[Phase-2]: Current best model saved.")
             bad_epochs = 0
-        elif epoch >= warmup_epochs:
+        elif epoch >= warmup_gate:
             bad_epochs += 1
             if bad_epochs >= training_settings["early-stop-patience"]:
                 print("[Phase-2]: Early stopping triggered.")

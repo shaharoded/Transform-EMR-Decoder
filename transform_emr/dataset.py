@@ -659,7 +659,7 @@ class EMRTokenizer:
     @classmethod
     def load(cls, path=os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        obj = torch.load(path, map_location=device)
+        obj = torch.load(path, map_location=device, weights_only=True)
 
         tokenizer = cls(
             token2id=obj['token2id'],
