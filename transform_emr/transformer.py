@@ -476,7 +476,7 @@ class GPT(nn.Module):
         
         # Validate that current config matches checkpoint
         current_outcomes = set(OUTCOMES + TERMINAL_OUTCOMES)
-        if expected_outcome_names != current_outcomes:
+        if not expected_outcome_names.issubset(current_outcomes):
             raise ValueError(
                 f"[GPT.load] Outcome configuration mismatch!\n"
                 f"  Checkpoint outcomes: {sorted(expected_outcome_names)}\n"
