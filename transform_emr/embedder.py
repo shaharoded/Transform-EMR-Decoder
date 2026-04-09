@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
 from transform_emr.config.model_config import *
-from transform_emr.utils import compute_legality_masks_tf, get_multi_hot_targets, build_mlm, plot_losses, build_luts
+from transform_emr.utils import compute_legality_masks_tf, get_temporal_multi_hot_targets, build_mlm, plot_losses, build_luts
 from transform_emr.schedulers import LambdaScheduleController
 
 torch.serialization.add_safe_globals([
@@ -76,12 +76,12 @@ class EMREmbedding(nn.Module):
     This module creates time-aware, context-enhanced event representations suitable
     for Transformer-based models. It replaces traditional token and positional embeddings
     by explicitly decomposing each event into structured components:
-      - Raw Concept ID (e.g., "GLUCOSE")
+      - Parent Raw Concept IDs (e.g., "GLUCOSE") - All source raw concepts for this Concept
       - Concept ID (e.g., "GLUCOSE_STATE")
       - Concept + Value ID (e.g., "GLUCOSE_STATE_Low")
       - Concept + Value + Position ID (e.g., "GLUCOSE_STATE_Low_START")
       - Absolute time since admission (Δt abs)
-      - Patient-level context vector (e.g., age, sex, No. prior admissions in 6 months)
+      - Patient-level context vector (e.g., age, sex, No. prior admissions in 6 months...)
 
     These components are embedded, concatenated, and projected into a shared
     fixed-size embedding space. A [CTX] projection is added to each sequence to incorporate patient-level context.
@@ -135,9 +135,11 @@ class EMREmbedding(nn.Module):
         )
 
         # --- patient‑context slot ----------------------------------------
-        # NOTE: This projection is separate from event embeddings. 
-        # It is not added to event embeddings, nor learns during phase‑1.
-        # Instead, it is passed separately to the transformer, which uses it in AdaLN layers, which will then propagate gradients back here.
+        # NOTE: In phase-1, this projection's output is added directly to the event
+        # embeddings as an additive bias (forward_with_decoder / forward_with_mlm),
+        # so it trains alongside the decoder via those gradients.
+        # In phase-2, forward() returns it separately as `cond` — the transformer's
+        # AdaLN blocks use it for shift/scale/gate conditioning (no direct addition).
         self.context_proj = nn.Linear(ctx_dim, embed_dim, bias=False)
 
         # --- Final projection ---
@@ -161,7 +163,7 @@ class EMREmbedding(nn.Module):
 
     def predict_time(self, abs_ts):
         """
-        Helper used during Phase‑1 to supervise Time2Vec.
+        Helper used during Phase-1 to supervise Time2Vec.
         abs_ts must be the same tensor given to forward().
         Returns: [B, T, 1] values ∈ [0,1]
         """
@@ -306,6 +308,7 @@ class EMREmbedding(nn.Module):
             "bad_epochs": bad_epochs,
             "optim_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
+            "lambda_schedule_state": lambda_schedule_state,
             "model_state": self.state_dict(),
             "config": {
                 "ctx_dim": self.context_proj.in_features,
@@ -315,8 +318,6 @@ class EMREmbedding(nn.Module):
                 "vocab_size": self.position_embed.num_embeddings,
             }
         }
-        if lambda_schedule_state is not None:
-            ckpt["lambda_schedule_state"] = lambda_schedule_state
         torch.save(ckpt, path)
     
     @classmethod
@@ -357,15 +358,23 @@ class EMREmbedding(nn.Module):
         )
         model.load_state_dict(ckpt["model_state"])
 
-        return model, ckpt["epoch"], ckpt["best_val"], ckpt["optim_state"], ckpt["scheduler_state"], ckpt["lambda_schedule_state"], ckpt.get("bad_epochs", 0)
+        return (
+            model,
+            ckpt["epoch"],
+            ckpt["best_val"],
+            ckpt["optim_state"],
+            ckpt["scheduler_state"],
+            ckpt.get("lambda_schedule_state"),
+            ckpt.get("bad_epochs", 0),
+        )
 
 
 def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_path=EMBEDDER_CHECKPOINT, 
                    training_settings=TRAINING_SETTINGS):
     """
-    Trains an EMREmbedding model using weighted k-step prediction loss, to allow for a softer loss penalty.
-    IDEA: The exact order of the token is not really important, only the existance of important tokens and patterns.
-    Total Loss = λ1 * BCE + λ2 * MLM + λ3 * Time Loss (τt)
+    Trains an EMREmbedding model using temporal multi-hot BCE, masked language modelling (MLM),
+    and Δt regression.
+    Total Loss = λ1 * BCE(temporal multi-hot) + λ2 * MLM(cross-entropy) + λ3 * Δt MSE
 
     Legality-aware BCE notes:
      - We compute BCE per element (reduction="none") and then mask out illegal classes.
@@ -395,6 +404,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     luts = build_luts(embedder.tokenizer)
     luts = {k: v.to(device) if torch.is_tensor(v) else v for k,v in luts.items()}
     embedder.to(device)
+    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
 
     ckpt_path = Path(checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -440,8 +450,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             batch = {k: v.to(device) for k, v in batch.items()}
             
             if train_flag:
-                optimizer.zero_grad()
-            
+                optimizer.zero_grad(set_to_none=True)
+
             mlm_input_pos_ids = batch["position_ids"].clone() # To avoid in place modifications of the batch
             masked_pos_ids, mlm_mask = build_mlm(
                 mlm_input_pos_ids,
@@ -450,10 +460,11 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             ) # MLM mask
             
             # BCE Logits + Loss
-            bce_logits = embedder.forward_with_decoder(batch)  # [B, T, V]
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                bce_logits = embedder.forward_with_decoder(batch)  # [B, T, V]
 
             # build legality with teacher forcing (same LUTs as phase-2)
-            illegal, _ = compute_legality_masks_tf(
+            illegal = compute_legality_masks_tf(
                 position_ids=batch["position_ids"],
                 is_start=luts["is_start"],
                 is_end=luts["is_end"],
@@ -467,12 +478,18 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 predict_block=luts["predict_block"],   # PAD/MASK/CTX only
             )
 
-            multi_hot_targets = get_multi_hot_targets(
-                                position_ids=batch["position_ids"], 
-                                padding_idx=embedder.padding_idx, 
-                                vocab_size=bce_logits.size(-1), 
-                                k=training_settings["bce_k_window"]
-                                ).masked_fill(illegal, 0.0)
+            # Temporal: all tokens within phase1_bce_window_hours
+            _ABS_TS_SCALE = 336.0
+            _P1_WIN = training_settings.get("phase1_bce_window_hours", 3.0) / _ABS_TS_SCALE
+            multi_hot_targets = get_temporal_multi_hot_targets(
+                target_ids=batch["position_ids"],
+                all_abs_ts=batch["abs_ts"],
+                query_abs_ts=batch["abs_ts"],
+                padding_idx=embedder.padding_idx,
+                vocab_size=bce_logits.size(-1),
+                window_size=_P1_WIN,
+            )
+            multi_hot_targets = multi_hot_targets.masked_fill(illegal, 0.0)
 
             raw = loss_fn(bce_logits, multi_hot_targets)       # [B, T, V], Per-element loss
             weights = ((~illegal) & (batch["position_ids"] != embedder.padding_idx).unsqueeze(-1)).float()  # [B,T,V]
@@ -480,10 +497,11 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             bce_loss = (raw * weights).sum() / den
 
             # MLM Logits + Loss
-            mlm_logits = embedder.forward_with_mlm(
-                                                batch,
-                                                mlm_mask=mlm_mask,
-                                                masked_pos_ids=masked_pos_ids)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                mlm_logits = embedder.forward_with_mlm(
+                                                    batch,
+                                                    mlm_mask=mlm_mask,
+                                                    masked_pos_ids=masked_pos_ids)
             mlm_labels = batch["position_ids"][mlm_mask]          # ground truth
             mlm_raw = F.cross_entropy(
                 mlm_logits,
@@ -496,7 +514,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             # Δt regression supervision
             # Predict normalised absolute time for every step (non-padding only)
             nonpad = (batch["position_ids"] != embedder.padding_idx)  # [B,T]
-            pred_t = embedder.predict_time(batch["abs_ts"])            # [B,T,1]
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                pred_t = embedder.predict_time(batch["abs_ts"])            # [B,T,1]
             dt_raw = F.mse_loss(
                 pred_t.squeeze(-1)[nonpad],                            # [N_real]
                 batch["abs_ts"][nonpad],                               # [N_real]
@@ -555,17 +574,18 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
 
         print(f"""[Phase-1] Epoch {epoch:03d}
             --> Train={tr_tot:.4f} (BCE={tr_bce:.4f}  MLM={tr_mlm:.4f}  Δt={tr_dt:.4f})
-            --> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  MLM={val_mlm:.4f}  Δt={vl_dt:.4f})
-            --> Aux-λ {schedule_controller.status_line(epoch)}""")
+            --> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  MLM={val_mlm:.4f}  Δt={vl_dt:.4f})""")
 
-        # Save best model
-        if (vl_tot < best_val - 1e-4) and (epoch >= training_settings["warmup_epochs"]):
+        # Save best model only after aux-scheduler warmup is complete.
+        warmup_gate = schedule_controller.current_warmup_end_epoch()
+
+        if (vl_tot < best_val - 1e-4) and (epoch >= warmup_gate):
             best_val = vl_tot
             bad_epochs = 0
             embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path,
                           lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs)
             print("[Phase-1]: Current best model saved.")
-        elif epoch >= training_settings["warmup_epochs"]:
+        elif epoch >= warmup_gate:
             bad_epochs += 1
             if bad_epochs >= training_settings["early-stop-patience"]:
                 # Save last checkpoint before stopping

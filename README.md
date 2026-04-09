@@ -9,7 +9,7 @@ This repo is part of an unpublished thesis and will be finalized post-submission
 The results shown here (in `evaluation.ipynb`) are on random data, as my research dataset is private. This model will be used on actual EMR data, stored in a closed environment. For that, it is organized as a package that can be installed:
 
 ```bash
-event-prediction-in-diabetes-care/
+transform-emr/
 │
 ├── transform_emr/                     # Core Python package
 │   ├── config/                        # Configuration modules
@@ -24,9 +24,9 @@ event-prediction-in-diabetes-care/
 │   ├── train.py                       # Full training pipeline (2-phase)
 │   ├── inference.py                   # Inference pipeline
 │   ├── loss.py                        # Utility module for special loss criterias
-│   ├── schedulers.py                  # Utility module for auxillary training schedulers
+│   ├── schedulers.py                  # Utility module for training schedulers (LR & Aux tasks)
 │   ├── utils.py                       # Utility functions for the package (plots + penalties + masks)
-│   └── debug_tools.py                 # Debug loop for epochs (logits)
+│   └── diagnose.py                    # Debug reports on trained model health
 ├── data/                              # External data folder (for synthetic or real EMR)
 │   ├── generate_synthetic_data.ipynb  # A notebook that generates synthetic data similar in structure to mediator's output (for tests)
 │   ├── source/                        # Notebook will point here and auto-generate the train-test splits
@@ -125,8 +125,8 @@ but you'll need to adjust the imports. Use `train.py` structure for that.
     dataset = EMRDataset(df_subset, ctx_subset, tokenizer=tokenizer)
 
     # Load models
-    embedder, _, _, _, _ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=tokenizer)
-    model, _, _, _, _ = GPT.load(TRANSFORMER_CHECKPOINT, embedder=embedder)
+    embedder, _, _, _, _, _, _ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=tokenizer)
+    model, _, _, _, _, _ = GPT.load(TRANSFORMER_CHECKPOINT, embedder=embedder)
     model.eval()
 
     # Run inference
@@ -163,12 +163,12 @@ Run all tests:
 
 Without validation prints:
 ```bash
-pytest unittests/
+python -m pytest unittests/
 ```
 
 With validation prints:
 ```bash
-pytest -q -s unittests/
+python -m pytest -q -s unittests/
 ```
 
 ---
@@ -204,7 +204,6 @@ Remove-Item -Recurse -Force .\transform_emr_temp
 
 - This project uses synthetic EMR data (`data/train/` and `data/test/`).
 - For best results, ensure consistent preprocessing when saving/loading models.
-- `model_config.py: MODEL_CONFIG.ctx_dim` should only be updated **after** dataset initialization to avoid embedding size mismatches. You should update this value with your full context dimention (without PatientID idx).
 
 ---
 
@@ -249,8 +248,8 @@ Medical data varies in density and structure across patients. This dynamic prepr
 | Component           | Role                                                                                              |
 |--------------------|---------------------------------------------------------------------------------------------------|
 | `Time2Vec`          | Learns periodic + trend encoding from inter-event durations.                                      |
-| `EMREmbedding`      | Combines token, time, and patient context embeddings. Adds `[CTX]` token for global patient info. |
-| `train_embedder()`  | Trains the embedding model with teacher-forced next-token prediction.                            |
+| `EMREmbedding`      | Combines token, time, and patient context embeddings to create token representation.  |
+| `train_embedder()`  | Trains the embedding model with teacher-forced next-token prediction (temporal BCE), with MSE on time prediction and MLM task as auxilary goal.                            |
 
 ⚙️ **Phase 1: Learning Events Representation**  
 Phase 1 learns a robust, patient-aware representation of their event sequences. It isolates the core structure of patient timelines without being confounded by the autoregressive depth of Transformers.
@@ -264,7 +263,7 @@ We choose concatenation (Early Fusion) for the temporal component-unlike the sta
 
 Context Handling To condition these embeddings on static patient attributes (e.g., Age, Sex), we project the patient context vector and **add** it to the event sequence. This acts as a global bias, shifting the entire event manifold into a patient-specific subspace. This ensures that even before the Transformer layers, the event representations are already calibrated to the patient's demographic risk profile. Since the inference output the context projection and event embedding separately, we use **context dropout** (passing p% of the trajectories with no context) so that the embedder will learn to work with / without it, while still pushing the context projection layer towards the shared latent space. 
 
-The training uses next token prediction loss (k-window BCE) + time prediction MSE (Δt) + MLM prediction loss.
+The training uses next token prediction loss (temporal-window BCE) + time prediction MSE (Δt) + MLM prediction loss.
 MLM will avoid masking tokens which will damage the broader meaning like ADMISSION, TERMINAL_OUTCOMES...
 
 ---
@@ -274,10 +273,10 @@ MLM will avoid masking tokens which will damage the broader meaning like ADMISSI
 | Component           | Role                                                                                              |
 |--------------------|---------------------------------------------------------------------------------------------------|
 | `GPT`               | Transformer decoder stack over learned embeddings for next token prediction, with an additional head for delta_t prediction. Model inputs a trained embedder.                                               |
-| `CausalSelfAttention` | Multi-head attention using causal mask to enforce chronology.                                 |
+| `CausalSelfAttention` | Multi-head attention using causal mask to enforce chronology. Uses temporal RoPE to inject absolute time into attention scores.|
 | `MLP` | SwiGLU MLP (SiLU Gating), based on common LLM optimizations.                                 |
 | `AdaLNBlock` | Transformer block with AdaLN-Zero conditioning (adaptive layer norm), to bias prediction based on the patient context.                                 |
-| `train_transformer()` | Complete training logic for the model using a BCE with multi-hot targets to account for EMR irregularities.                         |
+| `train_transformer()` | Complete training logic using legality-masked temporal multi-hot BCE (focal), masked set-CE, Δt loss, and outcome BCE auxiliary losses.                         |
 
 ⚙️ **Phase 2: Learning Sequence Dependencies**  
 Once the EMR structure is captured, the transformer learns to model sequential dependencies in event progression:  
@@ -285,10 +284,10 @@ Once the EMR structure is captured, the transformer learns to model sequential d
 - How does timing affect outcomes?  
 - How does patient context modulate the trajectory?
 
-The training uses next token prediction loss (k-window masked BCE Focal Loss) + time prediction MSE (Δt) + structural penalties + outcome prediction BCE auxillary task.
-The training is guided by teacher's forcing, showing the model the correct context at every step (exposing [0, t-1] at step t from T where T is block_size), while also masking logits for illegal predictions based on the true trajectory. As training progress, the model's input ([0, t-1]) is partially masked (CBM) to teach the model to handle inaccuracies in generation, while avoiding masking same tokens as the EMREmbedding + MEAL + _START + _END tokens, to not clash with the penalties the model recieves.
+The training uses next token prediction loss (temporal-window masked BCE Focal Loss + masked CE loss) + time prediction MSE (Δt) + outcome prediction BCE auxillary task.
+The training is guided by teacher's forcing, showing the model the correct context at every step (exposing [0, t-1] at step t from T where T is block_size), while also masking logits for illegal predictions based on the true trajectory. As training progress, the model's input ([0, t-1]) is partially masked (CBM) to teach the model to handle inaccuracies in generation, while avoiding masking same tokens as the EMREmbedding + MEAL + _START + _END tokens, to not clash with the legal set of next tokens to model can use.
 
-The training flow uses a warmup period where the model is to learn patterns using a frozen embedder (so that the sharp gradients won't cause forgetting to the embedder's weights).
+The training flow uses warmup/curriculum scheduling (LR warmup, BCE-only phase, and staged auxiliary losses). The embedder is trainable during Phase 2, but updated with a lower learning rate than the transformer blocks.
 
 ---
 
@@ -337,6 +336,11 @@ This work builds on and adapts ideas from the following sources:
 - **nanoGPT** (Karpathy, 2023):  
   The training loop and transformer backbone are adapted from [nanoGPT](https://github.com/karpathy/nanoGPT),  
   with modifications for multi-stream EMR inputs, multiple embeddings, and a k-step prediction loss.
+
+- **RoPE / RoFormer** (Su et al., 2021):  
+  The attention module uses rotary position embeddings adapted to continuous/absolute timestamps (temporal RoPE) to inject time into Q/K rotations.  
+  📄 *J. Su, Y. Lu, S. Pan, A. Murtadha, B. Wen. "RoFormer: Enhanced Transformer with Rotary Position Embedding." arXiv:2104.09864.*  
+  [arXiv:2104.09864](https://arxiv.org/abs/2104.09864)
 
 - **AdaLN-Zero** (Peebles, W., & Xie, S., 2023):  
   Inspired by the paper "Scalable diffusion models with transformers", I added a customized block to the transformer designed to allow static context influence all generation steps. The [paper](https://openaccess.thecvf.com/content/ICCV2023/papers/Peebles_Scalable_Diffusion_Models_with_Transformers_ICCV_2023_paper.pdf) uses this method to inform the diffusion model of the label of the image it should generate.

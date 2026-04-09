@@ -4,6 +4,12 @@ schedulers.py
 
 Unified auxiliary loss weighting scheduler for Phase-1 (embedding) and Phase-2 (transformer) training.
 
+LRScheduleController:
+    - Wraps Phase-2 OneCycleLR construction and step updates.
+    - Uses `phase2_scheduler["warmup_epochs"]` when provided, otherwise
+        falls back to `phase2_scheduler["bce_only_epochs"]` for LR warmup.
+    - Exposes `update`, `state_dict`, and `load_state_dict` for training/resume.
+
 LambdaScheduleController:
   - Accepts a phase-specific schedule config dict.
   - Defines auxiliary tasks and their curriculum via an `order` list-of-lists:
@@ -36,6 +42,8 @@ update() call convention:
     )
 """
 
+import torch
+
 
 def linear_schedule(epoch: int, start_epoch: int, end_epoch: int, max_val: float) -> float:
     """
@@ -48,6 +56,74 @@ def linear_schedule(epoch: int, start_epoch: int, end_epoch: int, max_val: float
         return max_val
     progress = min(max((epoch - start_epoch) / float(end_epoch - start_epoch), 0.0), 1.0)
     return max_val * progress
+
+
+class LRScheduleController:
+    """Controller wrapper for Phase-2 LR scheduling.
+
+    Encapsulates a OneCycleLR instance and exposes a minimal interface used by
+    training loops and checkpointing (`update`, `state_dict`, `load_state_dict`).
+    """
+
+    def __init__(self, optimizer, training_settings, train_dl):
+        """Configure the phase-2 learning-rate scheduler controller.
+
+        Builds and owns a `torch.optim.lr_scheduler.OneCycleLR` instance used
+        during phase-2 training. The warmup portion is derived from
+        `training_settings["phase2_scheduler"]["warmup_epochs"]` or `training_settings["phase2_scheduler"]["bce_only_epochs"]`
+        and converted to OneCycle's
+        `pct_start` fraction.
+
+        Args:
+            optimizer (torch.optim.Optimizer): Optimizer instance whose param
+                    groups are already configured for transformer training.
+            training_settings (dict): Training hyperparameters containing at
+                    least:
+                    - `phase2_n_epochs`
+                    - `phase2_scheduler`
+            train_dl (DataLoader): Training dataloader used to infer
+                    `steps_per_epoch` via `len(train_dl)`.
+
+        Notes:
+            - Expected optimizer param-group order is
+                `[decay, no_decay, embedder]`.
+            - `max_lr` is mapped to those groups as
+                `[base_lr, base_lr, base_lr * 0.1]`.
+            - Auxiliary-loss lambda scheduling is independent and handled by
+                `LambdaScheduleController`.
+        """
+        total_epochs = training_settings["phase2_n_epochs"]
+        lr_warmup_epochs = training_settings["phase2_scheduler"].get("warmup_epochs", 0) or training_settings["phase2_scheduler"].get("bce_only_epochs", 0)
+        pct = max(1e-6, min(0.9, lr_warmup_epochs / float(total_epochs)))
+
+        base_lr = training_settings["phase2_learning_rate"]
+        # Keep max_lr aligned with optimizer param groups: decay, no_decay, embedder(0.1x)
+        max_lrs = [base_lr, base_lr, base_lr * 0.1]
+
+        self._scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lrs,
+            epochs=total_epochs,
+            steps_per_epoch=len(train_dl),
+            pct_start=pct,
+            anneal_strategy="cos",
+            cycle_momentum=False,
+            div_factor=10,
+            final_div_factor=10,
+        )
+
+    def update(self):
+        """Advance LR scheduler by one optimizer step."""
+        self._scheduler.step()
+
+    def get_last_lr(self):
+        return self._scheduler.get_last_lr()
+
+    def state_dict(self):
+        return self._scheduler.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self._scheduler.load_state_dict(state_dict)
 
 
 class LambdaScheduleController:
@@ -123,7 +199,16 @@ class LambdaScheduleController:
             self._stage_best = float("inf")
             self._stage_bad_epochs = 0
 
-        self._warmup_complete_epoch = None
+        # Warmup completion gate used by training loops to start early-stop counting.
+        # Single-stage schedules have a known warmup completion at init time;
+        # multi-stage schedules resolve this only after the final stage unlocks.
+        if self._has_dynamic:
+            self._warmup_complete_epoch = None
+        else:
+            if len(order) == 0:
+                self._warmup_complete_epoch = self.start_epoch
+            else:
+                self._warmup_complete_epoch = max(self._ramp_end(n) for n in order[0])
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -291,10 +376,8 @@ class LambdaScheduleController:
         -------
         int | float | None
             - Multi-stage: float('inf') until last stage unlocked, then concrete epoch.
-            - Single-stage: None (caller manages warmup separately).
+            - Single-stage: concrete epoch (end of stage-0 ramp).
         """
-        if not self._has_dynamic:
-            return None
         if self._warmup_complete_epoch is None:
             return float("inf")
         return self._warmup_complete_epoch

@@ -99,10 +99,8 @@ def prepare_data(sample=False):
     
     summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer)   
 
-    assert train_ds.context_df.shape[1] == MODEL_CONFIG['ctx_dim'], (
-    f"Context dimension mismatch: expected {MODEL_CONFIG['ctx_dim']}, "
-    f"but got {train_ds.context_df.shape[1]}. Columns: {list(train_ds.context_df.columns)}"
-    )
+    MODEL_CONFIG["ctx_dim"] = int(train_ds.context_df.shape[1])
+    print(f"[Pre-processing]: Auto-set MODEL_CONFIG['ctx_dim'] = {MODEL_CONFIG['ctx_dim']}")
 
     embedder_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False) # Regular, no shuffle
     transformer_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=True) # Balanced batches

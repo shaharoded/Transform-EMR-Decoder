@@ -349,8 +349,8 @@ if __name__ == "__main__":
 
     # Load models
     print("Loading model and generating predictions...")
-    embedder, _, _, _, _ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=tokenizer)
-    model, _, _, _, _ = GPT.load(TRANSFORMER_CHECKPOINT, embedder=embedder)
+    embedder, _, _, _, _, _, _ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=tokenizer)
+    model, _, _, _, _, _ = GPT.load(TRANSFORMER_CHECKPOINT, embedder=embedder)
     model.eval()
 
     # Run inference

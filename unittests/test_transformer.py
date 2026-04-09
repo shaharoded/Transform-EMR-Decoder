@@ -16,7 +16,6 @@ def mini_tokenizer():
     special_tokens = ["[PAD]", "[MASK]", "[NULL]"]
     token_weights = torch.ones(len(toks))
     outcome_weights = torch.ones(len(toks))
-    important_ids = torch.tensor([], dtype=torch.long)
     token_counts = torch.tensor([], dtype=torch.long)
 
     # Dummy parent raw mapping
@@ -32,8 +31,7 @@ def mini_tokenizer():
         special_tokens=special_tokens,
         token_weights=token_weights,
         outcome_weights=outcome_weights,
-        important_token_ids=important_ids,
-        token_counts = token_counts,
+        token_counts=token_counts,
         tokenid2parent_raw_ids=tokenid2parent_raw_ids,
         parent_pad_len=parent_pad_len
     )
@@ -109,7 +107,7 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
     context = torch.zeros(B, 2)
 
     with torch.no_grad():
-        logits, abs_t, outcomes = model(
+        logits, abs_t, outcomes, dt_gate = model(
             parent_raw_ids=parent_raw,
             concept_ids=concept,
             value_ids=value,
@@ -121,6 +119,7 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
     assert logits.shape == (B, T, V), f"Expected logits shape {(B, T, V)}, got {logits.shape}"
     assert abs_t.shape == (B, T), f"Expected abs_t shape {(B, T)}, got {abs_t.shape}"
     assert outcomes.shape == (B, T, model.num_outcomes), f"Expected outcomes shape {(B, T, model.num_outcomes)}, got {outcomes.shape}"
+    assert dt_gate.shape == (B, T), f"Expected dt_gate shape {(B, T)}, got {dt_gate.shape}"
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_transformer_forward_gpu(mini_transformer, mini_tokenizer):

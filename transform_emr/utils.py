@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import pandas as pd
+from typing import Optional
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import (
@@ -16,165 +17,143 @@ from transform_emr.config.dataset_config import (
 from transform_emr.schedulers import linear_schedule
 
 
-class OutcomePRTracker:
+@torch.no_grad()
+def get_temporal_multi_hot_targets(
+    target_ids: torch.Tensor,
+    all_abs_ts: torch.Tensor,
+    padding_idx: int,
+    vocab_size: int,
+    window_size: float,
+    query_abs_ts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
-    Tracks precision/recall at a few thresholds and max-F1 per outcome
-    using masked probabilities from teacher-forced batches.
+    Build temporal multi-hot targets over a future time window using GPU-efficient
+    searchsorted + prefix-sum approach.
 
-    outcomes scored: ["RELEASE", "DEATH", <each COMPLICATION token>]
-    Scores are computed per example as max_t P(outcome at t).
-    Labels are whether the outcome appears at any step.
+    For each query step t, marks token ids that appear at any future step s such that:
+        0 < (all_abs_ts[s] - query_abs_ts[t]) <= window_size
+
+    IMPORTANT: This function assumes all_abs_ts is NON-DECREASING (sorted) per batch.
+    The dataset MUST maintain this ordering. See dataset.py for sorting guarantees.
+
+    Args:
+        target_ids: [B, T_all] token ids whose occurrences will be marked as positives.
+        all_abs_ts: [B, T_all] absolute timestamps, MUST be non-decreasing per batch.
+        padding_idx: Token id used for PAD. PAD is excluded from targets.
+        vocab_size: Vocabulary size V for output shape.
+        window_size: Future window size (same normalized units as ``all_abs_ts``).
+        query_abs_ts: [B, T_q] optional query timestamps. If omitted, uses ``all_abs_ts``.
+
+    Returns:
+        FloatTensor [B, T_q, V] with 0/1 multi-hot labels.
     """
-    def __init__(self, tokenizer, thresholds=(0.05, 0.10, 0.20, 0.30, 0.50), device="cpu"):
-        self.names, self.ids = [], []
-        outcomes = TERMINAL_OUTCOMES + OUTCOMES
-        for name in outcomes:
-            if name in tokenizer.token2id:
-                self.names.append(name)
-                self.ids.append(tokenizer.token2id[name])
+    if query_abs_ts is None:
+        query_abs_ts = all_abs_ts
 
-        self.ids = torch.tensor(self.ids, device=device, dtype=torch.long)         # [K]
-        self.thr = torch.tensor(list(thresholds), device=device, dtype=torch.float32)  # [M]
+    B, T_all = target_ids.shape
+    T_q = query_abs_ts.size(1)
 
-        K, M = len(self.ids), len(self.thr)
-        self.tp = torch.zeros(K, M, device=device, dtype=torch.float32)
-        self.fp = torch.zeros(K, M, device=device, dtype=torch.float32)
-        self.fn = torch.zeros(K, M, device=device, dtype=torch.float32)
+    # GPU-friendly searchsorted + prefix-sum approach (O(B * T * log T) instead of O(B * T^2)).
+    # Assumes timestamps are sorted; violation will produce incorrect results silently.
+    left_idx = torch.searchsorted(all_abs_ts, query_abs_ts, right=True)
+    right_idx = torch.searchsorted(all_abs_ts, query_abs_ts + window_size, right=True)
 
-    @torch.inference_mode()
-    def update(self, logits, allowed, target_ids, nonpad):
-        """
-        logits:   [B,T,V] raw logits for teacher-forced steps
-        allowed:  [B,T,V] bool mask of legal classes
-        target_ids: [B,T] target token ids
-        nonpad:   [B,T]   bool, valid steps
-        """
-        allowed = allowed.bool()
-        nonpad  = nonpad.bool()
+    oh = F.one_hot(target_ids.clamp(min=0), num_classes=vocab_size).to(torch.float32)  # [B, T_all, V]
+    csum = oh.cumsum(dim=1)
 
-        # masked probabilities over allowed classes
-        P = masked_softmax(logits, allowed)                        # [B,T,V]
-        P = P * nonpad.unsqueeze(-1).to(P.dtype)                   # zero out PAD steps (fast + broadcast-safe)
+    # Prefix a zero row so window sum is prefix[right] - prefix[left].
+    prefix = torch.cat(
+        [torch.zeros(B, 1, vocab_size, device=target_ids.device, dtype=csum.dtype), csum],
+        dim=1,
+    )  # [B, T_all+1, V]
 
-        # labels[b,k] = example b has class k anywhere in valid steps
-        ids = self.ids.view(1, 1, -1)                              # [1,1,K]
-        labels = ((target_ids.unsqueeze(-1) == ids) &              # [B,T,K]
-                  nonpad.unsqueeze(-1)).any(dim=1)                 # [B,K] bool
+    left = left_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
+    right = right_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
 
-        # scores[b,k] = max_t P(class k at t) over valid steps
-        scores = P.index_select(dim=2, index=self.ids).amax(dim=1) # [B,K]
+    future_counts = prefix.gather(1, right) - prefix.gather(1, left)
+    multi_hot = (future_counts > 0).to(torch.float32)
 
-        # accumulate counts for all thresholds at once
-        pred = scores.unsqueeze(-1) >= self.thr.view(1, 1, -1)     # [B,K,M]
-        lab  = labels.unsqueeze(-1)                                 # [B,K,1]
-
-        self.tp += (pred &  lab).sum(dim=0).to(self.tp.dtype)       # [K,M]
-        self.fp += (pred & ~lab).sum(dim=0).to(self.fp.dtype)
-        self.fn += ((~pred) & lab).sum(dim=0).to(self.fn.dtype)
-
-    def compute(self):
-        precision = self.tp / (self.tp + self.fp).clamp_min(1e-8)
-        recall    = self.tp / (self.tp + self.fn).clamp_min(1e-8)
-        f1        = (2 * precision * recall) / (precision + recall).clamp_min(1e-8)
-        max_f1, idx = f1.max(dim=1)
-
-        return {
-            "thresholds": self.thr.tolist(),
-            "per_class_maxF1": {n: float(v) for n, v in zip(self.names, max_f1.tolist())},
-            "per_class_P_at_maxF1": {
-                n: float(precision[i, idx[i]])
-                for i, n in enumerate(self.names)
-            },
-            "per_class_R_at_maxF1": {
-                n: float(recall[i, idx[i]])
-                for i, n in enumerate(self.names)
-            },
-        }
-
-    def reset(self):
-        self.tp.zero_(); self.fp.zero_(); self.fn.zero_()
-    
-
-def get_multi_hot_targets(position_ids: torch.Tensor,
-                          padding_idx: int,
-                          vocab_size: int,
-                          k: int) -> torch.Tensor:
-    """
-    For each timestep t, mark all tokens that appear in positions [t+1, t+k]
-    with a multi-hot vector (0/1) over the vocabulary.
-
-    Parameters
-    ----------
-    position_ids : LongTensor, shape [B, T]
-        Token ids, right-padded with `padding_idx`.
-    padding_idx  : int
-        The pad token id. It will be excluded from the targets.
-    vocab_size   : int
-        Size of the vocabulary.
-    k            : int
-        Lookahead window size.
-
-    Returns
-    -------
-    targets : FloatTensor, shape [B, T, V]
-        Multi-hot matrix. targets[b, t, v] == 1 if token v appears in
-        any of the next k positions after t (inclusive of t+1, exclusive of t).
-    """
-    B, T = position_ids.shape
-    device = position_ids.device
-
-    # One‐hot: [B, T, V]
-    oh = F.one_hot(position_ids.clamp(min=0), num_classes=vocab_size).to(torch.float32)
-    csum = oh.cumsum(dim=1)  # [B, T, V]
-
-    # Build csum_k by shifting left k, then for tail positions repeat the last csum row
-    # 1) core = csum[:, k:] gives shape [B, T–k, V]
-    core   = csum[:, k:]                # sums through position k..T–1
-    # 2) tail = last csum vector repeated k times
-    last   = csum[:, -1:]               # shape [B, 1, V]
-    tail   = last.repeat(1, k, 1)       # shape [B, k, V]
-    # 3) concat back to length T
-    csum_k = torch.cat([core, tail], dim=1)  # [B, T, V]
-
-    # future counts in (t+1 .. t+k] = csum_k – csum
-    future = (csum_k - csum).clamp_min(0.0)  # [B, T, V]
-
-    # never supervise PAD
     if 0 <= padding_idx < vocab_size:
-        future[..., padding_idx] = 0.0
+        multi_hot[..., padding_idx] = 0.0
 
-    return (future > 0).to(torch.float32)
+    return multi_hot
 
+
+@torch.no_grad()
 def get_future_outcome_targets(
-    position_ids: torch.Tensor,   # [B, T]
-    outcome_ids: list[int],       # [K] list of outcome token IDs
-) -> torch.Tensor:                # [B, T, K] Float (0.0 or 1.0)
+    target_ids: torch.Tensor,      # [B, T] token ids
+    outcome_ids: list,        # [K] list of outcome token IDs
+    all_abs_ts: Optional[torch.Tensor] = None,  # [B, T] absolute timestamps
+    query_abs_ts: Optional[torch.Tensor] = None, # [B, T_q] query timestamps
+    tau: Optional[float] = None,      # decay time constant (hours / 336)
+    horizon: Optional[float] = None,  # max lookahead horizon (hours / 336)
+) -> torch.Tensor:
     """
-    Builds binary targets for auxiliary outcome prediction.
-    target[b, t, k] = 1 if outcome_ids[k] appears in position_ids[b, t+1:]
+    Builds time-aware outcome targets for auxiliary prediction head.
+
+    Two modes:
+    
+    1. **Binary mode** (all_abs_ts=None): 
+       target[b, t, k] = 1 if outcome_ids[k] appears in position_ids[b, t+1:] (anywhere after t).
+       
+    2. **Time-decayed mode** (all_abs_ts provided):
+       target[b, t, k] = soft score ∈ [0, 1]:
+           sum_s { exp(-dt(t,s) / tau) * 1[token_s == outcome_k] }.clamp(0, 1)
+       where dt(t,s) is filtered by 0 < dt <= horizon.
+       Maximum signal for outcomes very soon; decays exponentially to zero.
+
+    Args:
+        target_ids: [B, T] token sequence to search for outcomes.
+        outcome_ids: [K] list of outcome token IDs.
+        all_abs_ts: [B, T] absolute timestamps aligned with target_ids. If provided, enables time decay.
+        query_abs_ts: [B, T_q] query timestamps. If omitted, uses all_abs_ts (same shape as target_ids).
+        tau: Decay time constant (same units as timestamps). Only used if all_abs_ts is provided.
+        horizon: Max lookahead window (same units as timestamps). Only used if all_abs_ts is provided.
+
+    Returns:
+        FloatTensor [B, T_q, K] with outcome probabilities (0/1 for binary, soft [0..1] for decayed).
     """
-    B, T = position_ids.shape
+    # B, T = target_ids.shape
     K = len(outcome_ids)
-    device = position_ids.device
+    device = target_ids.device
     
-    # [1, 1, K] for broadcasting
+    # Build outcome match matrix: [B, T, K]
+    # matches[b, t, k] = 1.0 if target_ids[b, t] == outcome_ids[k]
     out_tensor = torch.tensor(outcome_ids, device=device, dtype=torch.long).view(1, 1, K)
+    matches = (target_ids.unsqueeze(-1) == out_tensor).float()  # [B, T, K]
+
+    # Binary mode: no time information
+    if all_abs_ts is None:
+        # Shift matches to get "future presence": target[t] = any match at s > t
+        future_matches = torch.zeros_like(matches)
+        future_matches[:, :-1, :] = matches[:, 1:, :]
+        future_presence = future_matches.flip(dims=[1]).cummax(dim=1).values.flip(dims=[1])
+        return future_presence
+
+    # Time-decayed mode
+    if query_abs_ts is None:
+        query_abs_ts = all_abs_ts
     
-    # 1. Where do outcomes occur? [B, T, K]
-    # matches[b, t, k] is True if token at t is outcome k
-    matches = (position_ids.unsqueeze(-1) == out_tensor) 
+    if tau is None or horizon is None:
+        raise ValueError(
+            "tau and horizon must be provided when all_abs_ts is given. "
+            "Use model_config.TRAINING_SETTINGS for defaults."
+        )
+
+    # T_q = query_abs_ts.size(1)
+    # Compute time differences: [B, T_q, T]
+    dt = all_abs_ts.unsqueeze(1) - query_abs_ts.unsqueeze(2)
     
-    # 2. Propagate "Future Presence" backwards
-    # We want target[t] to be True if match occurs at any step > t.
-    # Shift matches left by 1 (future relative to t)
-    future_matches = torch.zeros_like(matches)
-    future_matches[:, :-1, :] = matches[:, 1:, :] # shift left
+    # Horizon filtering: 0 < dt <= horizon
+    in_horizon = (dt > 0) & (dt <= horizon)
     
-    # Reverse cumulative max (logical OR) -> "Does it happen anytime after now?"
-    # flip time, cummax, flip back
-    future_presence = future_matches.flip(dims=[1]).cummax(dim=1).values.flip(dims=[1])
+    # Decay weights: exp(-dt / tau), masked to horizon
+    decay_weights = torch.exp(-dt / tau).masked_fill(~in_horizon, 0.0)  # [B, T_q, T]
     
-    return future_presence.float()
+    # Aggregate outcomes via batch matrix multiply: [B, T_q, T] x [B, T, K] -> [B, T_q, K]
+    outcome_targets = torch.bmm(decay_weights, matches).clamp(0.0, 1.0)
+    
+    return outcome_targets
 
 
 def build_mlm(ids, tokenizer, p=0.15):
@@ -509,10 +488,9 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
                               conflict_mat: torch.BoolTensor,
                               predict_block: torch.BoolTensor):
     """
-    Vectorized legality/bonus masks from GOLD prefix (teacher forcing).
+    Vectorized legality masks from GOLD prefix (teacher forcing).
 
     illegal[B,T,V]  True → forbid v at step t
-    bonus  [B,T,V]  True → boost v at step t
 
     Terms:
     If token== 'GLUCOSE_TREND_inc_START', base(tok) == 'GLUCOSE_TREND_inc'
@@ -524,13 +502,12 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
       • START illegal if base already open 
       (You can't have 'GLUCOSE_TREND_inc_START' after 'GLUCOSE_TREND_inc_START' without seeing
         'GLUCOSE_TREND_inc_END'). Enforced using base(tok).
-      • END bonus  if base open (to push the model to close intervals). Enforced using base(tok).
       • START of concept(tok) is illegal if concept(tok) is still open 
         (meaning you can't have 'GLUCOSE_TREND_inc_START' after 'GLUCOSE_TREND_dec_START' without seeing
         'GLUCOSE_TREND_inc_END'). Enforced using concept(tok).
 
     Meal logic:
-      cyclic order; meal m illegal if predecessor rank not seen yet, bonus if seen. 
+            cyclic order; meal m illegal if predecessor rank not seen yet.
       The first meal is never illegal, only the following ones.
 
     All done without loops over T (only broadcast/cumsums).
@@ -567,14 +544,12 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
     prev_e = torch.zeros_like(ends_cum);   prev_e[:,1:,:] = ends_cum[:,:-1,:]
     open_before = (prev_s - prev_e) > 0  # [B,T,nb]
 
-    # Prepare illegal / bonus matrices
+    # Prepare legality matrix
     illegal = torch.zeros(B, T, V, device=device, dtype=torch.bool)
-    bonus   = illegal.clone()
 
-    # 1) END rules: illegal if not open_before, bonus if open_before
+    # 1) END rules: illegal if not open_before
     end_ids = end_ids_per_base.view(1,1,nb).expand(B,T,nb)
     illegal.scatter_(2, end_ids, ~open_before)
-    bonus.  scatter_(2, end_ids,  open_before)
 
     # 2) DUP-START: START when *that same* base was already open should be illegal
     #    clamp base_id to ≥0 so gather never errors
@@ -632,210 +607,13 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
             ok_initial  = ~any_seen                                 # [B,T,1]
             ok          = ok_pred | ok_initial                     # [B,T,nv]
 
-            # 4) apply to illegal/bonus
+            # 4) apply to illegal mask
             illegal[:,:,v_ids] |= ~ok
-            bonus  [:,:,v_ids] |=  ok
     
     # ---- Specials never to be predicted ----
     illegal |= predict_block.view(1, 1, -1)   # broadcast [V] -> [B,T,V]
 
-    return illegal, bonus
-
-
-def penalty_interval_structure(
-    pred_ids: torch.LongTensor,
-    gt_ids:   torch.LongTensor,
-    is_start:             torch.BoolTensor,
-    is_end:               torch.BoolTensor,
-    base_id:              torch.LongTensor,
-    start_ids_per_base:   torch.LongTensor,
-    end_ids_per_base:     torch.LongTensor,
-    meal_rank:            torch.LongTensor,
-    meal_pred_rank:       torch.LongTensor,
-    K_meals:              torch.Tensor,
-    conflict_mat:         torch.BoolTensor,
-    predict_block:       torch.BoolTensor,
-    window:               int = 5,
-) -> torch.Tensor:
-    """
-    Computes a structural-violation penalty for interval tokens, covering:
-      FSM : END without an open START
-      DUP : START when same base already open
-      UNC : START never closed by END (sequence ended)
-      CNF : START while a conflicting base is open (same concept, different value)
-
-    Returns a scalar ∈ [0,1]:
-      (new_timestep_violations + new_unc_violations) /
-      (interval_token_count + batch_size)
-
-    Forgiveness: if a violation of the same token_id and type
-    occurs in the GT sequence within ±`window` time steps,
-    it is forgiven (not counted as new). Unclosed (UNC) violations
-    are forgiven if the same base remains unclosed in GT.
-
-    Args:
-      pred_ids, gt_ids: [B, T] LongTensor
-      is_start, is_end, base_id: [V] Bool/Long tensors
-      conflict_mat: [nb, nb] Bool
-      window: integer radius for forgiving GT violations around each t
-    """
-    B, T = pred_ids.shape
-
-    # 1) Compute illegal masks for pred & GT
-    illegal_pred, _ = compute_legality_masks_tf(
-        pred_ids, is_start, is_end,
-        base_id, start_ids_per_base, end_ids_per_base,
-        meal_rank, meal_pred_rank, K_meals, conflict_mat, predict_block
-    )
-    illegal_gt, _ = compute_legality_masks_tf(
-        gt_ids,   is_start, is_end,
-        base_id, start_ids_per_base, end_ids_per_base,
-        meal_rank, meal_pred_rank, K_meals, conflict_mat, predict_block
-    )
-
-    # Gather illegal flags per token
-    # 2a) Gather illegal flags per token for pred **and** GT
-    pred_illegal = illegal_pred.gather(2, pred_ids.unsqueeze(-1)).squeeze(-1)  # [B,T]
-    gt_illegal   = illegal_gt.  gather(2, gt_ids.  unsqueeze(-1)).squeeze(-1)  # [B,T]
-
-    # Do not let specials (PAD/CTX/MASK) create forgiveness windows
-    gt_special = predict_block[gt_ids]      # [B,T] True where GT token is a special
-    gt_illegal = gt_illegal & (~gt_special) # drop specials from GT-illegal used for forgiveness
-
-    # Do not count specials on the PRED side as “new” violations either
-    pred_special = predict_block[pred_ids]     # specials in PRED
-    pred_illegal = pred_illegal & (~pred_special)
-
-    # 2) Forgiveness window over GT
-    gt_win = F.max_pool1d(
-        gt_illegal.float().unsqueeze(1),
-        kernel_size=2*window+1, stride=1, padding=window
-    ).squeeze(1).bool()  # [B,T]
-
-    # 3) New-timestep violations
-    new_ts_viol = pred_illegal & (~gt_win)
-    count_ts_viol = new_ts_viol.float().sum()
-
-    # 4) Unclosed (UNC) violations: count residual opens
-    # Map tokens → base indices
-    base_idx = base_id[pred_ids]  # [B,T]
-    # Masks where start/end occurred and base_idx >=0
-    start_mask = is_start[pred_ids] & (base_idx >= 0)
-    end_mask   = is_end  [pred_ids] & (base_idx >= 0)
-
-    nb = conflict_mat.shape[0]
-    # Count starts/ends via scatter_add
-    starts_pred = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
-    ends_pred   = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
-    starts_gt   = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
-    ends_gt     = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
-
-    # Predicted
-    if start_mask.any():
-        idxs = base_idx[start_mask]
-        b_idxs, t_idxs = (start_mask).nonzero(as_tuple=True)
-        # scatter per batch
-        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
-            starts_pred[b, tid] += 1.0
-    if end_mask.any():
-        idxs = base_idx[end_mask]
-        b_idxs, t_idxs = (end_mask).nonzero(as_tuple=True)
-        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
-            ends_pred[b, tid] += 1.0
-    # GT
-    base_idx_gt = base_id[gt_ids]
-    mask_s_gt = is_start[gt_ids] & (base_idx_gt >= 0)
-    mask_e_gt = is_end  [gt_ids] & (base_idx_gt >= 0)
-    if mask_s_gt.any():
-        idxs = base_idx_gt[mask_s_gt]
-        b_idxs, t_idxs = mask_s_gt.nonzero(as_tuple=True)
-        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
-            starts_gt[b, tid] += 1.0
-    if mask_e_gt.any():
-        idxs = base_idx_gt[mask_e_gt]
-        b_idxs, t_idxs = mask_e_gt.nonzero(as_tuple=True)
-        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
-            ends_gt[b, tid] += 1.0
-
-    open_pred = (starts_pred - ends_pred) > 0  # [B, nb]
-    open_gt   = (starts_gt   - ends_gt)   > 0  # [B, nb]
-    new_unc_viol = (open_pred & (~open_gt)).float().sum()
-
-    # 5) Normalize by interval tokens + batch
-    denom = ((base_idx >= 0).float().sum() + B).clamp_min(1.0)
-    penalty = (count_ts_viol + new_unc_viol) / denom
-    return penalty
-
-
-def penalty_meal_order(pred_ids:  torch.LongTensor, meal_rank: torch.LongTensor) -> torch.Tensor:
-    """
-    Enforces cyclic order among meals: B→L→D→N→B...
-    We ignore non-meal tokens (they can appear anywhere in between).
-
-    Implementation:
-      1. Extract only meal ids per sequence (mask ranks>=0).
-      2. Compare each consecutive pair in that filtered list.
-
-    pred_ids  : [B,T]
-    meal_rank : [V]  (-1 non-meal, else 0..K-1)
-
-    return scalar ∈ [0,1] = (#wrong meal transitions)/(#meal transitions)
-    """
-
-    """
-    Computes a cyclic-meal-order penalty: B→L→D→N→B...
-    Returns a scalar ∈ [0,1]: the fraction of adjacent meal transitions
-    in the predicted sequence that violate the expected cycle.
-
-    Steps:
-      1. Map pred_ids → ranks (with -1 for non-meal tokens).
-      2. Compress each batch sequence into its meal-only sequence M of shape [B, max_meals].
-      3. Compute expected next-meal rank = (M[:, :-1] + 1) % K.
-      4. Count wrong transitions (curr != expected) and normalize by total transitions.
-
-    Fully batched, GPU-friendly, non differentiable (due to argmax -> pred_ids).
-    """
-    device = pred_ids.device
-    ranks = meal_rank[pred_ids]  # [B,T]
-    B, T = ranks.shape
-    mask = ranks >= 0            # [B,T]
-    if not mask.any():
-        return torch.tensor(0.0, device=device)
-
-    # 1. Identify meal positions per sequence
-    mask_int = mask.int()
-    meal_idx = torch.cumsum(mask_int, dim=1)  # [B, T]
-    meal_counts = meal_idx[:, -1]             # [B]
-    max_meals = int(meal_counts.max().item())
-
-    # 2. Scatter predicted ranks into a compact [B,max_meals] matrix
-    b_t = mask.nonzero(as_tuple=False)        # [N,2] of (b, t)
-    b_idx, t_idx = b_t[:, 0], b_t[:, 1]
-    k_idx = meal_idx[b_idx, t_idx] - 1       # [N]
-
-    M = torch.full((B, max_meals), -1, dtype=ranks.dtype, device=device)
-    flat_M = M.view(-1)
-    flat_idx = b_idx * max_meals + k_idx
-    flat_M[flat_idx] = ranks[b_idx, t_idx]
-    M = flat_M.view(B, max_meals)
-
-    # 3. Compute transitions
-    prev = M[:, :-1]
-    curr = M[:, 1:]
-    valid = (prev >= 0) & (curr >= 0)
-    K = int(meal_rank.max().item()) + 1
-    expected = (prev + 1) % K
-
-    wrong = ((curr != expected) & valid).float().sum()
-    total = valid.float().sum().clamp_min(1.0)
-    return wrong / total
-
-
-@torch.no_grad()
-def _gather_valid_ids(ids_tensor):
-    """Return (ids_valid, mask_valid) where ids_valid has all ids >=0 and mask_valid selects those columns."""
-    mask = ids_tensor >= 0
-    return ids_tensor[mask], mask
+    return illegal
 
 
 def masked_softmax(logits, allowed):
@@ -860,6 +638,171 @@ def masked_softmax(logits, allowed):
     # stop gradients on fully-masked rows (no learning signal there)
     probs = probs * any_valid.float()
     return probs
+
+
+def apply_masks_to_logits(logits, illegal_mask):
+    """
+    logits: [B,T,V] *after* slicing (no [CTX])
+    illegal_mask: Bool [B,T,V]
+
+    Sets illegal-token logits to -1e9 so they are suppressed in both
+    softmax and BCE without producing NaN gradients.
+
+    Note: bonus boosting (+0.2 for legal-closure tokens) was removed.
+    The bonus was a hardcoded nudge toward closing open intervals, but
+    it was never calibrated and interfered with BCE learning the same
+    signal organically. The illegal hard-mask is sufficient.
+    """
+    return logits.masked_fill(illegal_mask, -1e9)
+
+
+def plot_losses(train_losses, val_losses):
+    """
+    Plot train vs. validation loss to inspect training quality.
+
+    Ignores loss at first step (major instability).
+    """
+    train_losses = train_losses[1:]
+    val_losses = val_losses[1:]
+
+    epochs = range(1, len(train_losses) + 1)
+    plt.figure()
+    plt.plot(epochs, train_losses, label="Train loss")
+    plt.plot(epochs, val_losses, label="Val loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training vs. validation loss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+def build_rep_penalty(last_tokens, V, window=5, strength=0.6, device=None):
+    """
+    Soft repetition discourager on inference.
+    last_tokens : list[int]   (already generated, newest at the end)
+    V           : vocab size
+    window      : how many recent tokens we look back
+    strength    : scalar multiplier for the penalty (0..1 typical)
+    Returns:
+        rep_vec : [V] float tensor, 0 for unseen, higher for very recent repeats
+    """
+    if not last_tokens or strength <= 0:
+        return torch.zeros(V, device=device)
+    device = device or torch.device("cpu")
+    k = min(window, len(last_tokens))
+    # decay weights: newest gets 1.0, then 0.8, 0.6, ...
+    decay = torch.linspace(1.0, 0.2, steps=window, device=device)[:k]
+    idx = torch.tensor(last_tokens[-k:], device=device)
+
+    rep_vec = torch.zeros(V, device=device)
+    # reverse so newest aligns with decay[0]
+    rep_vec.index_add_(0, idx.flip(0), decay)
+    return rep_vec * strength
+
+
+def audit_generated_stream(
+        results_df: pd.DataFrame,
+        tokenizer,
+        token_w: int = 50,        # Max width of the “Token” column
+    ) -> None:
+    """
+    Prints a step-by-step structural audit of a context+generation stream.
+    Used for model manual tests after training, to validate poor results.
+
+    After the row-by-row trace it prints the whole DataFrame (Token,
+    IsInput, Note).  No return value.
+    """
+    # ------------- helpers ------------- #
+    def _print(idx, tok, is_inp, problems, token_w):
+        clipped = (tok[:token_w - 3] + "...") if len(tok) > token_w else tok
+        note    = ";".join(problems)
+        print(f"{idx:4d}  {clipped:<{token_w}}  {int(is_inp):>5d}  {note}")
+    
+    # ------------- look‑ups & runtime state ------------- #
+    l = build_luts(tokenizer)
+    is_start, is_end   = l['is_start'], l['is_end']
+    base_id            = l['base_id']
+    meal_rank          = l['meal_rank']
+    conflict_mat       = l['conflict_mat']
+    nb                 = int(l['start_ids_per_base'].numel())
+    K                  = int(l['K_meals'].item())
+
+    open_counts = torch.zeros(nb, dtype=torch.int16)
+    seen_meals  = torch.zeros(K,  dtype=torch.bool) if K else None
+
+    t2id = tokenizer.token2id
+    notes = []                                            # per‑row notes
+
+    # ------------- pretty header for live trace -------- #
+    hdr = f"{'Idx':>4}  {'Token':<{token_w}}  IsInp  Note"
+    print(hdr)
+    print("-" * len(hdr))
+
+    # ------------- iterate over stream ----------------- #
+    for idx, (tok, is_inp) in enumerate(zip(results_df['Token'],
+                                            results_df['IsInput'])):
+        tid = t2id.get(tok, None)
+        problems = []
+
+        # UNK
+        if tid is None:
+            problems.append("UNK")
+            notes.append(";".join(problems))
+            _print(idx, tok, is_inp, problems, token_w)
+            continue
+
+        b = base_id[tid].item()
+        s = bool(is_start[tid])
+        e = bool(is_end[tid])
+        r = meal_rank[tid].item()
+
+        # interval FSM / DUP / CNF
+        if e:
+            if b < 0 or open_counts[b] == 0:
+                problems.append("FSM")
+            else:
+                open_counts[b] -= 1
+        elif s:
+            if open_counts[b] > 0:
+                problems.append("DUP")
+            if conflict_mat.any() and (open_counts > 0).any():
+                if (conflict_mat[b] & (open_counts > 0)).any():
+                    problems.append("CNF")
+            open_counts[b] += 1
+
+        # meal order
+        if r >= 0:
+            if 'next_meal' not in locals():               # first meal we ever see
+                next_meal = (r + 1) % K                   # set expectation
+            else:
+                if r != next_meal:                        # wrong meal → violation
+                    problems.append("MEAL")
+                next_meal = (r + 1) % K                   # advance expectation
+
+        notes.append(";".join(problems))
+        
+    # ------------- final full table -------------------- #
+    df_out = results_df.copy()
+    df_out['Note'] = notes
+
+    pd.set_option("display.max_rows", None)
+    print("\n=== Full trajectory with annotations ===")
+    print(df_out[['Token', 'IsInput', 'Note']]
+          .to_string(index=True, col_space={'Token': token_w}))
+    
+
+# ---------------------------------------------------------------------------
+# Legacy / diagnostics-only helpers (not used by current training path)
+# These are kept for now for potential future use, but they are not called
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _gather_valid_ids(ids_tensor):
+    """Return (ids_valid, mask_valid) where ids_valid has all ids >=0 and mask_valid selects those columns."""
+    mask = ids_tensor >= 0
+    return ids_tensor[mask], mask
 
 
 def soft_interval_penalty(
@@ -1073,8 +1016,17 @@ def soft_illegal_mass_penalty(
     Penalize probability mass placed on illegal classes *before* masking.
     Scale ~[0,1]. Fully differentiable w.r.t. logits_pre_mask.
 
-    NOTE: This penalty is applied *before* masking, so it can affect the logits directly,
-    learning from illegality and not just blocking it.
+    NOTE: DEPRECATED — kept for diagnostic use only; removed from the training loss.
+
+    Why: The apply_masks_to_logits hard-mask already enforces legality at every step
+    (illegal logits → -1e9), so the model never selects illegal tokens regardless.
+    The penalty's only purpose would be to make the *pre-mask* distribution internally
+    avoid illegal regions — but BCE/CE gradients drive allowed logits up, which in
+    softmax space *relatively* raises illegal logits. The penalty gradient fights this
+    without enough λ budget to win. Net effect: the penalty fluctuates near its initial
+    value and contributes noise rather than useful signal.
+    Use for inspection (how much illegal mass does the raw network assign?) but not as
+    a training objective.
     """
     P = torch.softmax(logits_pre_mask, dim=-1)                     # [B,T,V]
     mass = (P * illegal_mask).sum(dim=-1)                          # [B,T]
@@ -1089,14 +1041,28 @@ def soft_illegal_mass_penalty(
 def soft_unclosed_interval_penalty(
     logits: torch.Tensor,           # [B,T,V] AFTER masking
     allowed: torch.Tensor,          # [B,T,V] bool
-    start_ids_per_base: torch.Tensor, 
+    start_ids_per_base: torch.Tensor,
     end_ids_per_base: torch.Tensor, # [nb]
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
     Penalizes intervals that remain open at the end of the sequence (step T).
     This captures global consistency that step-wise masks cannot enforce.
-    
+
+    NOTE: DEPRECATED — kept for diagnostic use only; removed from the training loss.
+
+    Why: The penalty aggregates total probability mass assigned to start tokens vs
+    end tokens across ALL time steps, then penalises relu(total_starts - total_ends).
+    This is a global approximation of a local constraint ("every start must be followed
+    by an end"). The resulting gradient tells the model "assign less mass to starts /
+    more mass to ends everywhere" — a diffuse signal that does not correspond to any
+    specific positional violation. A model satisfying global mass balance (total_starts
+    ≈ total_ends) can still generate structurally invalid sequences at individual steps.
+    The step-wise illegal mask already prevents the worst violations; the penalty adds
+    noise without improving structural correctness in practice.
+    Use for inspection (how much unclosed-interval mass accumulates over a batch?) but
+    not as a training objective.
+
     Returns: scalar penalty in [0, 1]
     """
     B, T, V = logits.shape
@@ -1135,155 +1101,180 @@ def soft_unclosed_interval_penalty(
     return pen_unclosed
 
 
-def apply_masks_to_logits(logits, illegal_mask, bonus_mask, bonus_boost=0.2):
+def penalty_interval_structure(
+    pred_ids: torch.LongTensor,
+    gt_ids:   torch.LongTensor,
+    is_start:             torch.BoolTensor,
+    is_end:               torch.BoolTensor,
+    base_id:              torch.LongTensor,
+    start_ids_per_base:   torch.LongTensor,
+    end_ids_per_base:     torch.LongTensor,
+    meal_rank:            torch.LongTensor,
+    meal_pred_rank:       torch.LongTensor,
+    K_meals:              torch.Tensor,
+    conflict_mat:         torch.BoolTensor,
+    predict_block:       torch.BoolTensor,
+    window:               int = 5,
+) -> torch.Tensor:
     """
-    logits: [B,T,V] *after* slicing (no [CTX])
-    illegal_mask/bonus_mask: Bool [B,T,V]
-    We add/subtract constants (broadcast).
+    Computes a structural-violation penalty for interval tokens, covering:
+      FSM : END without an open START
+      DUP : START when same base already open
+      UNC : START never closed by END (sequence ended)
+      CNF : START while a conflicting base is open (same concept, different value)
 
-    NOTE: Logits mask uses large negative number to avoid nan in BCE loss.
-          Illegal targets must also be masked to avoid large backpropagations.
-    """
-    # illegal → - (~inf)
-    logits = logits.masked_fill(illegal_mask, -1e9)
-    # bonus → add small boost
-    if bonus_boost > 0:
-        logits = logits + bonus_boost * bonus_mask.float()
-    return logits
+    Returns a scalar ∈ [0,1]:
+      (new_timestep_violations + new_unc_violations) /
+      (interval_token_count + batch_size)
 
+    Forgiveness: if a violation of the same token_id and type
+    occurs in the GT sequence within ±`window` time steps,
+    it is forgiven (not counted as new). Unclosed (UNC) violations
+    are forgiven if the same base remains unclosed in GT.
 
-def plot_losses(train_losses, val_losses):
-    """
-    Plot train vs. validation loss to inspect training quality.
-
-    Ignores loss at first step (major instability).
-    """
-    train_losses = train_losses[1:]
-    val_losses = val_losses[1:]
-
-    epochs = range(1, len(train_losses) + 1)
-    plt.figure()
-    plt.plot(epochs, train_losses, label="Train loss")
-    plt.plot(epochs, val_losses, label="Val loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training vs. validation loss")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-
-def build_rep_penalty(last_tokens, V, window=5, strength=0.6, device=None):
-    """
-    Soft repetition discourager on inference.
-    last_tokens : list[int]   (already generated, newest at the end)
-    V           : vocab size
-    window      : how many recent tokens we look back
-    strength    : scalar multiplier for the penalty (0..1 typical)
-    Returns:
-        rep_vec : [V] float tensor, 0 for unseen, higher for very recent repeats
-    """
-    if not last_tokens or strength <= 0:
-        return torch.zeros(V, device=device)
-    device = device or torch.device("cpu")
-    k = min(window, len(last_tokens))
-    # decay weights: newest gets 1.0, then 0.8, 0.6, ...
-    decay = torch.linspace(1.0, 0.2, steps=window, device=device)[:k]
-    idx = torch.tensor(last_tokens[-k:], device=device)
-
-    rep_vec = torch.zeros(V, device=device)
-    # reverse so newest aligns with decay[0]
-    rep_vec.index_add_(0, idx.flip(0), decay)
-    return rep_vec * strength
-
-
-def audit_generated_stream(
-        results_df: pd.DataFrame,
-        tokenizer,
-        token_w: int = 50,        # Max width of the “Token” column
-    ) -> None:
-    """
-    Prints a step-by-step structural audit of a context+generation stream.
-    Used for model manual tests after training, to validate poor results.
-
-    After the row-by-row trace it prints the whole DataFrame (Token,
-    IsInput, Note).  No return value.
-    """
-    # ------------- helpers ------------- #
-    def _print(idx, tok, is_inp, problems, token_w):
-        clipped = (tok[:token_w - 3] + "...") if len(tok) > token_w else tok
-        note    = ";".join(problems)
-        print(f"{idx:4d}  {clipped:<{token_w}}  {int(is_inp):>5d}  {note}")
+    Args:
+      pred_ids, gt_ids: [B, T] LongTensor
+      is_start, is_end, base_id: [V] Bool/Long tensors
+      conflict_mat: [nb, nb] Bool
+      window: integer radius for forgiving GT violations around each t
     
-    # ------------- look‑ups & runtime state ------------- #
-    l = build_luts(tokenizer)
-    is_start, is_end   = l['is_start'], l['is_end']
-    base_id            = l['base_id']
-    meal_rank          = l['meal_rank']
-    conflict_mat       = l['conflict_mat']
-    nb                 = int(l['start_ids_per_base'].numel())
-    K                  = int(l['K_meals'].item())
+    NOTE: Currently not used in the codebase. Found to be less effective than expected, and may need rethinking.
+    """
+    B, T = pred_ids.shape
 
-    open_counts = torch.zeros(nb, dtype=torch.int16)
-    seen_meals  = torch.zeros(K,  dtype=torch.bool) if K else None
+    # 1) Compute illegal masks for pred & GT
+    illegal_pred = compute_legality_masks_tf(
+        pred_ids, is_start, is_end,
+        base_id, start_ids_per_base, end_ids_per_base,
+        meal_rank, meal_pred_rank, K_meals, conflict_mat, predict_block
+    )
+    illegal_gt = compute_legality_masks_tf(
+        gt_ids,   is_start, is_end,
+        base_id, start_ids_per_base, end_ids_per_base,
+        meal_rank, meal_pred_rank, K_meals, conflict_mat, predict_block
+    )
 
-    t2id = tokenizer.token2id
-    notes = []                                            # per‑row notes
+    # Gather illegal flags per token
+    # 2a) Gather illegal flags per token for pred **and** GT
+    pred_illegal = illegal_pred.gather(2, pred_ids.unsqueeze(-1)).squeeze(-1)  # [B,T]
+    gt_illegal   = illegal_gt.  gather(2, gt_ids.  unsqueeze(-1)).squeeze(-1)  # [B,T]
 
-    # ------------- pretty header for live trace -------- #
-    hdr = f"{'Idx':>4}  {'Token':<{token_w}}  IsInp  Note"
-    print(hdr)
-    print("-" * len(hdr))
+    # Do not let specials (PAD/CTX/MASK) create forgiveness windows
+    gt_special = predict_block[gt_ids]      # [B,T] True where GT token is a special
+    gt_illegal = gt_illegal & (~gt_special) # drop specials from GT-illegal used for forgiveness
 
-    # ------------- iterate over stream ----------------- #
-    for idx, (tok, is_inp) in enumerate(zip(results_df['Token'],
-                                            results_df['IsInput'])):
-        tid = t2id.get(tok, None)
-        problems = []
+    # Do not count specials on the PRED side as “new” violations either
+    pred_special = predict_block[pred_ids]     # specials in PRED
+    pred_illegal = pred_illegal & (~pred_special)
 
-        # UNK
-        if tid is None:
-            problems.append("UNK")
-            notes.append(";".join(problems))
-            _print(idx, tok, is_inp, problems, token_w)
-            continue
+    # 2) Forgiveness window over GT
+    gt_win = F.max_pool1d(
+        gt_illegal.float().unsqueeze(1),
+        kernel_size=2*window+1, stride=1, padding=window
+    ).squeeze(1).bool()  # [B,T]
 
-        b = base_id[tid].item()
-        s = bool(is_start[tid])
-        e = bool(is_end[tid])
-        r = meal_rank[tid].item()
+    # 3) New-timestep violations
+    new_ts_viol = pred_illegal & (~gt_win)
+    count_ts_viol = new_ts_viol.float().sum()
 
-        # interval FSM / DUP / CNF
-        if e:
-            if b < 0 or open_counts[b] == 0:
-                problems.append("FSM")
-            else:
-                open_counts[b] -= 1
-        elif s:
-            if open_counts[b] > 0:
-                problems.append("DUP")
-            if conflict_mat.any() and (open_counts > 0).any():
-                if (conflict_mat[b] & (open_counts > 0)).any():
-                    problems.append("CNF")
-            open_counts[b] += 1
+    # 4) Unclosed (UNC) violations: count residual opens
+    # Map tokens → base indices
+    base_idx = base_id[pred_ids]  # [B,T]
+    # Masks where start/end occurred and base_idx >=0
+    start_mask = is_start[pred_ids] & (base_idx >= 0)
+    end_mask   = is_end  [pred_ids] & (base_idx >= 0)
 
-        # meal order
-        if r >= 0:
-            if 'next_meal' not in locals():               # first meal we ever see
-                next_meal = (r + 1) % K                   # set expectation
-            else:
-                if r != next_meal:                        # wrong meal → violation
-                    problems.append("MEAL")
-                next_meal = (r + 1) % K                   # advance expectation
+    nb = conflict_mat.shape[0]
+    # Count starts/ends via scatter_add
+    starts_pred = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
+    ends_pred   = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
+    starts_gt   = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
+    ends_gt     = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
 
-        notes.append(";".join(problems))
-        
-    # ------------- final full table -------------------- #
-    df_out = results_df.copy()
-    df_out['Note'] = notes
+    # Predicted
+    if start_mask.any():
+        idxs = base_idx[start_mask]
+        b_idxs, t_idxs = (start_mask).nonzero(as_tuple=True)
+        # scatter per batch
+        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
+            starts_pred[b, tid] += 1.0
+    if end_mask.any():
+        idxs = base_idx[end_mask]
+        b_idxs, t_idxs = (end_mask).nonzero(as_tuple=True)
+        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
+            ends_pred[b, tid] += 1.0
+    # GT
+    base_idx_gt = base_id[gt_ids]
+    mask_s_gt = is_start[gt_ids] & (base_idx_gt >= 0)
+    mask_e_gt = is_end  [gt_ids] & (base_idx_gt >= 0)
+    if mask_s_gt.any():
+        idxs = base_idx_gt[mask_s_gt]
+        b_idxs, t_idxs = mask_s_gt.nonzero(as_tuple=True)
+        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
+            starts_gt[b, tid] += 1.0
+    if mask_e_gt.any():
+        idxs = base_idx_gt[mask_e_gt]
+        b_idxs, t_idxs = mask_e_gt.nonzero(as_tuple=True)
+        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
+            ends_gt[b, tid] += 1.0
 
-    pd.set_option("display.max_rows", None)
-    print("\n=== Full trajectory with annotations ===")
-    print(df_out[['Token', 'IsInput', 'Note']]
-          .to_string(index=True, col_space={'Token': token_w}))
+    open_pred = (starts_pred - ends_pred) > 0  # [B, nb]
+    open_gt   = (starts_gt   - ends_gt)   > 0  # [B, nb]
+    new_unc_viol = (open_pred & (~open_gt)).float().sum()
+
+    # 5) Normalize by interval tokens + batch
+    denom = ((base_idx >= 0).float().sum() + B).clamp_min(1.0)
+    penalty = (count_ts_viol + new_unc_viol) / denom
+    return penalty
+
+
+def penalty_meal_order(pred_ids:  torch.LongTensor, meal_rank: torch.LongTensor) -> torch.Tensor:
+    """
+    Computes a cyclic-meal-order penalty: B→L→D→N→B...
+    Returns a scalar ∈ [0,1]: the fraction of adjacent meal transitions
+    in the predicted sequence that violate the expected cycle.
+
+    Steps:
+      1. Map pred_ids → ranks (with -1 for non-meal tokens).
+      2. Compress each batch sequence into its meal-only sequence M of shape [B, max_meals].
+      3. Compute expected next-meal rank = (M[:, :-1] + 1) % K.
+      4. Count wrong transitions (curr != expected) and normalize by total transitions.
+
+    Fully batched, GPU-friendly, non differentiable (due to argmax -> pred_ids).
+
+    NOTE: Currently not used in the codebase. Found to be less effective than expected, and may need rethinking.
+    """
+    device = pred_ids.device
+    ranks = meal_rank[pred_ids]  # [B,T]
+    B, T = ranks.shape
+    mask = ranks >= 0            # [B,T]
+    if not mask.any():
+        return torch.tensor(0.0, device=device)
+
+    # 1. Identify meal positions per sequence
+    mask_int = mask.int()
+    meal_idx = torch.cumsum(mask_int, dim=1)  # [B, T]
+    meal_counts = meal_idx[:, -1]             # [B]
+    max_meals = int(meal_counts.max().item())
+
+    # 2. Scatter predicted ranks into a compact [B,max_meals] matrix
+    b_t = mask.nonzero(as_tuple=False)        # [N,2] of (b, t)
+    b_idx, t_idx = b_t[:, 0], b_t[:, 1]
+    k_idx = meal_idx[b_idx, t_idx] - 1       # [N]
+
+    M = torch.full((B, max_meals), -1, dtype=ranks.dtype, device=device)
+    flat_M = M.view(-1)
+    flat_idx = b_idx * max_meals + k_idx
+    flat_M[flat_idx] = ranks[b_idx, t_idx]
+    M = flat_M.view(B, max_meals)
+
+    # 3. Compute transitions
+    prev = M[:, :-1]
+    curr = M[:, 1:]
+    valid = (prev >= 0) & (curr >= 0)
+    K = int(meal_rank.max().item()) + 1
+    expected = (prev + 1) % K
+
+    wrong = ((curr != expected) & valid).float().sum()
+    total = valid.float().sum().clamp_min(1.0)
+    return wrong / total

@@ -4,7 +4,7 @@ import pytest
 import transform_emr.utils as utils_module
 
 from transform_emr.utils import (
-    get_multi_hot_targets,
+    get_temporal_multi_hot_targets,
     get_future_outcome_targets,
     build_mlm,
     linear_schedule,
@@ -36,7 +36,7 @@ def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activatio
       - bce_only_epochs=1 means aux activates at epoch 1, not 0.
       - Calibration uses tr_main (training BCE) not validation.
       - update() uses vl_total for plateau, tr_main+aux names for calibration.
-      - Single-stage: has_dynamic=False, current_warmup_end_epoch() returns None.
+      - Single-stage: has_dynamic=False, current_warmup_end_epoch() returns concrete epoch.
     """
     cfg = {
         "bce_only_epochs": 1,
@@ -46,7 +46,9 @@ def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activatio
     }
     controller = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
     assert controller.has_dynamic is False
-    assert controller.current_warmup_end_epoch() is None
+    # For single-stage, warmup_end_epoch returns the epoch after ramp completes
+    warmup_epoch = controller.current_warmup_end_epoch()
+    assert warmup_epoch == 1, f"Expected warmup to end at epoch 1, got {warmup_epoch}"
 
     # Before bce_only_epochs passes, lambdas = 0.
     assert controller.get_lambdas(epoch=0)["mlm"] == 0.0
@@ -273,7 +275,6 @@ def mini_tokenizer():
     special_tokens = ["[PAD]", "[MASK]", "[CTX]", "[NULL]"]
     token_weights = torch.ones(len(toks))
     outcome_weights = torch.ones(len(toks))
-    important_token_ids = torch.tensor([], dtype=torch.long)
     token_counts = torch.tensor([], dtype=torch.long)
 
     # Dummy parent raw mapping for testing
@@ -289,8 +290,7 @@ def mini_tokenizer():
         special_tokens=special_tokens,
         token_weights=token_weights,
         outcome_weights=outcome_weights,
-        important_token_ids=important_token_ids,
-        token_counts = token_counts,
+        token_counts=token_counts,
         tokenid2parent_raw_ids=tokenid2parent_raw_ids,
         parent_pad_len=parent_pad_len
     )
@@ -306,35 +306,50 @@ def test_multi_hot_targets_visual_and_assert():
     """
     For each t in a longer sequence, print the
     true future IDs vs. the multi-hot IDs, then
-    assert they exactly match.
+    assert they match within a temporal window.
 
-    Expectation: At every position t, the targets are the positions t+1 up to t+k, until the first padding (0) token.
+    Expectation: At every position t, the targets are the IDs that appear within a time window 
+    after t, until padding (0) token is encountered.
     """
     # --- Setup a toy sequence: 1..10 then two PADs (0) ---
-    seq = torch.tensor([[1,2,3,4,5,6,7,8,9,10,0,0]])
+    seq = torch.tensor([[1,2,3,4,5,6,7,8,9,10,0,0]], dtype=torch.long)
     B, T = seq.shape
     V    = seq.max().item() + 1  # 11 = tokens 0..10
-    k    = 5
+    
+    # --- Create timestamps: each token is 1 unit apart ---
+    # This simulates a sequence where each event occurs 1 time unit after the previous
+    abs_ts = torch.arange(T, dtype=torch.float32).unsqueeze(0)  # [B, T]
+    
+    # --- Window size of 5 units matches the previous k=5 behavior ---
+    window_size = 5.0
 
-    # --- Compute multi-hot targets ---
-    mh = get_multi_hot_targets(seq, padding_idx=0, vocab_size=V, k=k)
+    # --- Compute temporal multi-hot targets ---
+    mh = get_temporal_multi_hot_targets(
+        target_ids=seq, 
+        all_abs_ts=abs_ts, 
+        padding_idx=0, 
+        vocab_size=V, 
+        window_size=window_size
+    )
     assert mh.shape == (B, T, V)
 
     # --- For each timestep, print & assert correctness ---
     for t in range(T):
         # curr
         curr = seq[0, t]
-        # ground-truth future slice
-        future = seq[0, t+1 : t+1+k].tolist()
+        # ground-truth: future tokens within window_size time units, excluding pads
+        # tokens at position s where 0 < (abs_ts[s] - abs_ts[t]) <= window_size
+        future_mask = (abs_ts[0] > abs_ts[0, t]) & (abs_ts[0] <= abs_ts[0, t] + window_size)
+        future_ids = seq[0, future_mask].tolist()
         # drop pads & dedupe
-        expected = sorted({x for x in future if x != 0})
+        expected = sorted({x for x in future_ids if x != 0})
 
         # what the function actually marked
         hot_ids = mh[0, t].nonzero(as_tuple=False).squeeze(-1).tolist()
         hot_ids.sort()
 
         # print for human verification
-        print(f"t={t}, curr={curr} | future={future} | hot_ids={hot_ids}")
+        print(f"t={t}, curr={curr} | future_ids={future_ids} | hot_ids={hot_ids}")
 
         # pytest assertion
         assert hot_ids == expected, (
@@ -639,7 +654,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 
     # 1) Correct interval order
     seq_ok = torch.tensor([[low_s, low_e, pad]])
-    illegal_ok, bonus_ok = compute_legality_masks_tf(
+    illegal_ok = compute_legality_masks_tf(
         seq_ok, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
@@ -650,11 +665,10 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
             f"Token {tk.id2token[tok]} wrongly flagged illegal at position {t_idx}")
     # PAD should be illegal to predict
     assert illegal_ok[0, 2, pad], "PAD should be blocked from prediction"
-    assert bonus_ok[0, 1, low_e], "Bonus mask for END token missing"
 
     # 2) FSM violation: END before START
     seq_rev = torch.tensor([[low_e, low_s, pad]])
-    illegal_rev, _ = compute_legality_masks_tf(
+    illegal_rev = compute_legality_masks_tf(
         seq_rev, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
@@ -663,7 +677,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 
     # 3) CNF violation: conflicting High START while Low open
     seq_conf = torch.tensor([[low_s, high_s, pad]])
-    illegal_conf, _ = compute_legality_masks_tf(
+    illegal_conf = compute_legality_masks_tf(
         seq_conf, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
@@ -672,7 +686,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 
     # 4) DUP violation: START twice in a row on same base
     seq_dup = torch.tensor([[low_s, low_s, pad]])
-    illegal_dup, _ = compute_legality_masks_tf(
+    illegal_dup = compute_legality_masks_tf(
         seq_dup, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
@@ -688,7 +702,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 
     # 5) Legal full cycle: L → D → N → B → L
     seq_cycle = torch.tensor([[l_id, d, n, b, l_id]])
-    illegal_cycle, _ = compute_legality_masks_tf(
+    illegal_cycle = compute_legality_masks_tf(
         seq_cycle, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
@@ -699,7 +713,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 
     # 6) Illegal short cycle: L → B → D — Breakfast at t=1 should be flagged illegal
     seq_bad = torch.tensor([[l_id, b, d, pad]])
-    illegal_bad, _ = compute_legality_masks_tf(
+    illegal_bad = compute_legality_masks_tf(
         seq_bad, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
@@ -708,7 +722,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 
     # 7) Interval+Meal interleaving
     seq_mix1 = torch.tensor([[low_s, b, low_e, pad]])
-    illegal_mix1, _ = compute_legality_masks_tf(
+    illegal_mix1 = compute_legality_masks_tf(
         seq_mix1, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
@@ -719,7 +733,7 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 
     # 8) Meal+Interval interleaving
     seq_mix2 = torch.tensor([[l_id, low_s, d, n, b, l_id]])
-    illegal_mix2, _ = compute_legality_masks_tf(
+    illegal_mix2 = compute_legality_masks_tf(
         seq_mix2, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']
@@ -770,14 +784,14 @@ def test_penalty_interval_structure_and_meal_order(mini_tokenizer):
         l['K_meals'], l['conflict_mat'], l['predict_block'],
         window=1
     )
-    illegal_pred, _ = compute_legality_masks_tf(pred2, l['is_start'], l['is_end'], l['base_id'],
+    illegal_pred = compute_legality_masks_tf(pred2, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
         l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block'])
     pred_illegal = illegal_pred.gather(2, pred2.unsqueeze(-1)).squeeze(-1)
     print("pred_illegal:", pred_illegal)          # e.g. tensor([[False, False,  True]])
     gt_illegal = compute_legality_masks_tf(gt2, l['is_start'], l['is_end'], l['base_id'],
         l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block'])[0] \
+        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']) \
                     .gather(2, gt2.unsqueeze(-1)).squeeze(-1)
     print("gt_illegal:  ", gt_illegal)            # e.g. tensor([[ True, False, False]])
     gt_win = F.max_pool1d(
@@ -1045,9 +1059,11 @@ def test_soft_penalties_agree_with_hard_in_peaked_limit(mini_tokenizer):
 def test_apply_masks_to_logits():
     """
     Test that apply_masks_to_logits:
-      - Masks illegal positions to -inf
-      - Applies bonus boosting correctly
+      - Masks illegal positions to -1e9 (effectively -inf for suppression)
+      - Preserves legal positions unchanged
       - Handles multi-batch, multi-vocab cases
+      
+    Note: Bonus boosting was removed as it interfered with BCE learning.
     """
     # 2 batches, 2 timesteps, vocab size 5
     logits = torch.arange(20.0).view(2,2,5)
@@ -1055,35 +1071,23 @@ def test_apply_masks_to_logits():
     illegal = torch.zeros_like(logits, dtype=torch.bool)
     illegal[0,0,1] = True   # batch0, timestep0, token1
     illegal[1,1,4] = True   # batch1, timestep1, token4
-    # Mark some bonus positions
-    bonus = torch.zeros_like(logits, dtype=torch.bool)
-    bonus[0,1,0] = True     # batch0, timestep1, token0
-    bonus[1,0,2] = True     # batch1, timestep0, token2
 
-    # Apply with boost=0.3
-    boost = 0.3
-    out = apply_masks_to_logits(logits.clone(), illegal, bonus, bonus_boost=boost)
-    # Expected: illegal -> -inf
+    # Apply masking
+    out = apply_masks_to_logits(logits.clone(), illegal)
+    
+    # Expected: illegal -> -1e9
     assert out[0,0,1].item() == -1e9, f"Expected -1e9 at [0,0,1], got {out[0,0,1]}"
     assert out[1,1,4].item() == -1e9, f"Expected -1e9 at [1,1,4], got {out[1,1,4]}"
-    # Expected: bonus -> logits + boost
-    exp00 = logits[0,1,0] + boost
-    exp12 = logits[1,0,2] + boost
-    print(f"test_apply_masks_to_logits: expected out[0,1,0]={exp00}, got {out[0,1,0]}")
-    print(f"test_apply_masks_to_logits: expected out[1,0,2]={exp12}, got {out[1,0,2]}")
-    assert abs(out[0,1,0].item() - exp00) < 1e-6
-    assert abs(out[1,0,2].item() - exp12) < 1e-6
-
-    # Apply with boost=0.0
-    out2 = apply_masks_to_logits(logits.clone(), illegal, bonus, bonus_boost=0.0)
-    # Expect same as logits except illegal
+    
+    # Expected: legal positions preserve original logits
     for b in range(2):
         for t in range(2):
             for v in range(5):
                 if illegal[b,t,v]:
-                    assert out2[b,t,v].item() == -1e9
+                    assert out[b,t,v].item() == -1e9, f"Illegal [{ b},{t},{v}] not masked"
                 else:
-                    assert abs(out2[b,t,v].item() - logits[b,t,v].item()) < 1e-6
+                    assert abs(out[b,t,v].item() - logits[b,t,v].item()) < 1e-6, \
+                        f"Legal position [{b},{t},{v}] should preserve logits"
     print("test_apply_masks_to_logits: all cases passed.")
 
 

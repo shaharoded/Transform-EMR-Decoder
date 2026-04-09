@@ -85,7 +85,7 @@ class DataProcessor:
     def _fit_scaler(self):
         """
         Fit and / or use a standard scaler on the context dataframe. 
-        Will save the scaler in the checkpoints.
+        Will save the scaler in the checkpoints (and load from there).
         """        
         if self.scaler is None:
             scaler = StandardScaler()
@@ -218,6 +218,9 @@ class DataProcessor:
     
 
     def _normalize_time(self):
+        """
+        Normalizes time to be relative to the start of each visit. Also adds VisitID and VisitStart columns.
+        """
         df = self.df.copy()
         df["IsAdmission"] = df["ConceptName"] == ADMISSION_TOKEN
         df["VisitCounter"] = df.groupby("PatientId")["IsAdmission"].cumsum()
@@ -365,8 +368,23 @@ class DataProcessor:
 
         df = pd.DataFrame(rows)
 
-        # --- Sort and compute time deltas ---
-        self.df = df.sort_values(['PatientId', 'TimePoint'])
+        # ⚠️  CRITICAL SORTING OPERATION ⚠️
+        # The following sort by ['PatientId', 'TimePoint'] is MANDATORY and must NEVER be removed,
+        # reordered, or performed differently. This sorted order is a hard requirement for:
+        #
+        #   1. GPU-efficient temporal target generation in utils.get_temporal_multi_hot_targets()
+        #      which uses torch.searchsorted() and assumes per-batch non-decreasing timestamps.
+        #      Violating this will cause silent correctness bugs (wrong multi-hot targets).
+        #
+        #   2. Proper EMR sequence semantics: events within a visit MUST be chronological
+        #      for the model to learn meaningful temporal dependencies.
+        #
+        # If you need to change this sorting for any reason, you MUST also update:
+        #   - emr_model/transform_emr/utils.py::get_temporal_multi_hot_targets()
+        #   - emr_model/transform_emr/embedder.py::train_embedder() BCE loss computation
+        #   - emr_model/transform_emr/transformer.py::train_transformer() BCE loss computation
+        #
+        self.df = df.sort_values(['PatientId', 'TimePoint']).reset_index(drop=True)
     
 
     def _insert_null_tokens(self, gap_hrs: int = 3) -> None:
@@ -443,27 +461,33 @@ class DataProcessor:
 
 class EMRTokenizer:
     """
-    A custom tokenizer objest to match this model's requirement.
-    build this object with your full training data to ensure it builds properly.
-    Token weights are determined by token frequency in cohort.
+    Tokenizer + metadata container for EMR sequence modeling.
+
+    Build this from fully processed training data (`from_processed_df`) so all
+    vocabularies, token statistics, and lookup tables are consistent.
 
     Attributes:
         token2id (Dict[str, int]): Full vocabulary mapping ("GLUCOSE_STATE_HIGH_START").
         id2token (Dict[int, str]): Reverse mapping for decoding.
         rawconcept2id (Dict[str, int]): Vocabulary mapping for raw concepts only ("GLUCOSE").
-        concept2id (Dict[str, int]): Vocabulary mapping for concepts only ("GLUCOSE_STATE"/ "GLUCOSE_TREND")..
-        value2id (Dict[str, int]): Vocabulary mapping for concepts+values ("GLUCOSE_STATE_HIGH")
-        special_tokens (List[str]): Special tokens like ["MASK"].
-        token_weights (torch.Tensor): Weights used in loss to emphasize important tokens on token generation.
-        outcome_weights (torch.Tensor): Weights for outcome tokens, for BCE loss.
-        important_token_ids (torch.Tensor): Token IDs with weight > 1.0.
+        concept2id (Dict[str, int]): Vocabulary mapping for concept names (e.g. "GLUCOSE_STATE").
+        value2id (Dict[str, int]): Vocabulary mapping for concept+value tokens ("GLUCOSE_STATE_HIGH").
+        special_tokens (List[str]): Special tokens (e.g. ["[PAD]", "[MASK]", "[NULL]"]).
+        token_weights (torch.Tensor): Per-token loss weights; 0.0 for special/boundary tokens, 1.0 otherwise.
+        outcome_weights (torch.Tensor): Class-imbalance weights for the outcome BCE head.
         token_counts (torch.Tensor): Token counts (distribution).
+        tokenid2parent_raw_ids (torch.Tensor): Lookup table mapping each PositionToken id
+            to its parent raw-concept ids, padded to `parent_pad_len`.
+        parent_pad_len (int): Width of `tokenid2parent_raw_ids` (max number of parent raws).
         pad_token_id (int): ID for padding token.
         mask_token_id (int): ID for MASK token.
         null_token_id (int): ID for NULL token.
+
+    Notes:
+        Required special tokens are validated at init: `[PAD]`, `[MASK]`, `[NULL]`.
     """
-    def __init__(self, token2id, rawconcept2id, concept2id, value2id, special_tokens, 
-                 token_weights, outcome_weights, important_token_ids, token_counts,
+    def __init__(self, token2id, rawconcept2id, concept2id, value2id, special_tokens,
+                 token_weights, outcome_weights, token_counts,
                  tokenid2parent_raw_ids, parent_pad_len):
         self.token2id = token2id
         self.id2token = {i: tok for tok, i in token2id.items()}
@@ -473,7 +497,6 @@ class EMRTokenizer:
         self.special_tokens = special_tokens
         self.token_weights = token_weights
         self.outcome_weights = outcome_weights
-        self.important_token_ids = important_token_ids
         self.token_counts = token_counts
         self.tokenid2parent_raw_ids = tokenid2parent_raw_ids
         self.parent_pad_len = parent_pad_len
@@ -532,19 +555,14 @@ class EMRTokenizer:
         value2id = {tok: i for i, tok in enumerate(values)}
 
         # === Define Token Weights ===
-        # Only used for regular BCELoss (Embedder), not Focal (Transformer)
-        # Initialize weights (data driven)
+        # Multiplies the frequency-based alpha in FocalBCELoss. Default 1.0 for all tokens.
+        # Outcome upweighting is handled by aux_fraction_caps in TRAINING_SETTINGS, not here.
+        # [PAD] and [MASK] get 0.0 — they are not real prediction targets.
+        # [NULL] stays at 1.0 — it is a real sequence token (synthetic gap marker) and
+        #   the model must learn to predict quiet periods correctly.
+        # ADMISSION_TOKEN gets 0.0 — it is a sequence boundary marker, not a clinical event.
         token_weights = torch.ones(len(token2id))
-
-        for outcome in OUTCOMES:
-            tok_id = token2id.get(outcome)
-            if tok_id is not None:
-                token_weights[tok_id] = 10.0
-        for term in TERMINAL_OUTCOMES:
-            tok_id = token2id.get(term)
-            if tok_id is not None:
-                token_weights[tok_id] = 15.0
-        for ignore_tok in special_tokens + [ADMISSION_TOKEN]:
+        for ignore_tok in ["[PAD]", "[MASK]", ADMISSION_TOKEN]:
             tok_id = token2id.get(ignore_tok)
             if tok_id is not None:
                 token_weights[tok_id] = 0.0
@@ -576,8 +594,6 @@ class EMRTokenizer:
             
             outcome_weights[tid] = float(w)
         
-        important_token_ids = (token_weights > 1.0).nonzero(as_tuple=True)[0]
-
         # Add token distribution
         count_series = df["PositionToken"].value_counts()
         counts_vec   = torch.zeros(len(token2id), dtype=torch.long)
@@ -636,8 +652,8 @@ class EMRTokenizer:
             ids = encode_parent_names(pos_to_parents[tok])
             lut[tid, :len(ids)] = torch.tensor(ids, dtype=torch.long)
 
-        return cls(token2id, rawconcept2id, concept2id, value2id,special_tokens, token_weights, outcome_weights,
-                   important_token_ids, counts_vec, lut, Pmax)
+        return cls(token2id, rawconcept2id, concept2id, value2id, special_tokens, token_weights, outcome_weights,
+                   counts_vec, lut, Pmax)
 
     def save(self, path=os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
         torch.save({
@@ -648,7 +664,6 @@ class EMRTokenizer:
             'special_tokens': self.special_tokens,
             'token_weights': self.token_weights,
             'outcome_weights': self.outcome_weights,
-            'important_token_ids': self.important_token_ids,
             'token_counts': self.token_counts,
             'tokenid2parent_raw_ids': self.tokenid2parent_raw_ids,
             'parent_pad_len': self.parent_pad_len,
@@ -669,7 +684,6 @@ class EMRTokenizer:
             special_tokens=obj['special_tokens'],
             token_weights=obj['token_weights'].to(device),
             outcome_weights=obj['outcome_weights'].to(device),
-            important_token_ids=obj['important_token_ids'].to(device),
             token_counts=obj['token_counts'].to(device),
             tokenid2parent_raw_ids=obj['tokenid2parent_raw_ids'].to(device),
             parent_pad_len=obj['parent_pad_len'],
@@ -836,6 +850,10 @@ class EMRDataset(Dataset):
 def collate_emr(batch, pad_token_id=0):
     """
     Collates a batch of patient EMR sequences into padded tensors.
+
+    ASSUMES: Each patient sequence in the batch is already SORTED by TimePoint (ascending).
+    This sorting is performed in DataProcessor._expand_tokens() and is maintained by EMRDataset.__getitem__().
+    Do NOT reorder sequences, as temporal target generation in training relies on sortedness.
 
     Each sequence contains:
         - Parents Concept ID (2D: [T, P])

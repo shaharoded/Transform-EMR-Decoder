@@ -15,7 +15,6 @@ def mini_tokenizer():
     special_tokens = ["[PAD]","[MASK]","[CTX]","[NULL]"]
     token_weights = torch.ones(len(toks))
     outcome_weights = torch.ones(len(toks))
-    important_ids = torch.tensor([], dtype=torch.long)
     token_counts = torch.tensor([], dtype=torch.long)
 
     # Dummy parent raw mapping
@@ -31,8 +30,7 @@ def mini_tokenizer():
         special_tokens=special_tokens,
         token_weights=token_weights,
         outcome_weights=outcome_weights,
-        important_token_ids=important_ids,
-        token_counts = token_counts,
+        token_counts=token_counts,
         tokenid2parent_raw_ids=tokenid2parent_raw_ids,
         parent_pad_len=parent_pad_len
     )
