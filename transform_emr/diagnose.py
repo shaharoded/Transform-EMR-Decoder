@@ -28,9 +28,10 @@ from transform_emr.config.dataset_config import (  # noqa: E402
 )
 from transform_emr.config.model_config import (  # noqa: E402
     CHECKPOINT_PATH,
-    EMBEDDER_CHECKPOINT,
+    PHASE1_CHECKPOINT,
+    PHASE2_CHECKPOINT,
+    PHASE3_CHECKPOINT,
     TRAINING_SETTINGS,
-    TRANSFORMER_CHECKPOINT,
 )
 from transform_emr.dataset import DataProcessor, EMRDataset, EMRTokenizer, collate_emr, get_dataloader  # noqa: E402
 from transform_emr.embedder import EMREmbedding  # noqa: E402
@@ -244,10 +245,12 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
 
     print("[Diag] Loading checkpoints...")
     missing = []
-    if not Path(EMBEDDER_CHECKPOINT).exists():
-        missing.append(EMBEDDER_CHECKPOINT)
-    if not Path(TRANSFORMER_CHECKPOINT).exists():
-        missing.append(TRANSFORMER_CHECKPOINT)
+    if not Path(PHASE1_CHECKPOINT).exists():
+        missing.append(PHASE1_CHECKPOINT)
+    if not Path(PHASE2_CHECKPOINT).exists():
+        missing.append(PHASE2_CHECKPOINT)
+    if not Path(PHASE3_CHECKPOINT).exists():
+        missing.append(PHASE3_CHECKPOINT)
     if missing:
         print("[Diag] Missing checkpoint(s). Run training first to generate them:")
         for ckpt in missing:
@@ -255,8 +258,8 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
         print("[Diag] Aborting diagnostics.")
         return
 
-    embedder, *_ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=tokenizer)
-    model, *_ = GPT.load(TRANSFORMER_CHECKPOINT, embedder=embedder)
+    embedder, *_ = EMREmbedding.load(PHASE1_CHECKPOINT, tokenizer=tokenizer)
+    model, *_ = GPT.load(PHASE2_CHECKPOINT, embedder=embedder)
     model = model.to(device).eval()
 
     outcome_list = _get_outcome_token_ids(tokenizer)

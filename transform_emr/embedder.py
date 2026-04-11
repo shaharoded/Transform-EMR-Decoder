@@ -380,7 +380,7 @@ class EMREmbedding(nn.Module):
         )
 
 
-def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_path=EMBEDDER_CHECKPOINT, 
+def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_path=PHASE1_CHECKPOINT,
                    training_settings=TRAINING_SETTINGS):
     """
     Trains an EMREmbedding model using temporal multi-hot BCE, masked language modelling (MLM),

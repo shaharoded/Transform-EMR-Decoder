@@ -5,8 +5,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 
 # Checkpoint paths
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, 'checkpoints')
-EMBEDDER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase1', 'ckpt_best.pt')
-TRANSFORMER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'ckpt_best.pt')
+PHASE1_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase1', 'ckpt_best.pt')
+PHASE2_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'ckpt_best.pt')
+PHASE3_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase3', 'ckpt_best.pt')
 
 MODEL_CONFIG = {
       "time2vec_dim": 32,
@@ -19,8 +20,9 @@ MODEL_CONFIG = {
     }
 
 TRAINING_SETTINGS = {
-    "phase1_n_epochs": 100,
-    "phase2_n_epochs": 100,
+    "phase1_n_epochs": 10,
+    "phase2_n_epochs": 10,
+    "phase3_n_epochs": 10,
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
@@ -29,6 +31,7 @@ TRAINING_SETTINGS = {
 
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 5e-4,
+    "phase3_learning_rate":  1e-4,
     "weight_decay": 1e-3,
 
     "batch_size": 64, # Number of patients processed concurrently

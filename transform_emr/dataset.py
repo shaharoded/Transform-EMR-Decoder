@@ -382,7 +382,7 @@ class DataProcessor:
         # If you need to change this sorting for any reason, you MUST also update:
         #   - emr_model/transform_emr/utils.py::get_temporal_multi_hot_targets()
         #   - emr_model/transform_emr/embedder.py::train_embedder() BCE loss computation
-        #   - emr_model/transform_emr/transformer.py::train_transformer() BCE loss computation
+        #   - emr_model/transform_emr/transformer.py::pretrain_transformer() BCE loss computation
         #
         self.df = df.sort_values(['PatientId', 'TimePoint']).reset_index(drop=True)
     

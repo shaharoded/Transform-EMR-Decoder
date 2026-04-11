@@ -3,8 +3,8 @@
 from transform_emr.dataset import DataProcessor, EMRDataset, EMRTokenizer, collate_emr, get_dataloader
 from transform_emr.diagnose import run_diagnostics
 from transform_emr.embedder import EMREmbedding
-from transform_emr.inference import get_token_embedding, infer_event_stream
-from transform_emr.train import phase_one, phase_two, prepare_data, run_two_phase_training, summarize_patient_data_split
+from transform_emr.inference import get_token_embedding, infer_event_stream, generate_risk_curves
+from transform_emr.train import phase_one, phase_two, phase_three, prepare_data, run_training, summarize_patient_data_split
 from transform_emr.transformer import GPT
 
 __all__ = [
@@ -19,8 +19,10 @@ __all__ = [
     "summarize_patient_data_split",
     "phase_one",
     "phase_two",
-    "run_two_phase_training",
+    "phase_three",
+    "run_training",
     "get_token_embedding",
     "infer_event_stream",
+    "generate_risk_curves",
     "run_diagnostics",
 ]

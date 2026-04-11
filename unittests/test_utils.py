@@ -22,6 +22,8 @@ from transform_emr.utils import (
 )
 from transform_emr.schedulers import LambdaScheduleController, linear_schedule as sched_linear_schedule
 from transform_emr.dataset import EMRTokenizer
+from transform_emr.utils import compute_soft_outcome_labels
+from transform_emr.inference import _build_illegal_mask, _update_legality_state
 
 
 def test_linear_schedule_import_is_from_schedulers():
@@ -1124,3 +1126,275 @@ def test_build_rep_penalty():
             f"Index {i} expected {expected[i]}, got {rep[i]}"
         )
     print("test_build_rep_penalty: all cases passed.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute_soft_outcome_labels
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_gt_df(tokens_and_times):
+    """Helper: build a minimal ground-truth DataFrame with PositionToken and TimePoint columns.
+    TimePoint is normalised (hours / 336) to match the DataProcessor output convention."""
+    import pandas as pd
+    rows = [{"PositionToken": tok, "TimePoint": t / 336.0} for tok, t in tokens_and_times]
+    return pd.DataFrame(rows)
+
+
+def test_compute_soft_outcome_labels_single_future_event():
+    """
+    One outcome event at t=48 h.  Generated steps at t=24, 36, 48, 60 h.
+    tau=12, horizon=48.
+
+    Expected behaviour:
+    - t=24 : dt=24 → exp(-24/12)=exp(-2) ≈ 0.135  (within horizon)
+    - t=36 : dt=12 → exp(-1)           ≈ 0.368
+    - t=48 : dt=0  → NOT future (dt==0, condition is dt>0), so 0
+    - t=60 : dt=-12 → past event, 0
+    """
+    outcome_name = "OUTCOME_EVENT"
+    gt_df = _make_gt_df([(outcome_name, 48.0)])  # outcome at 48 h
+
+    gen_abs_ts = torch.tensor([24.0, 36.0, 48.0, 60.0])
+    tau_hours     = 12.0
+    horizon_hours = 48.0
+
+    labels = compute_soft_outcome_labels(
+        gen_abs_ts, gt_df, [outcome_name], tau_hours, horizon_hours, device=torch.device("cpu")
+    )
+
+    assert labels.shape == (4, 1), f"Expected [4,1], got {labels.shape}"
+
+    expected_24 = torch.exp(torch.tensor(-24.0 / tau_hours)).clamp(0, 1).item()
+    expected_36 = torch.exp(torch.tensor(-12.0 / tau_hours)).clamp(0, 1).item()
+
+    assert abs(labels[0, 0].item() - expected_24) < 1e-5, \
+        f"t=24 expected {expected_24:.4f}, got {labels[0,0].item():.4f}"
+    assert abs(labels[1, 0].item() - expected_36) < 1e-5, \
+        f"t=36 expected {expected_36:.4f}, got {labels[1,0].item():.4f}"
+    assert labels[2, 0].item() == 0.0, "dt==0 should not count as future"
+    assert labels[3, 0].item() == 0.0, "Past event should give 0"
+    print(f"labels: {labels.squeeze().tolist()} — test_compute_soft_outcome_labels_single_future_event passed.")
+
+
+def test_compute_soft_outcome_labels_beyond_horizon():
+    """Event at t=100 h, generated step at t=0 h.  horizon=48 → contribution should be 0."""
+    outcome_name = "OUTCOME_EVENT"
+    gt_df = _make_gt_df([(outcome_name, 100.0)])
+    gen_abs_ts = torch.tensor([0.0])
+    labels = compute_soft_outcome_labels(
+        gen_abs_ts, gt_df, [outcome_name], tau_hours=12.0, horizon_hours=48.0,
+        device=torch.device("cpu")
+    )
+    assert labels[0, 0].item() == 0.0, "Event beyond horizon should give 0"
+    print("test_compute_soft_outcome_labels_beyond_horizon passed.")
+
+
+def test_compute_soft_outcome_labels_multiple_events_clamped():
+    """Two outcome events close together — sum may exceed 1 and must be clamped."""
+    outcome_name = "OUTCOME_EVENT"
+    gt_df = _make_gt_df([(outcome_name, 10.0), (outcome_name, 12.0)])
+    gen_abs_ts = torch.tensor([0.0])  # 10 h and 12 h ahead
+    labels = compute_soft_outcome_labels(
+        gen_abs_ts, gt_df, [outcome_name], tau_hours=12.0, horizon_hours=48.0,
+        device=torch.device("cpu")
+    )
+    assert labels[0, 0].item() <= 1.0, "Labels must be clamped to [0, 1]"
+    assert labels[0, 0].item() > 0.0, "Close future events should produce non-zero label"
+    print(f"clamped label={labels[0,0].item():.4f} — test_compute_soft_outcome_labels_multiple_events_clamped passed.")
+
+
+def test_compute_soft_outcome_labels_absent_outcome():
+    """Outcome name not present in gt_df → all zeros."""
+    import pandas as pd
+    gt_df = _make_gt_df([("OTHER_EVENT", 10.0)])
+    gen_abs_ts = torch.tensor([0.0, 5.0])
+    labels = compute_soft_outcome_labels(
+        gen_abs_ts, gt_df, ["OUTCOME_EVENT"], tau_hours=12.0, horizon_hours=48.0,
+        device=torch.device("cpu")
+    )
+    assert (labels == 0).all(), "Absent outcome should produce all-zero labels"
+    print("test_compute_soft_outcome_labels_absent_outcome passed.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _build_illegal_mask  and  _update_legality_state
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_build_illegal_mask_always_blocks_pad_and_mask(mini_tokenizer):
+    """PAD and MASK must always appear in the illegal mask regardless of state."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)
+    K           = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
+
+    illegal = _build_illegal_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id, "cpu")
+
+    assert illegal[tk.pad_token_id],  "PAD must always be illegal"
+    assert illegal[tk.mask_token_id], "MASK must always be illegal"
+    print("test_build_illegal_mask_always_blocks_pad_and_mask passed.")
+
+
+def test_build_illegal_mask_end_blocked_when_no_start(mini_tokenizer):
+    """END token should be illegal when the interval has never been opened."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)  # nothing open
+
+    low_e = tk.token2id["A_STATE_Low_END"]
+    illegal = _build_illegal_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id, "cpu")
+
+    assert illegal[low_e], "END should be illegal when interval is not open"
+    print("test_build_illegal_mask_end_blocked_when_no_start passed.")
+
+
+def test_build_illegal_mask_start_blocked_when_open(mini_tokenizer):
+    """Duplicate START should be illegal once the interval is already open."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)
+
+    low_s = tk.token2id["A_STATE_Low_START"]
+    # Open the Low_STATE interval
+    open_counts = open_counts.clone()
+    open_counts[luts["base_id"][low_s]] = 1
+
+    illegal = _build_illegal_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id, "cpu")
+
+    assert illegal[low_s], "Duplicate START should be illegal when interval is already open"
+    print("test_build_illegal_mask_start_blocked_when_open passed.")
+
+
+def test_build_illegal_mask_conflict_blocked(mini_tokenizer):
+    """Starting a conflicting value while another is open must be illegal."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)
+
+    low_s  = tk.token2id["A_STATE_Low_START"]
+    high_s = tk.token2id["A_STATE_High_START"]
+    # Open Low; High is a conflict
+    open_counts[luts["base_id"][low_s]] = 1
+
+    illegal = _build_illegal_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id, "cpu")
+
+    assert illegal[high_s], "Conflicting START (High while Low open) should be illegal"
+    print("test_build_illegal_mask_conflict_blocked passed.")
+
+
+def test_build_illegal_mask_meal_order(mini_tokenizer):
+    """When next_meal_rank is set, only the expected meal token should be allowed."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)
+    K           = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
+
+    b    = tk.token2id["MEAL_CONTEXT_Breakfast"]
+    l_id = tk.token2id["MEAL_CONTEXT_Lunch"]
+    d    = tk.token2id["MEAL_CONTEXT_Dinner"]
+    n    = tk.token2id["MEAL_CONTEXT_Night-Snack"]
+    meal_ranks = {b: luts["meal_rank"][b].item(),
+                  l_id: luts["meal_rank"][l_id].item(),
+                  d: luts["meal_rank"][d].item(),
+                  n: luts["meal_rank"][n].item()}
+    # Find which rank Lunch has, then set next_meal_rank to that
+    lunch_rank = meal_ranks[l_id]
+    illegal = _build_illegal_mask(luts, open_counts, lunch_rank, tk.pad_token_id, tk.mask_token_id, "cpu")
+
+    # Lunch should be legal; all other meals should be illegal
+    assert not illegal[l_id], "Expected meal (Lunch) should be legal"
+    for tok, rank in meal_ranks.items():
+        if rank != lunch_rank:
+            assert illegal[tok], f"Non-expected meal (rank {rank}) should be illegal"
+    print("test_build_illegal_mask_meal_order passed.")
+
+
+def test_update_legality_state_start_increments_open(mini_tokenizer):
+    """After a START token, open_counts for that base should increase by 1."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)
+    K           = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
+
+    low_s = tk.token2id["A_STATE_Low_START"]
+    base  = luts["base_id"][low_s].item()
+
+    _update_legality_state(luts, low_s, open_counts, None, K)
+
+    assert open_counts[base].item() == 1, f"Expected open_counts[{base}]=1, got {open_counts[base].item()}"
+    print("test_update_legality_state_start_increments_open passed.")
+
+
+def test_update_legality_state_end_decrements_open(mini_tokenizer):
+    """After a matching END, open_counts should decrease back to 0."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)
+    K           = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
+
+    low_s = tk.token2id["A_STATE_Low_START"]
+    low_e = tk.token2id["A_STATE_Low_END"]
+    base  = luts["base_id"][low_s].item()
+
+    _update_legality_state(luts, low_s, open_counts, None, K)
+    assert open_counts[base].item() == 1
+    _update_legality_state(luts, low_e, open_counts, None, K)
+    assert open_counts[base].item() == 0, "END should bring open_counts back to 0"
+    print("test_update_legality_state_end_decrements_open passed.")
+
+
+def test_update_legality_state_end_does_not_go_negative(mini_tokenizer):
+    """END without prior START should not decrement below 0."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)
+    K           = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
+
+    low_e = tk.token2id["A_STATE_Low_END"]
+    _update_legality_state(luts, low_e, open_counts, None, K)
+    base = luts["base_id"][low_e].item()
+    assert open_counts[base].item() >= 0, "open_counts must never go negative"
+    print("test_update_legality_state_end_does_not_go_negative passed.")
+
+
+def test_update_legality_state_meal_advances_rank(mini_tokenizer):
+    """After a meal token, next_meal_rank should advance to the next rank in the cycle."""
+    tk  = mini_tokenizer
+    luts = build_luts(tk)
+    luts = {k: v.to("cpu") if torch.is_tensor(v) else v for k, v in luts.items()}
+
+    n_b         = luts["start_ids"].numel()
+    open_counts = torch.zeros(n_b, dtype=torch.int32)
+    K           = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
+
+    l_id = tk.token2id["MEAL_CONTEXT_Lunch"]
+    lunch_rank = luts["meal_rank"][l_id].item()
+
+    next_rank = _update_legality_state(luts, l_id, open_counts, None, K)
+
+    assert next_rank == (lunch_rank + 1) % K, \
+        f"Expected rank {(lunch_rank+1)%K}, got {next_rank}"
+    print(f"Lunch rank={lunch_rank}, next={next_rank} — test_update_legality_state_meal_advances_rank passed.")

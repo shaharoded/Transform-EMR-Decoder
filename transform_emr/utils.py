@@ -702,6 +702,59 @@ def build_rep_penalty(last_tokens, V, window=5, strength=0.6, device=None):
     return rep_vec * strength
 
 
+def compute_soft_outcome_labels(gen_abs_ts_hours, gt_df, outcome_names,
+                                 tau_hours, horizon_hours, device):
+    """
+    Compute soft outcome labels for a single patient's generated trajectory,
+    using the same time-decayed formula as Phase-2 training:
+
+        target_k(t) = clamp( Σ_s exp(-dt(t,s)/τ) * 1[token_s == outcome_k], 0, 1 )
+
+    where s iterates over ground-truth FUTURE events within `horizon_hours` of t.
+    Used during phase-3 training (finetuning on generated trajectories) to provide a learning signal for outcomes,
+    even when the exact outcome token is not generated at the exact time in the future.
+    
+    Parameters
+    ----------
+    gen_abs_ts_hours : 1-D tensor of absolute times (hours from admission) for
+                       each generated step.
+    gt_df            : full (untruncated) token DataFrame for this patient.
+                       Expected to have a 'PositionToken' (or 'Token') column and
+                       a 'TimePoint' column (normalised to [0,1] by /336).
+    outcome_names    : list of outcome token strings (model.outcome_names).
+    tau_hours        : decay constant in hours (TRAINING_SETTINGS['outcome_decay_tau_hours']).
+    horizon_hours    : max lookahead in hours (TRAINING_SETTINGS['outcome_horizon_hours']).
+    device           : torch device for the returned tensor.
+
+    Returns
+    -------
+    torch.Tensor of shape [T_gen, len(outcome_names)], dtype float32.
+    """
+    if gt_df is None or gen_abs_ts_hours.numel() == 0:
+        return torch.zeros(0, len(outcome_names), device=device)
+
+    T_gen   = gen_abs_ts_hours.shape[0]
+    labels  = torch.zeros(T_gen, len(outcome_names))
+    tok_col = 'PositionToken' if 'PositionToken' in gt_df.columns else 'Token'
+
+    for k, name in enumerate(outcome_names):
+        occ = gt_df[gt_df[tok_col] == name]
+        if occ.empty:
+            continue
+        occ_times = torch.tensor(occ['TimePoint'].values * 336.0, dtype=torch.float32)
+        for t_idx in range(T_gen):
+            t      = gen_abs_ts_hours[t_idx].item()
+            dt     = occ_times - t
+            future = (dt > 0) & (dt <= horizon_hours)
+            if not future.any():
+                continue
+            labels[t_idx, k] = torch.clamp(
+                torch.exp(-dt[future] / tau_hours).sum(), 0.0, 1.0
+            )
+
+    return labels.to(device)
+
+
 def audit_generated_stream(
         results_df: pd.DataFrame,
         tokenizer,

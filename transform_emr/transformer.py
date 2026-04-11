@@ -510,7 +510,7 @@ class GPT(nn.Module):
         )
 
 
-def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRANSFORMER_CHECKPOINT, training_settings=TRAINING_SETTINGS):
+def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=PHASE2_CHECKPOINT, training_settings=TRAINING_SETTINGS):
     """
     Trains a Transformer-based EMR sequence model in Phase 2 (decoder stage),
     using a pretrained embedder and structured multi-loss optimization.
@@ -872,6 +872,178 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         else:
             # If warmup isn't complete - do nothing.
             continue
+
+
+def finetune_transformer(model, train_dl, val_dl, resume=True,
+                         checkpoint_path=PHASE3_CHECKPOINT, training_settings=TRAINING_SETTINGS):
+    """
+    Phase 3 — Outcome Head Fine-tuning.
+
+    Freezes the backbone (embedder + transformer blocks + time head) and fine-tunes
+    only the outcome_head on teacher-forced training data. Analogous to fine-tuning a
+    classification head in BERT-style models: the representation network is kept fixed
+    while only the task-specific head is updated.
+
+    The outcome loss uses the same time-decayed soft labels as Phase 2 (same
+    get_future_outcome_targets formula), so the head learns from exactly the same target
+    distribution — but now with perfect gradient isolation: backbone features are frozen
+    and gradients flow only through outcome_head.
+
+    Because the backbone is frozen, this phase converges quickly. Early stopping is
+    applied against validation outcome loss. Checkpoints are saved in the same full-model
+    format as Phase 2, so GPT.load() works identically for both checkpoints.
+
+    Args:
+        model             : trained GPT (loaded from Phase-2 best checkpoint).
+        train_dl          : training DataLoader (same batched loader used in Phase 2).
+        val_dl            : validation DataLoader.
+        resume            : if True, look for a Phase-3 checkpoint and continue from it.
+        checkpoint_path   : path for the best-checkpoint file.
+        training_settings : settings dict (from model_config).
+
+    Returns
+    -------
+    model, train_losses, val_losses
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt_path = Path(checkpoint_path).resolve()
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_last = ckpt_path.parent / "ckpt_last.pt"
+
+    tok = model.embedder.tokenizer
+    valid_outcomes    = [n for n in model.outcome_names if n in tok.token2id]
+    outcome_token_ids = [tok.token2id[n] for n in valid_outcomes]
+    pos_weights       = tok.outcome_weights[outcome_token_ids].to(device)
+    OutcomeCriterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction="none")
+
+    # ── Freeze backbone, unfreeze outcome_head ────────────────────────────────
+    for param in model.parameters():
+        param.requires_grad_(False)
+    for param in model.outcome_head.parameters():
+        param.requires_grad_(True)
+
+    optimizer = torch.optim.AdamW(
+        model.outcome_head.parameters(),
+        lr=training_settings["phase3_learning_rate"],
+        weight_decay=training_settings["weight_decay"],
+    )
+
+    start_epoch = 0
+    best_val    = float("inf")
+    bad_epochs  = 0
+
+    if resume and ckpt_last.exists():
+        print(f"[Phase-3]: Loading checkpoint: {ckpt_last}")
+        loaded_model, start_epoch, best_val, opt_state, _, _ = GPT.load(
+            ckpt_last, embedder=model.embedder, map_location=device
+        )
+        model = loaded_model
+        model.to(device)
+        # Re-freeze backbone after loading
+        for param in model.parameters():
+            param.requires_grad_(False)
+        for param in model.outcome_head.parameters():
+            param.requires_grad_(True)
+        optimizer = torch.optim.AdamW(
+            model.outcome_head.parameters(),
+            lr=training_settings["phase3_learning_rate"],
+            weight_decay=training_settings["weight_decay"],
+        )
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+        start_epoch += 1
+        print(f"[Phase-3]: Resumed at epoch {start_epoch} (best val: {best_val:.4f})")
+    else:
+        model.to(device)
+        print("[Phase-3]: Fine-tuning outcome head...")
+
+    train_losses, val_losses = [], []
+
+    _ABS_TS_SCALE = 336.0
+    _TAU     = training_settings.get("outcome_decay_tau_hours", 12.0) / _ABS_TS_SCALE
+    _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
+
+    def run_epoch(loader, train_flag):
+        # Backbone stays in eval mode (no dropout updates, deterministic features).
+        # Only outcome_head is set to train mode when updating.
+        model.eval()
+        if train_flag:
+            model.outcome_head.train()
+
+        total_loss = 0.0
+        with torch.set_grad_enabled(train_flag):
+            for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
+                              leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
+                batch = {k: v.to(device) for k, v in batch.items()}
+
+                _, _, outcome_logits, _ = model(
+                    parent_raw_ids=batch["parent_raw_ids"],
+                    concept_ids=batch["concept_ids"],
+                    value_ids=batch["value_ids"],
+                    position_ids=batch["position_ids"],
+                    abs_ts=batch["abs_ts"],
+                    context_vec=batch["context_vec"],
+                )
+
+                full_targets = batch["position_ids"]           # [B, T]
+                outcome_pred = outcome_logits[:, :-1, :]       # [B, T-1, K]
+
+                outcome_targets = get_future_outcome_targets(
+                    target_ids=full_targets,
+                    outcome_ids=outcome_token_ids,
+                    all_abs_ts=batch["abs_ts"],
+                    query_abs_ts=batch["abs_ts"][:, :-1],
+                    tau=_TAU,
+                    horizon=_HORIZON,
+                )  # [B, T-1, K]
+
+                nonpad    = (full_targets[:, 1:] != model.embedder.padding_idx)  # [B, T-1]
+                valid_pos = nonpad.unsqueeze(-1)                                  # [B, T-1, 1]
+
+                loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)        # [B, T-1, K]
+                loss     = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+
+                if train_flag:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.outcome_head.parameters(), 1.0)
+                    optimizer.step()
+
+                total_loss += loss.item()
+
+        return total_loss / max(len(loader), 1)
+
+    n_epochs = training_settings["phase3_n_epochs"]
+    patience = training_settings["early-stop-patience"]
+
+    for epoch in range(start_epoch, start_epoch + n_epochs):
+        tr_loss = run_epoch(train_dl, train_flag=True)
+        vl_loss = run_epoch(val_dl,   train_flag=False)
+
+        train_losses.append(tr_loss)
+        val_losses.append(vl_loss)
+
+        print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}")
+
+        model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
+                   training_settings=training_settings, bad_epochs=bad_epochs)
+
+        if vl_loss < best_val - 1e-4:
+            best_val = vl_loss
+            bad_epochs = 0
+            model.save(ckpt_path, epoch=epoch, best_val=best_val, optimizer=optimizer,
+                       training_settings=training_settings)
+            print("[Phase-3]: Current best model saved.")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                print("[Phase-3]: Early stopping triggered.")
+                break
+
+    # Restore gradients to all parameters
+    for param in model.parameters():
+        param.requires_grad_(True)
 
     plot_losses(train_losses, val_losses)
     return model, train_losses, val_losses

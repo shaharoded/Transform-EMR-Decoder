@@ -21,7 +21,7 @@ transform-emr/
 │   ├── dataset.py                     # Dataset, DataPreprocess and Tokenizer
 │   ├── embedder.py                    # Embedding model (EMREmbedding) + training
 │   ├── transformer.py                 # Transformer architecture (GPT) + training
-│   ├── train.py                       # Full training pipeline (2-phase)
+│   ├── train.py                       # Full training pipeline (3-phase)
 │   ├── inference.py                   # Inference pipeline
 │   ├── loss.py                        # Utility module for special loss criterias
 │   ├── schedulers.py                  # Utility module for training schedulers (LR & Aux tasks)
@@ -43,7 +43,7 @@ transform-emr/
 └── pyproject.toml
 ```
 
-As noted, this model feeds of the output of the [Mediator](https://github.com/shaharoded/Mediator) temporal abstraction engine.
+As noted, this model feeds of the output of the [Mediator](https://github.com/shaharoded/Mediator) temporal abstraction engine. It can work with any temporal-interval dataset, but note that the embedding has knowledge-base component, so a `tak-repo-portable.json` like object is mandatory.
 
 ---
 
@@ -80,65 +80,61 @@ temporal_df, ctx_df = processor.run()
 
 tokenizer = EMRTokenizer.from_processed_df(temporal_df)
 train_ds = EMRDataset(train_df, train_ctx, tokenizer=tokenizer)
-MODEL_CONFIG['ctx_dim'] = train_ds.context_df.shape[1] # Dinamically updating shape
+MODEL_CONFIG['ctx_dim'] = int(train_ds.context_df.shape[1]) # Dinamically updating shape
 ```
 
 ### 2. Train Model
 
 ```python
-from transform_emr.train import run_two_phase_training
-run_two_phase_training()
+from transform_emr.train import run_training
+run_training()
 ```
 
-Model checkpoints and scaler are saved under `checkpoints/phase1/` and `checkpoints/phase2/`.
-You can also split this part to it's components, running the prepare_data(), phase_one(), phase_two() seperatly,
-but you'll need to adjust the imports. Use `train.py` structure for that.
+Model checkpoints are saved under `checkpoints/phase1/`, `checkpoints/phase2/`, and `checkpoints/phase3/`.
+You can also run each phase individually by calling `prepare_data()`, `phase_one()`, `phase_two()`, and
+`phase_three()` separately. All three phases use the same DataLoaders. See `train.py` for reference.
 
-### 3. Inference from the Model
+### 3. Inference and Complication Risk Prediction
+
+The primary inference task is **complication risk prediction**: for each patient, generate a single
+free-running trajectory and read the outcome head at every step to produce a probability curve per
+complication over time. Use `generate_risk_curves` for this purpose.
 
 ```python
-    import random
-    import joblib
-    from pathlib import Path
-    from transform_emr.embedder import EMREmbedding
-    from transform_emr.transformer import GPT
-    from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset
-    from transform_emr.config.model_config import *
+import joblib
+from pathlib import Path
+from transform_emr.embedder import EMREmbedding
+from transform_emr.transformer import GPT
+from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset
+from transform_emr.inference import generate_risk_curves
+from transform_emr.config.model_config import *
 
-    # Load test data
-    df = pd.read_csv(TEST_TEMPORAL_DATA_FILE, low_memory=False)
-    ctx_df = pd.read_csv(TEST_CTX_DATA_FILE)
+# Load tokenizer and scaler
+tokenizer = EMRTokenizer.load(Path(CHECKPOINT_PATH) / "tokenizer.pt")
+scaler = joblib.load(Path(CHECKPOINT_PATH) / "scaler.pkl")
 
-    # Load tokenizer and scaler
-    tokenizer = EMRTokenizer.load(Path(CHECKPOINT_PATH) / "tokenizer.pt")
-    scaler = joblib.load(Path(CHECKPOINT_PATH) / "scaler.pkl")
+# Preprocess test data, truncated to the same input window used during Phase-3 alignment
+processor = DataProcessor(df, ctx_df, scaler=scaler, tak_repo_path=TAK_REPO_PATH, max_input_days=5)
+df, ctx_df = processor.run()
+dataset_input = EMRDataset(df, ctx_df, tokenizer=tokenizer)
 
-    # Run preprocessing
-    processor = DataProcessor(df, ctx_df, scaler=scaler, tak_repo_path=TAK_REPO_PATH, max_input_days=5)
-    df, ctx_df = processor.run()
+# Load the best available checkpoint (Phase-3 if available, otherwise Phase-2)
+embedder_model, *_ = EMREmbedding.load(PHASE1_CHECKPOINT, tokenizer=tokenizer)
+p3_ckpt = Path(PHASE3_CHECKPOINT)
+p2_ckpt = Path(PHASE2_CHECKPOINT)
+ckpt_path = p3_ckpt if p3_ckpt.exists() else p2_ckpt
+model, *_ = GPT.load(ckpt_path, embedder=embedder_model)
+model.eval()
 
-    patient_ids = df["PatientID"].unique()
-    df_subset = df[df["PatientID"].isin(patient_ids)].copy()
-    ctx_subset = ctx_df.loc[patient_ids].copy()
-
-    # Create dataset
-    dataset = EMRDataset(df_subset, ctx_subset, tokenizer=tokenizer)
-
-    # Load models
-    embedder, _, _, _, _, _, _ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=tokenizer)
-    model, _, _, _, _, _ = GPT.load(TRANSFORMER_CHECKPOINT, embedder=embedder)
-    model.eval()
-
-    # Run inference
-    result_df = infer_event_stream(model, dataset, temperature=1.0)  # optional: adjust temperature
+# Generate risk curves — one row per generated step, P_<outcome> columns per complication
+risk_df = generate_risk_curves(model, dataset_input, max_len=500, temperature=1.0, rep_decay=0.6)
 ```
 
-This results_df will include both input events and generated events and will have these columns:
-{"PatientID", "Step", "Token", "IsInput", "IsOutcome", "IsTerminal", "TimePoint"}
+The returned `risk_df` has columns `{PatientId, Step, Token, IsInput, TimePoint, P_<outcome_name>, ...}`.
+Rows with `IsInput == 0` are generated steps; the `P_*` columns hold sigmoid outcome-head probabilities
+at that step. Evaluate using time-stratified AUC (see `evaluation.ipynb`).
 
-You can analize the model's performance by comparing the input (`dataset.tokens_df`) to the output:
- - Were all complications generated?
- - Were all complications generated on time? (Set a forgiving boundry like 24h window)
+`infer_event_stream` is also available for raw event generation (returns token stream without risk scores).
 
 
 ### 4. Using as a module
@@ -218,10 +214,14 @@ Per-patient Event Tokenization (with normalized absolute timestamps)
 🧠 Phase 1 – Train EMREmbedding (token + time + patient context)
 │
 ▼
-📚 Phase 2 – Pre-train a Transformer decoder over learned embeddings, as a next-token-prediction task.
+📚 Phase 2 – Pretrain a Transformer decoder over learned embeddings (next-token prediction + outcome auxiliary task).
 │
 ▼
-→ Predict next medical events (token + time) and deduce outcome predictions from them (in `evaluation.ipynb`)
+🎯 Phase 3 – Outcome Head Fine-tuning: freeze backbone, fine-tune only the outcome head on
+             teacher-forced data (same DataLoaders as Phase 2), analogous to BERT head fine-tuning.
+│
+▼
+→ Predict next medical events (token + time) and read complication risk curves from the outcome head (in `evaluation.ipynb`)
 
 ---
 
@@ -240,7 +240,7 @@ Per-patient Event Tokenization (with normalized absolute timestamps)
 📌 **Why it matters:**  
 Medical data varies in density and structure across patients. This dynamic preprocessing handles irregularity while preserving medically-relevant sequencing via `START/END` logic and relative timing.
 
->> This modules assumes the existance of prepared tak_repo.pkl file, outputed from the Mediator as a hierarchy mapper of the different concepts.
+>> This modules assumes the existance of prepared tak-repo-portable.json file, outputed from the Mediator as a hierarchy mapper of the different concepts.
 ---
 
 ### 2. **`embedder.py`** – EMR Representation Learning
@@ -276,7 +276,8 @@ MLM will avoid masking tokens which will damage the broader meaning like ADMISSI
 | `CausalSelfAttention` | Multi-head attention using causal mask to enforce chronology. Uses temporal RoPE to inject absolute time into attention scores.|
 | `MLP` | SwiGLU MLP (SiLU Gating), based on common LLM optimizations.                                 |
 | `AdaLNBlock` | Transformer block with AdaLN-Zero conditioning (adaptive layer norm), to bias prediction based on the patient context.                                 |
-| `train_transformer()` | Complete training logic using legality-masked temporal multi-hot BCE (focal), masked set-CE, Δt loss, and outcome BCE auxiliary losses.                         |
+| `pretrain_transformer()` | Complete Phase-2 training logic using legality-masked temporal multi-hot BCE (focal), masked set-CE, Δt loss, and outcome BCE auxiliary losses.                         |
+| `finetune_transformer()` | Phase-3 outcome head fine-tuning: freezes the backbone and fine-tunes only the outcome head on teacher-forced data (same DataLoaders as Phase 2), analogous to fine-tuning a BERT classification head. Uses the same soft-label targets as Phase 2 but with gradient isolation on the head only. Saves full-model checkpoints loadable with `GPT.load()`. |
 
 ⚙️ **Phase 2: Learning Sequence Dependencies**  
 Once the EMR structure is captured, the transformer learns to model sequential dependencies in event progression:  
@@ -295,23 +296,28 @@ The training flow uses warmup/curriculum scheduling (LR warmup, BCE-only phase, 
 
 | Component           | Role                                                                                              |
 |--------------------|---------------------------------------------------------------------------------------------------|
-| `get_token_embedding()` | Select a token and get it's embeddings based on an input embedder.                                 |
-| `infer_event_stream()` | Generate predicted stream of events on an input dataset (Test), using a masking process to block prediction of illegal tokens in relation to the predictions so far.                         |
+| `generate_risk_curves()` | **Primary inference function.** Generates one autoregressive trajectory per patient and reads the outcome head at every step, returning a DataFrame of per-step complication probabilities. |
+| `infer_event_stream()` | Generates a predicted stream of tokens without risk scores. Useful for inspecting which events the model predicts, independent of outcome probabilities. |
+| `get_token_embedding()` | Returns the embedding vector of a specific token from a trained embedder. |
+| `_build_illegal_mask()` | Builds a Boolean `[V]` mask of token ids that are structurally illegal to generate next, given the current interval and meal-order state. |
+| `_update_legality_state()` | Mutates interval open-counts and advances meal-order rank after each generated token. |
+| `_decode_token_components()` | Decodes a position-token string into `(concept_id, value_id)` for feeding back into the model. |
 
-
-NOTE: Unlike the parallel batching in the training process, inference on the transformer is step-by-step, hence slow (especially with the updating of illegal tokens on the fly).
+NOTE: Inference is step-by-step (not batched), so it is significantly slower than training.
 ---
 
-### 5. **`evaluation.ipynb`** – Evaluation of the model's performance based on dynamic activations of `inference.py`.
+### 5. **`evaluation.ipynb`** – Risk-based complication prediction evaluation.
+
+Runs the full end-to-end evaluation pipeline: data loading, three-phase training, risk-curve generation,
+and statistical analysis. The primary evaluation metric is time-stratified AUC.
 
 | Component           | Role                                                                                              |
 |--------------------|---------------------------------------------------------------------------------------------------|
-| `evaluate_events` | Calculates full classification evaluation methods given gold-standard DataFrame and generated DataFrame.                                 |
-| `evaluate_across_k` | Handles Inference + Evaluation from pre-trained model across all K.                 |
-| `plot_metrics_trend` | Plots global evaluation over K. |
-| `build_3x_matrix` | Was the model able to predict a future RELEASE / COMPLICATION EATH?.                                 |
-| `build_full_outcome_matrix` | Was the model able to predict a future **specific** OUTCOME (from `dataset.config`).                         |
-| `build_timeaware_matrix` | Was the model able to predict a future **specific** OUTCOME (from `dataset.config`) at the correct time?                         |
+| `extract_ground_truth()` | Builds a `{patient_id → {outcome → first_occurrence_hours}}` dict from the full (untruncated) test dataset. |
+| `time_stratified_auc()` | At each 24 h window: score = max outcome-head probability in window, label = complication occurred in same window. Computes AUROC and AUPRC per complication, averaged across windows. |
+| `time_accuracy()` | For patients where a complication occurred: MAE between the generated step with peak probability and actual onset time. |
+| `calibrate_temperature()` | Learns a per-outcome temperature scalar via LBFGS (NLL minimisation). Does not affect rank order (AUC unchanged); improves probability calibration for direct interpretation. |
+| `reliability_diagram()` | Plots calibration curves before and after temperature scaling. |
 
 ---
 
