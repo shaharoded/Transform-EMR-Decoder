@@ -231,7 +231,10 @@ class LambdaScheduleController:
         s = spec["start_epoch"]
         if s is None:
             return float("inf")
-        return s if spec["ramp_epochs"] <= 1 else s + spec["ramp_epochs"]
+        # Calibration happens in update() which runs AFTER run_epoch().
+        # The first epoch that actually uses the calibrated lambda is start_epoch+1.
+        # Using max(1, ramp_epochs) ensures the gate never opens before that epoch.
+        return s + max(1, spec["ramp_epochs"])
 
     @staticmethod
     def _check_plateau(metric_val, best_val, bad_epochs, min_delta, patience):
