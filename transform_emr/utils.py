@@ -106,6 +106,8 @@ def get_temporal_multi_hot_targets(
     vocab_size: int,
     window_size: float,
     query_abs_ts: Optional[torch.Tensor] = None,
+    outcome_ids: Optional[torch.Tensor] = None,
+    next_token_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Build temporal multi-hot targets over a future time window using GPU-efficient
@@ -113,6 +115,11 @@ def get_temporal_multi_hot_targets(
 
     For each query step t, marks token ids that appear at any future step s such that:
         0 < (all_abs_ts[s] - query_abs_ts[t]) <= window_size
+
+    Outcome override: when ``outcome_ids`` and ``next_token_ids`` are both provided,
+    any query position whose immediate next token is an outcome/terminal token has its
+    entire multi-hot row replaced with a 1-hot on just that token. This eliminates
+    gradient dilution at exactly the positions where precise supervision matters most.
 
     IMPORTANT: This function assumes all_abs_ts is NON-DECREASING (sorted) per batch.
     The dataset MUST maintain this ordering. See dataset.py for sorting guarantees.
@@ -124,6 +131,10 @@ def get_temporal_multi_hot_targets(
         vocab_size: Vocabulary size V for output shape.
         window_size: Future window size (same normalized units as ``all_abs_ts``).
         query_abs_ts: [B, T_q] optional query timestamps. If omitted, uses ``all_abs_ts``.
+        outcome_ids: 1-D LongTensor of outcome + terminal token ids. When provided
+            together with ``next_token_ids``, enables the 1-hot override.
+        next_token_ids: [B, T_q] immediate next token at each query position.
+            Use ``padding_idx`` where no next token exists (e.g. last position in phase-1).
 
     Returns:
         FloatTensor [B, T_q, V] with 0/1 multi-hot labels.
@@ -158,6 +169,22 @@ def get_temporal_multi_hot_targets(
 
     if 0 <= padding_idx < vocab_size:
         multi_hot[..., padding_idx] = 0.0
+
+    # Outcome 1-hot override: replace the broad window multi-hot with a strict 1-hot at
+    # positions where the immediate next token is an outcome or terminal. Outcome tokens
+    # are never illegal so the legality mask does not conflict with this override.
+    if outcome_ids is not None and next_token_ids is not None and outcome_ids.numel() > 0:
+        assert next_token_ids.shape == (B, T_q), (
+            f"next_token_ids shape {next_token_ids.shape} must match (B={B}, T_q={T_q})"
+        )
+        oids = outcome_ids.to(target_ids.device)
+        # is_outcome_next[b, q] = True iff next_token_ids[b, q] is in outcome_ids
+        is_outcome_next = (next_token_ids.unsqueeze(-1) == oids.view(1, 1, -1)).any(-1)  # [B, T_q]
+        if is_outcome_next.any():
+            bi, qi = is_outcome_next.nonzero(as_tuple=True)
+            tok = next_token_ids[bi, qi]   # [N] the specific outcome token ids
+            multi_hot[bi, qi] = 0.0        # wipe window
+            multi_hot[bi, qi, tok] = 1.0   # replace with 1-hot
 
     return multi_hot
 

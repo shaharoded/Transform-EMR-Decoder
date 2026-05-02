@@ -339,15 +339,37 @@ class GPT(nn.Module):
             )
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
-        
+
         # A simple MLP classifier
         self.outcome_head = nn.Sequential(
             nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
             nn.Dropout(cfg["dropout"]),
-            nn.Linear(cfg["embed_dim"], self.num_outcomes) 
+            nn.Linear(cfg["embed_dim"], self.num_outcomes)
             # Note: No Sigmoid here if using BCEWithLogitsLoss later
         )
+
+        # _outcome_lm_ids: vocab positions for outcome_names — used by the LM coupling.
+        # _outcome_ids: vocab positions for ALL OUTCOMES+TERMINAL_OUTCOMES in vocab
+        #   (broader than outcome_names; used for 1-hot override in multi-hot targets).
+        self.register_buffer(
+            "_outcome_lm_ids",
+            torch.tensor([tok.token2id[n] for n in self.outcome_names], dtype=torch.long),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_outcome_ids",
+            torch.tensor([tok.token2id[n] for n in in_vocab], dtype=torch.long),
+            persistent=True,
+        )
+
+        # One-way coupling: outcome_head → LM head at outcome vocab positions.
+        # outcome_to_lm reads outcome_logits.detach() so LM loss never corrupts
+        # outcome_head training. Zero-init = no-op at start; trained in phase-3 only
+        # alongside outcome_head after it is well-calibrated from phase-2.
+        self.outcome_to_lm = nn.Linear(self.num_outcomes, self.num_outcomes, bias=True)
+        nn.init.zeros_(self.outcome_to_lm.weight)
+        nn.init.zeros_(self.outcome_to_lm.bias)
 
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
@@ -466,7 +488,7 @@ class GPT(nn.Module):
                 x = blk(x, cond_emb, key_pad_mask=pad_mask, abs_ts=abs_ts)
         
         x = self.ln_f(x)                     # [B, T, D]
-        
+
         # 3. Main next-token prediction head
         logits = self.lm_head(x)             # [B, T, V]
 
@@ -474,6 +496,12 @@ class GPT(nn.Module):
         # Input: Contextual embedding at step t (representing history 0..t)
         # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
         outcome_logits = self.outcome_head(x)
+
+        # 4b. One-way outcome→LM coupling: add a learned bias at the outcome vocab
+        # positions. Detach prevents LM loss from flowing into outcome_head weights.
+        # outcome_to_lm is zero-init (no-op until trained in phase-3).
+        lm_bias = self.outcome_to_lm(outcome_logits.detach())   # [B, T, num_outcomes]
+        logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)
 
         # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
@@ -550,6 +578,8 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
+        lm_bias        = self.outcome_to_lm(outcome_logits.detach())
+        logits         = logits.index_add(2, self._outcome_lm_ids, lm_bias)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
@@ -714,7 +744,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
     valid_outcomes = [n for n in model.outcome_names if n in model.embedder.tokenizer.token2id]
     outcome_token_ids = [model.embedder.tokenizer.token2id[n] for n in valid_outcomes]
-    
+
     # Build criterions once (for next token BCE and CE losses + aux outcome BCE)
     BCEcriterion = MaskedFocalBCE.from_counts(
         counts=model.embedder.tokenizer.token_counts,
@@ -878,6 +908,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     padding_idx=model.embedder.padding_idx,
                     vocab_size=pred_logits.size(-1),
                     window_size=_BCE_WIN,
+                    outcome_ids=model._outcome_ids,
+                    next_token_ids=full_targets[:, 1:],
                 )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 
@@ -1075,17 +1107,24 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     pos_weights       = tok.outcome_weights[outcome_token_ids].to(device)
     OutcomeCriterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction="none")
 
-    # ── Freeze backbone, unfreeze outcome_head ────────────────────────────────
-    for param in model.parameters():
-        param.requires_grad_(False)
-    for param in model.outcome_head.parameters():
-        param.requires_grad_(True)
+    def _freeze_backbone_only(m):
+        """Freeze all params except outcome_head and outcome_to_lm."""
+        for param in m.parameters():
+            param.requires_grad_(False)
+        for param in m.outcome_head.parameters():
+            param.requires_grad_(True)
+        for param in m.outcome_to_lm.parameters():
+            param.requires_grad_(True)
 
-    optimizer = torch.optim.AdamW(
-        model.outcome_head.parameters(),
-        lr=training_settings["phase3_learning_rate"],
-        weight_decay=training_settings["weight_decay"],
-    )
+    def _make_p3_optimizer(m):
+        return torch.optim.AdamW(
+            list(m.outcome_head.parameters()) + list(m.outcome_to_lm.parameters()),
+            lr=training_settings["phase3_learning_rate"],
+            weight_decay=training_settings["weight_decay"],
+        )
+
+    _freeze_backbone_only(model)
+    optimizer = _make_p3_optimizer(model)
 
     start_epoch = 0
     best_val    = float("inf")
@@ -1098,23 +1137,15 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         )
         model = loaded_model
         model.to(device)
-        # Re-freeze backbone after loading
-        for param in model.parameters():
-            param.requires_grad_(False)
-        for param in model.outcome_head.parameters():
-            param.requires_grad_(True)
-        optimizer = torch.optim.AdamW(
-            model.outcome_head.parameters(),
-            lr=training_settings["phase3_learning_rate"],
-            weight_decay=training_settings["weight_decay"],
-        )
+        _freeze_backbone_only(model)
+        optimizer = _make_p3_optimizer(model)
         if opt_state is not None:
             optimizer.load_state_dict(opt_state)
         start_epoch += 1
         print(f"[Phase-3]: Resumed at epoch {start_epoch} (best val: {best_val:.4f})")
     else:
         model.to(device)
-        print("[Phase-3]: Fine-tuning outcome head...")
+        print("[Phase-3]: Fine-tuning outcome head + outcome_to_lm coupling...")
 
     train_losses, val_losses = [], []
 
@@ -1124,18 +1155,19 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
-        # Only outcome_head is set to train mode when updating.
+        # outcome_head and outcome_to_lm are set to train mode when updating.
         model.eval()
         if train_flag:
             model.outcome_head.train()
+            model.outcome_to_lm.train()
 
-        total_loss = 0.0
+        total_loss = total_outcome = total_ce = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
-                _, _, outcome_logits, _ = model(
+                logits, _, outcome_logits, _ = model(
                     parent_raw_ids=batch["parent_raw_ids"],
                     concept_ids=batch["concept_ids"],
                     value_ids=batch["value_ids"],
@@ -1143,10 +1175,13 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     abs_ts=batch["abs_ts"],
                     context_vec=batch["context_vec"],
                 )
+                logits         = logits.float()
                 outcome_logits = outcome_logits.float()
 
-                full_targets = batch["position_ids"]           # [B, T]
-                outcome_pred = outcome_logits[:, :-1, :]       # [B, T-1, K]
+                full_targets = batch["position_ids"]      # [B, T]
+                target_ids   = full_targets[:, 1:]        # [B, T-1]
+                outcome_pred = outcome_logits[:, :-1, :]  # [B, T-1, K]
+                pred_logits  = logits[:, :-1, :]          # [B, T-1, V]
 
                 outcome_targets = get_future_outcome_targets(
                     target_ids=full_targets,
@@ -1157,33 +1192,55 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     horizon=_HORIZON,
                 )  # [B, T-1, K]
 
-                nonpad    = (full_targets[:, 1:] != model.embedder.padding_idx)  # [B, T-1]
-                valid_pos = nonpad.unsqueeze(-1)                                  # [B, T-1, 1]
+                nonpad    = (target_ids != model.embedder.padding_idx)  # [B, T-1]
+                valid_pos = nonpad.unsqueeze(-1)                        # [B, T-1, 1]
 
-                loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)        # [B, T-1, K]
-                loss     = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+                loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
+                loss_outcome = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+
+                # CE at outcome positions: trains outcome_to_lm via LM logits
+                oids = model._outcome_ids
+                is_outcome_pos = (target_ids.unsqueeze(-1) == oids.view(1, 1, -1)).any(-1) & nonpad
+                if is_outcome_pos.any():
+                    loss_ce = F.cross_entropy(
+                        pred_logits[is_outcome_pos],
+                        target_ids[is_outcome_pos],
+                        reduction="mean",
+                    )
+                else:
+                    loss_ce = torch.tensor(0.0, device=device)
+
+                loss = loss_outcome + loss_ce
 
                 if train_flag:
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(model.outcome_head.parameters(), 1.0)
+                    nn.utils.clip_grad_norm_(
+                        list(model.outcome_head.parameters()) + list(model.outcome_to_lm.parameters()),
+                        1.0,
+                    )
                     optimizer.step()
 
-                total_loss += loss.item()
+                total_loss    += loss.item()
+                total_outcome += loss_outcome.item()
+                total_ce      += loss_ce.item()
 
-        return total_loss / max(len(loader), 1)
+        n = max(len(loader), 1)
+        return total_loss / n, total_outcome / n, total_ce / n
 
     n_epochs = training_settings["phase3_n_epochs"]
     patience = training_settings["early-stop-patience"]
 
     for epoch in range(start_epoch, start_epoch + n_epochs):
-        tr_loss = run_epoch(train_dl, train_flag=True)
-        vl_loss = run_epoch(val_dl,   train_flag=False)
+        tr_loss, tr_outcome, tr_ce = run_epoch(train_dl, train_flag=True)
+        vl_loss, vl_outcome, vl_ce = run_epoch(val_dl,   train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}")
+        print(f"[Phase-3]: Epoch {epoch:02d}  "
+              f"train={tr_loss:.4f} (outcome={tr_outcome:.4f}, ce={tr_ce:.4f})  "
+              f"val={vl_loss:.4f} (outcome={vl_outcome:.4f}, ce={vl_ce:.4f})")
 
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)

@@ -1141,6 +1141,100 @@ def probe_outcome_logit_distribution(model, val_dl, n_batches: int = 1) -> pd.Da
     return df
 
 
+def probe_outcome_lm_coupling(model, val_dl, n_batches: int = 3) -> dict:
+    """
+    Purpose: Verify that the outcome_to_lm coupling is non-trivial after phase-3
+        training and that it correctly lifts LM logits at outcome positions when
+        the outcome head predicts elevated risk.
+    Method: For each outcome, (a) check weight norms of outcome_to_lm, (b) collect
+        positions where that outcome is the GT next token, (c) compare the raw
+        lm_head(x) logit vs the final logit (with coupling bias) at that vocab
+        position, (d) report the mean bias added and the Pearson correlation between
+        outcome_head logit and the coupling contribution.
+
+    Args:
+        model: GPT (outcome_to_lm should be trained — run after phase-3).
+        val_dl (DataLoader): Validation dataloader.
+        n_batches (int): Batches to consume.
+
+    Returns:
+        dict: per-outcome stats — weight_norm, mean_bias, bias_std, r_head_vs_bias.
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    # Weight norms of outcome_to_lm rows (one per outcome)
+    w = model.outcome_to_lm.weight.detach().cpu()  # [num_outcomes, num_outcomes]
+    row_norms = w.norm(dim=1).tolist()
+
+    # Per-outcome accumulators: lists of (outcome_logit, bias_added) pairs
+    accum: dict = {name: {"head_logits": [], "biases": []} for name in model.outcome_names}
+
+    with torch.no_grad():
+        for i, batch in enumerate(val_dl):
+            if i >= n_batches:
+                break
+            batch = {k: v.to(device) for k, v in batch.items()}
+
+            x_out, cond_emb, pad_mask = model.embedder(
+                batch["parent_raw_ids"], batch["concept_ids"], batch["value_ids"],
+                batch["position_ids"], batch["abs_ts"], batch["context_vec"],
+                return_mask=True,
+            )
+            for blk in model.blocks:
+                x_out = blk(x_out, cond_emb, key_pad_mask=pad_mask, abs_ts=batch["abs_ts"])
+            x_out = model.ln_f(x_out)
+
+            outcome_logits = model.outcome_head(x_out).float()     # [B, T, K]
+            bias           = model.outcome_to_lm(outcome_logits.detach())  # [B, T, K]
+
+            # For each outcome, find GT positions where next token == that outcome
+            target_ids   = batch["position_ids"][:, 1:]            # [B, T-1]
+            oh_shifted   = outcome_logits[:, :-1, :]               # [B, T-1, K]
+            bias_shifted = bias[:, :-1, :]                         # [B, T-1, K]
+
+            for k, name in enumerate(model.outcome_names):
+                vocab_id = model._outcome_lm_ids[k].item()
+                is_pos = (target_ids == vocab_id)                   # [B, T-1]
+                if not is_pos.any():
+                    continue
+                head_logit_vals = oh_shifted[..., k][is_pos].cpu().tolist()
+                bias_vals       = bias_shifted[..., k][is_pos].cpu().tolist()
+                accum[name]["head_logits"].extend(head_logit_vals)
+                accum[name]["biases"].extend(bias_vals)
+
+    rows = []
+    for k, name in enumerate(model.outcome_names):
+        hl = np.array(accum[name]["head_logits"])
+        bv = np.array(accum[name]["biases"])
+        n  = len(hl)
+        if n < 2:
+            r = float("nan")
+        else:
+            r = float(np.corrcoef(hl, bv)[0, 1]) if bv.std() > 1e-9 else float("nan")
+        rows.append({
+            "outcome":      name,
+            "weight_norm":  float(row_norms[k]),
+            "n_positions":  n,
+            "mean_bias":    float(bv.mean()) if n else float("nan"),
+            "bias_std":     float(bv.std())  if n else float("nan"),
+            "r_head_bias":  r,
+        })
+
+    df = pd.DataFrame(rows).sort_values("weight_norm", ascending=False)
+    print("\n" + "=" * 90)
+    print("PROBE - OUTCOME→LM COUPLING (outcome_to_lm weights + bias at GT outcome positions)")
+    print("=" * 90)
+    print(df.round(4).to_string(index=False))
+
+    near_zero = (df["weight_norm"] < 1e-3).all()
+    if near_zero:
+        print("\n  WARNING: outcome_to_lm weights are near zero — coupling has not activated.")
+        print("  Possible causes: (a) phase-3 not yet run, (b) CE loss at outcome positions")
+        print("  produced no gradient (check that outcome tokens appear in val batches).")
+    return df.to_dict(orient="records")
+
+
 def main() -> None:
     run_diagnostics(sample=2000, batch_size=32)
 

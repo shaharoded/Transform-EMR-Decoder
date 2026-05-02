@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
 from transform_emr.config.model_config import *
+from transform_emr.config.dataset_config import OUTCOMES, TERMINAL_OUTCOMES
 from transform_emr.utils import compute_legality_masks_tf, get_temporal_multi_hot_targets, build_mlm, plot_losses, build_luts, logger
 from transform_emr.schedulers import LambdaScheduleController
 
@@ -433,6 +434,13 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=4, min_lr=1e-6)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=embedder.tokenizer.token_weights.to(device), reduction="none")
 
+    # All outcome + terminal token ids — used for 1-hot override in multi-hot targets
+    _all_outcome_names = sorted(set(OUTCOMES + TERMINAL_OUTCOMES))
+    p1_outcome_ids = torch.tensor(
+        [embedder.tokenizer.token2id[n] for n in _all_outcome_names if n in embedder.tokenizer.token2id],
+        dtype=torch.long, device=device,
+    )
+
     # ----- Resume logic -----
     train_losses, val_losses = [], []
     start_epoch = 1
@@ -506,13 +514,21 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             # Temporal: all tokens within phase1_bce_window_hours
             _ABS_TS_SCALE = 336.0
             _P1_WIN = training_settings.get("phase1_bce_window_hours", 3.0) / _ABS_TS_SCALE
+            # next_token_ids for phase-1: query positions cover full T, so shift by 1
+            # and pad the last column with padding_idx (no next token after last position).
+            _pos_ids = batch["position_ids"]
+            _B = _pos_ids.size(0)
+            _pad_col = torch.full((_B, 1), embedder.padding_idx, dtype=torch.long, device=_pos_ids.device)
+            _next_tok = torch.cat([_pos_ids[:, 1:], _pad_col], dim=1)  # [B, T]
             multi_hot_targets = get_temporal_multi_hot_targets(
-                target_ids=batch["position_ids"],
+                target_ids=_pos_ids,
                 all_abs_ts=batch["abs_ts"],
                 query_abs_ts=batch["abs_ts"],
                 padding_idx=embedder.padding_idx,
                 vocab_size=bce_logits.size(-1),
                 window_size=_P1_WIN,
+                outcome_ids=p1_outcome_ids,
+                next_token_ids=_next_tok,
             )
             multi_hot_targets = multi_hot_targets.masked_fill(illegal, 0.0)
 

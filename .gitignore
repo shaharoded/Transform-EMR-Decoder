@@ -1,6 +1,5 @@
 # Ignore specific files
 emr_model.zip
-CLAUDE.md
 
 # Ignore an entire folder
 venv/
@@ -12,3 +11,4 @@ transform_emr_temp/
 *.egg-info/
 .pytest_cache/
 .ipynb_checkpoints/
+docs/

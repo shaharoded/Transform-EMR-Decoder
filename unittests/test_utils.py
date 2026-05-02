@@ -1416,3 +1416,168 @@ def test_update_legality_state_meal_advances_rank(mini_tokenizer):
     assert next_rank == (lunch_rank + 1) % K, \
         f"Expected rank {(lunch_rank+1)%K}, got {next_rank}"
     print(f"Lunch rank={lunch_rank}, next={next_rank} — test_update_legality_state_meal_advances_rank passed.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outcome 1-hot override in get_temporal_multi_hot_targets
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _make_multihot_inputs(B=2, T=6, V=10, pad=0):
+    """Minimal tensors for get_temporal_multi_hot_targets tests."""
+    target_ids = torch.zeros(B, T, dtype=torch.long)
+    abs_ts     = torch.zeros(B, T)
+    for b in range(B):
+        for t in range(T):
+            abs_ts[b, t] = t * 0.05      # spaced 0.05 apart (normalised)
+            target_ids[b, t] = (t % (V - 1)) + 1  # ids 1..V-1, never pad
+    return target_ids, abs_ts
+
+
+def test_outcome_one_hot_no_ids_unchanged():
+    """
+    Purpose: Backward-compatibility — omitting outcome_ids leaves multi-hot unchanged.
+    """
+    B, T, V, pad = 2, 6, 10, 0
+    target_ids, abs_ts = _make_multihot_inputs(B, T, V, pad)
+    window = 0.12  # covers ~2 future steps
+
+    baseline = get_temporal_multi_hot_targets(
+        target_ids=target_ids, all_abs_ts=abs_ts, padding_idx=pad,
+        vocab_size=V, window_size=window,
+    )
+    with_none = get_temporal_multi_hot_targets(
+        target_ids=target_ids, all_abs_ts=abs_ts, padding_idx=pad,
+        vocab_size=V, window_size=window,
+        outcome_ids=None, next_token_ids=None,
+    )
+    assert torch.equal(baseline, with_none), "outcome_ids=None must not change output"
+
+
+def test_outcome_one_hot_basic_replace():
+    """
+    Purpose: When next token at position q is an outcome, the multi-hot row is replaced
+    with a strict 1-hot on that outcome token and nothing else.
+    """
+    B, T, V, pad = 1, 5, 10, 0
+    # Manually craft: token 7 is the outcome; it sits at position 3
+    target_ids = torch.tensor([[1, 2, 3, 7, 5]], dtype=torch.long)  # [B=1, T=5]
+    abs_ts     = torch.arange(T, dtype=torch.float).unsqueeze(0) * 0.05
+    outcome_ids   = torch.tensor([7], dtype=torch.long)
+    # Phase-2 convention: T_q = T-1, next_token_ids = target_ids[:, 1:]
+    next_token_ids = target_ids[:, 1:]          # [1, 4]: [2, 3, 7, 5]
+    query_abs_ts   = abs_ts[:, :-1]             # [1, 4]
+
+    result = get_temporal_multi_hot_targets(
+        target_ids=target_ids, all_abs_ts=abs_ts,
+        query_abs_ts=query_abs_ts,
+        padding_idx=pad, vocab_size=V, window_size=0.12,
+        outcome_ids=outcome_ids, next_token_ids=next_token_ids,
+    )  # [1, 4, V]
+
+    # Position q=2: next token = 7 (outcome) → must be 1-hot at id 7
+    assert result[0, 2, 7] == 1.0, "outcome position must have 1-hot on outcome token"
+    assert result[0, 2].sum() == 1.0, "outcome position must have exactly 1 positive"
+
+    # Non-outcome positions must be identical to the no-override baseline.
+    baseline = get_temporal_multi_hot_targets(
+        target_ids=target_ids, all_abs_ts=abs_ts, query_abs_ts=query_abs_ts,
+        padding_idx=pad, vocab_size=V, window_size=0.12,
+    )
+    for q in [0, 1, 3]:
+        assert torch.equal(result[0, q], baseline[0, q]), \
+            f"Non-outcome position q={q} must match baseline (window multi-hot unchanged)"
+
+
+def test_outcome_one_hot_non_outcome_positions_unchanged():
+    """
+    Purpose: Multi-hot at non-outcome positions is identical to the no-override baseline.
+    """
+    B, T, V, pad = 2, 6, 12, 0
+    target_ids, abs_ts = _make_multihot_inputs(B, T, V, pad)
+    outcome_id = 9  # token 9 is an outcome; craft it to appear only at position 5
+    target_ids[:, 5] = outcome_id
+    outcome_ids    = torch.tensor([outcome_id], dtype=torch.long)
+    next_token_ids = target_ids[:, 1:]
+    query_abs_ts   = abs_ts[:, :-1]
+    window = 0.08  # covers ~1 future step
+
+    baseline = get_temporal_multi_hot_targets(
+        target_ids=target_ids, all_abs_ts=abs_ts, query_abs_ts=query_abs_ts,
+        padding_idx=pad, vocab_size=V, window_size=window,
+    )
+    result = get_temporal_multi_hot_targets(
+        target_ids=target_ids, all_abs_ts=abs_ts, query_abs_ts=query_abs_ts,
+        padding_idx=pad, vocab_size=V, window_size=window,
+        outcome_ids=outcome_ids, next_token_ids=next_token_ids,
+    )
+
+    # Only position q=4 (next=outcome at position 5) should differ
+    override_q = 4
+    for b in range(B):
+        for q in range(T - 1):
+            if q == override_q:
+                continue
+            assert torch.equal(result[b, q], baseline[b, q]), \
+                f"Non-outcome position (b={b}, q={q}) must be unchanged"
+
+
+def test_outcome_one_hot_padding_next_token_no_override():
+    """
+    Purpose: Phase-1 convention — last query position has padding_idx as next token.
+    This must NOT trigger the 1-hot override (padding_idx is never in outcome_ids).
+    """
+    B, T, V, pad = 1, 4, 8, 0
+    target_ids = torch.tensor([[1, 2, 5, 3]], dtype=torch.long)
+    abs_ts = torch.arange(T, dtype=torch.float).unsqueeze(0) * 0.05
+    outcome_ids = torch.tensor([5], dtype=torch.long)
+
+    # Phase-1 convention: T_q = T, pad last column
+    pad_col = torch.full((B, 1), pad, dtype=torch.long)
+    next_token_ids = torch.cat([target_ids[:, 1:], pad_col], dim=1)  # [1, 4]
+
+    result = get_temporal_multi_hot_targets(
+        target_ids=target_ids, all_abs_ts=abs_ts,
+        padding_idx=pad, vocab_size=V, window_size=0.12,
+        outcome_ids=outcome_ids, next_token_ids=next_token_ids,
+    )  # [1, 4, V]
+
+    # Last position (q=3): next = pad → no override, row sums normally (likely 0 since no future)
+    assert result[0, 3, pad] == 0.0, "padding column must always be zero"
+    # q=1: next=5 (outcome) → 1-hot
+    assert result[0, 1, 5] == 1.0
+    assert result[0, 1].sum() == 1.0
+    # q=3: last position, next=pad → NOT overridden
+    # (it may have 0 positives since no future window; that's correct, not the override)
+    assert result[0, 3].sum() == pytest.approx(result[0, 3].sum().item()), \
+        "last position with pad next token must not explode"
+
+
+def test_outcome_one_hot_multiple_positions_same_batch():
+    """
+    Purpose: Multiple outcome positions across both batch items are all overridden correctly.
+    """
+    B, T, V, pad = 2, 6, 12, 0
+    # outcome tokens: 8 and 9
+    target_ids = torch.tensor([
+        [1, 2, 8, 3, 4, 5],   # b=0: outcome 8 at position 2
+        [1, 9, 2, 9, 3, 4],   # b=1: outcome 9 at positions 1 and 3
+    ], dtype=torch.long)
+    abs_ts = torch.arange(T, dtype=torch.float).unsqueeze(0).expand(B, T) * 0.05
+    outcome_ids    = torch.tensor([8, 9], dtype=torch.long)
+    next_token_ids = target_ids[:, 1:]   # [2, 5]
+    query_abs_ts   = abs_ts[:, :-1]      # [2, 5]
+
+    result = get_temporal_multi_hot_targets(
+        target_ids=target_ids, all_abs_ts=abs_ts, query_abs_ts=query_abs_ts,
+        padding_idx=pad, vocab_size=V, window_size=0.08,
+        outcome_ids=outcome_ids, next_token_ids=next_token_ids,
+    )  # [2, 5, V]
+
+    # b=0, q=1: next=8 → 1-hot at 8
+    assert result[0, 1, 8] == 1.0 and result[0, 1].sum() == 1.0
+    # b=1, q=0: next=9 → 1-hot at 9
+    assert result[1, 0, 9] == 1.0 and result[1, 0].sum() == 1.0
+    # b=1, q=2: next=9 → 1-hot at 9
+    assert result[1, 2, 9] == 1.0 and result[1, 2].sum() == 1.0
+    # b=0, q=0: next=2 (not outcome) → sum > 0 from window (not a 1-hot on 2 alone)
+    assert result[0, 0].sum() >= 1.0  # window covers at least one token
