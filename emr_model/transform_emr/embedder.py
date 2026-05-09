@@ -139,8 +139,24 @@ class EMREmbedding(nn.Module):
         nn.init.zeros_(self.time_skip.weight)
         nn.init.zeros_(self.time_skip.bias)
 
-        # Gate head: predicts P(Δt > 0) for Phase-1 temporal supervision.
+        # Gate head: predicts P(Δt > 0) for Phase-1 temporal supervision (time-only path).
         self.dt_gate_head = nn.Linear(time2vec_dim, 1)
+
+        # Sequence-aware Δt heads: use event embedding + time2vec for better gap prediction.
+        # These take [embed_dim + time2vec_dim] as input and have more predictive power
+        # than the time-only heads since event type is correlated with inter-event timing.
+        _seq_dt_in = embed_dim + time2vec_dim
+        _seq_dt_hidden = max(16, time2vec_dim)
+        self.dt_gate_head_seq = nn.Sequential(
+            nn.Linear(_seq_dt_in, _seq_dt_hidden),
+            nn.ReLU(),
+            nn.Linear(_seq_dt_hidden, 1),
+        )
+        self.dt_mag_head_seq = nn.Sequential(
+            nn.Linear(_seq_dt_in, _seq_dt_hidden),
+            nn.ReLU(),
+            nn.Linear(_seq_dt_hidden, 1),
+        )
 
         # --- patient‑context slot ----------------------------------------
         # NOTE: In phase-1, this projection's output is added directly to the event
@@ -196,6 +212,27 @@ class EMREmbedding(nn.Module):
         t_abs      = self.time2vec_abs(abs_ts)                         # [B, T, k]
         gate_logit = self.dt_gate_head(t_abs)                          # [B, T, 1]
         mag_logit  = self.time_head(t_abs) + self.time_skip(abs_ts.unsqueeze(-1))  # [B, T, 1]
+        return gate_logit, mag_logit
+
+    def predict_dt_from_seq(self, seq, abs_ts):
+        """
+        Sequence-aware Δt prediction for Phase-1.
+        Uses event embedding (seq) + Time2Vec(abs_ts) to predict P(Δt>0) and log1p(Δt_hours).
+        seq is expected to be detached from the main BCE computation graph so Δt
+        gradients don't double-flow through the token embeddings.
+
+        Args:
+            seq     (FloatTensor): [B, T, D] event embeddings (detached).
+            abs_ts  (FloatTensor): [B, T] absolute timestamps (hours/336).
+
+        Returns:
+            gate_logit (FloatTensor): [B, T, 1]
+            mag_logit  (FloatTensor): [B, T, 1]
+        """
+        t_abs    = self.time2vec_abs(abs_ts)                         # [B, T, k]
+        combined = torch.cat([seq, t_abs], dim=-1)                   # [B, T, D+k]
+        gate_logit = self.dt_gate_head_seq(combined)                 # [B, T, 1]
+        mag_logit  = self.dt_mag_head_seq(combined)                  # [B, T, 1]
         return gate_logit, mag_logit
 
 
@@ -269,6 +306,8 @@ class EMREmbedding(nn.Module):
         Returns:
             logits: [B, T, vocab_size] — scores for next-token prediction
         """
+        # detach_time=False: allow BCE gradient to flow through Time2Vec so it gets a
+        # strong training signal from the primary loss (previously only Δt auxiliary trained it).
         seq, cond = self.forward(
         parent_raw_ids=batch["parent_raw_ids"],
         concept_ids=batch["concept_ids"],
@@ -277,7 +316,7 @@ class EMREmbedding(nn.Module):
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
         return_mask=False,
-        detach_time=True,
+        detach_time=False,
         )  # → returns only [B,T,D]
 
         # Context Dropout (Crucial for Phase 2 compatibility)
@@ -294,7 +333,7 @@ class EMREmbedding(nn.Module):
         # This biases the event representations based on patient static data.
         combined_embedding = seq + cond_for_addition.unsqueeze(1)
 
-        return self.decoder(combined_embedding)  # [B,T,V], Predict next token at each step
+        return self.decoder(combined_embedding), seq  # [B,T,V] logits + [B,T,D] embeddings
     
 
     def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None, context_dropout_prob=0.15):
@@ -522,10 +561,11 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 p=0.15
             ) # MLM mask
             
-            # BCE Logits + Loss
+            # BCE Logits + Loss (also returns seq for seq-aware Δt head)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                bce_logits = embedder.forward_with_decoder(batch)  # [B, T, V]
+                bce_logits, seq = embedder.forward_with_decoder(batch)  # [B, T, V], [B, T, D]
             bce_logits = bce_logits.float()
+            seq = seq.float()
 
             # build legality with teacher forcing (same LUTs as phase-2)
             illegal = compute_legality_masks_tf(
@@ -595,8 +635,13 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             dt_nonzero  = dt_vals_hrs > 1e-3
             nonpad_nz   = nonpad_pair & dt_nonzero
 
+            # Use seq-aware Δt head: event embedding + time2vec gives more predictive power
+            # than abs_ts alone. seq is detached so Δt gradient doesn't double-flow through
+            # the token embeddings (BCE already provides that gradient path via detach_time=False).
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                gate_logit, mag_logit = embedder.predict_dt(batch["abs_ts"][:, :-1])  # [B, T-1, 1]
+                gate_logit, mag_logit = embedder.predict_dt_from_seq(
+                    seq[:, :-1].detach(), batch["abs_ts"][:, :-1]
+                )  # [B, T-1, 1]
             gate_logit = gate_logit.squeeze(-1).float()  # [B, T-1]
             mag_logit  = mag_logit.squeeze(-1).float()   # [B, T-1]
 

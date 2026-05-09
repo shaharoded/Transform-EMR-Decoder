@@ -92,6 +92,6 @@ TRAINING_SETTINGS = {
     # where dt is the time gap (in hours, then normalised by 336) to future step s.
     # tau controls the decay rate: at dt=tau the weight is ~0.37; at 3*tau it is ~0.05.
     # outcome_horizon_hours hard-zeros any contribution beyond that horizon.
-    "outcome_decay_tau_hours":  24.0,   # half-life-ish decay constant (hours)
+    "outcome_decay_tau_hours":  12.0,   # half-life-ish decay constant (hours)
     "outcome_horizon_hours":    48.0,   # keep in sync with eval horizon
 }
