@@ -73,7 +73,7 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 9.00,    # Future-outcome auxiliary cap (continuing upward: 6→7→8→9)
+            "outcome": 9.00,    # Future-outcome auxiliary cap (peak confirmed at 9.0)
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
@@ -83,7 +83,7 @@ TRAINING_SETTINGS = {
         },
         # Plateau detection settings (applied per stage transition, in order)
         "plateau_min_delta": 1e-3,
-        "plateau_patience":  [2],  # Patience per transition: [0→1]
+        "plateau_patience":  [3],  # Patience per transition: [0→1]
     },
 
     # Outcome head — time-decayed soft labels.
