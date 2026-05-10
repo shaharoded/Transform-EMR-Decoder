@@ -185,34 +185,6 @@ class EMREmbedding(nn.Module):
         self.mlm_head = nn.Linear(embed_dim, len(tokenizer.token2id), bias=False)
         self.mlm_head.weight = self.position_embed.weight  # weight tying
 
-        # --- Token-type flag embeddings (Task 4B) ---
-        # 4 binary flags per token: is_outcome, is_interval_marker, is_trend, is_treatment.
-        # Each flag maps to a learned vector that is summed into the event embedding, giving
-        # the model explicit structural knowledge that outcome tokens are a special class.
-        self.token_type_embeds = nn.Embedding(4, embed_dim)
-        nn.init.normal_(self.token_type_embeds.weight, std=0.02)
-        self.register_buffer('_token_type_flags', self._compute_type_flags(tokenizer, embed_dim))
-
-    @staticmethod
-    def _compute_type_flags(tokenizer, embed_dim):
-        """
-        Build [V, 4] float buffer of binary token-type flags for token_type_embeds.
-        Flags: [is_outcome, is_interval_marker, is_trend, is_treatment_pattern].
-        """
-        from transform_emr.config.dataset_config import OUTCOMES, TERMINAL_OUTCOMES
-        outcome_names = set(OUTCOMES) | set(TERMINAL_OUTCOMES)
-        V = len(tokenizer.token2id)
-        flags = torch.zeros(V, 4)
-        for name, idx in tokenizer.token2id.items():
-            if name in outcome_names:
-                flags[idx, 0] = 1.0
-            if name.endswith('_START') or name.endswith('_END'):
-                flags[idx, 1] = 1.0
-            if 'TREND' in name:
-                flags[idx, 2] = 1.0
-            if 'BITZUA' in name:
-                flags[idx, 3] = 1.0
-        return flags
 
     def predict_time(self, abs_ts):
         """
@@ -311,11 +283,7 @@ class EMREmbedding(nn.Module):
         combined = torch.cat([r_emb, c_emb, v_emb, p_emb, t_emb], dim=-1)  # [B, T, 5D]
         ev_vec = self.final_proj(combined)                                 # [B, T, D]
 
-        # Token-type flag embeddings: additive structural signal (outcome / marker / trend / treatment)
-        type_flags = self._token_type_flags[position_ids]                  # [B, T, 4]
-        ev_vec = ev_vec + type_flags @ self.token_type_embeds.weight       # [B, T, D]
-
-        ev_vec = self.dropout(ev_vec) / self.scale                         # [B, 1, D]
+        ev_vec = self.dropout(ev_vec) / self.scale                         # [B, T, D]
 
         # --- Sequence Norm ---
         seq = self.layernorm(ev_vec) # [B, T, D]
@@ -370,21 +338,27 @@ class EMREmbedding(nn.Module):
         return self.decoder(combined_embedding), seq  # [B,T,V] logits + [B,T,D] embeddings
     
 
-    def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None, context_dropout_prob=0.15):
+    def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None,
+                         masked_concept_ids=None, masked_value_ids=None, masked_raw_ids=None,
+                         context_dropout_prob=0.15):
         """
         Runs full forward pass + MLM (for training phase 1).
         Same inputs as forward_with_decoder, plus:
-            mlm_mask - bool tensor [B,T] where True → this position was masked.
+            mlm_mask          - bool tensor [B,T] where True → this position was masked.
+            masked_pos_ids    - position_ids with [MASK] substituted at mlm_mask positions.
+            masked_concept_ids - concept_ids  with [MASK] at mlm_mask positions (hierarchy masking).
+            masked_value_ids   - value_ids    with [MASK] at mlm_mask positions (hierarchy masking).
+            masked_raw_ids     - parent_raw_ids with [MASK] at mlm_mask positions (hierarchy masking).
 
-        Context Dropout is applied here to improve robustness when patient context is missing.
-        Returns:
-            mlm_logits [B, T, vocab_size]
+        Hierarchy masking ensures the model cannot reconstruct the masked token by reading
+        sibling sub-ids (concept, value, raw-concept) — all are replaced at masked positions,
+        forcing genuine prediction from sequence context rather than local sub-id lookup.
         """
         seq, cond = self.forward(
-        parent_raw_ids=batch["parent_raw_ids"],
-        concept_ids=batch["concept_ids"],
-        value_ids=batch["value_ids"],
-        position_ids=masked_pos_ids,  # masked positions used here
+        parent_raw_ids=masked_raw_ids if masked_raw_ids is not None else batch["parent_raw_ids"],
+        concept_ids=masked_concept_ids if masked_concept_ids is not None else batch["concept_ids"],
+        value_ids=masked_value_ids if masked_value_ids is not None else batch["value_ids"],
+        position_ids=masked_pos_ids,
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
         return_mask=False,
@@ -468,7 +442,13 @@ class EMREmbedding(nn.Module):
             embed_dim=config["embed_dim"],
             dropout=config["dropout"]
         )
-        model.load_state_dict(ckpt["model_state"])
+        # Tolerate stale keys from exp39 (token-type flags removed in exp40+).
+        stale_keys = {"token_type_embeds.weight", "_token_type_flags"}
+        state = ckpt["model_state"]
+        unexpected = set(state.keys()) - set(model.state_dict().keys())
+        if unexpected - stale_keys:
+            raise RuntimeError(f"[EMREmbedding.load] Unexpected keys: {sorted(unexpected - stale_keys)}")
+        model.load_state_dict(state, strict=False)
 
         # Helpful metadata for callers that want to fully restore prior training settings.
         model.checkpoint_model_config = copy.deepcopy(config)
@@ -588,12 +568,22 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             if train_flag:
                 optimizer.zero_grad(set_to_none=True)
 
-            mlm_input_pos_ids = batch["position_ids"].clone() # To avoid in place modifications of the batch
+            mlm_input_pos_ids = batch["position_ids"].clone()
             masked_pos_ids, mlm_mask = build_mlm(
                 mlm_input_pos_ids,
                 tokenizer=embedder.tokenizer,
                 p=0.15
-            )  # MLM mask
+            )
+
+            # Hierarchy masking (exp38 fix): also replace concept/value/raw sub-ids at
+            # masked positions so the model must predict from sequence context, not siblings.
+            _mask_id = embedder.tokenizer.mask_token_id
+            masked_concept_ids = batch["concept_ids"].clone()
+            masked_concept_ids[mlm_mask] = _mask_id
+            masked_value_ids = batch["value_ids"].clone()
+            masked_value_ids[mlm_mask] = _mask_id
+            masked_raw_ids = batch["parent_raw_ids"].clone()
+            masked_raw_ids[mlm_mask.unsqueeze(-1).expand_as(masked_raw_ids)] = _mask_id
             
             # BCE Logits + Loss (also returns seq for seq-aware Δt head)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
@@ -647,7 +637,10 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 mlm_logits = embedder.forward_with_mlm(
                                                     batch,
                                                     mlm_mask=mlm_mask,
-                                                    masked_pos_ids=masked_pos_ids)
+                                                    masked_pos_ids=masked_pos_ids,
+                                                    masked_concept_ids=masked_concept_ids,
+                                                    masked_value_ids=masked_value_ids,
+                                                    masked_raw_ids=masked_raw_ids)
             mlm_logits = mlm_logits.float()
             mlm_labels = batch["position_ids"][mlm_mask]          # ground truth
             mlm_raw = F.cross_entropy(
@@ -669,12 +662,12 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             dt_nonzero  = dt_vals_hrs > 1e-3
             nonpad_nz   = nonpad_pair & dt_nonzero
 
-            # Use seq-aware Δt head: event embedding + time2vec gives more predictive power
-            # than abs_ts alone. seq is detached so Δt gradient doesn't double-flow through
-            # the token embeddings (BCE already provides that gradient path via detach_time=False).
+            # Sequence-aware Δt head: event embedding + time2vec predicts inter-event gap.
+            # Gradient flows through seq so embeddings learn temporal spacing structure
+            # (complementary to BCE which trains token sequence prediction).
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 gate_logit, mag_logit = embedder.predict_dt_from_seq(
-                    seq[:, :-1].detach(), batch["abs_ts"][:, :-1]
+                    seq[:, :-1], batch["abs_ts"][:, :-1]
                 )  # [B, T-1, 1]
             gate_logit = gate_logit.squeeze(-1).float()  # [B, T-1]
             mag_logit  = mag_logit.squeeze(-1).float()   # [B, T-1]
