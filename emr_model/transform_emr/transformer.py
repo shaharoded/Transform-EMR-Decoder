@@ -1123,6 +1123,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     backbone_lr_factor = training_settings.get("phase3_backbone_lr_factor", 0.0)
     p3_lr = training_settings["phase3_learning_rate"]
+    p3_wd = training_settings.get("phase3_weight_decay", training_settings["weight_decay"])
 
     def _freeze_backbone_only(m):
         """Enable gradients for all params; optimizer LR controls effective freeze."""
@@ -1134,10 +1135,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         head_params     = list(m.outcome_head.parameters())
         return torch.optim.AdamW(
             [
-                {"params": backbone_params, "lr": p3_lr * backbone_lr_factor},
-                {"params": head_params,     "lr": p3_lr},
+                {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
+                 "weight_decay": training_settings["weight_decay"]},
+                {"params": head_params,     "lr": p3_lr,
+                 "weight_decay": p3_wd},
             ],
-            weight_decay=training_settings["weight_decay"],
         )
 
     _freeze_backbone_only(model)

@@ -34,12 +34,13 @@ TRAINING_SETTINGS = {
     "phase2_learning_rate": 3e-4,
     "phase3_learning_rate":       1e-4,
     "phase3_backbone_lr_factor":  0.01,  # backbone LR = phase3_lr * factor (1e-6); 0.0 = fully frozen
+    "phase3_weight_decay":        0.0,   # separate weight decay for P3 (0 = let outcome_head fit freely)
     "weight_decay": 1e-3,
 
     "batch_size": 16, # Number of patients processed concurrently (effective batch=64 via grad accumulation)
     "grad_accumulation_steps": 4, # Accumulate gradients over N steps before optimizer.step()
     "phase1_bce_window_hours": 3.0,
-    "phase2_bce_window_hours": 24.0,
+    "phase2_bce_window_hours": 12.0,
 
     # Phase-1 auxiliary scheduler.
     # Single stage: mlm and dt activate after bce_only_epochs of pure BCE training.
