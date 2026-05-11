@@ -369,12 +369,9 @@ class GPT(nn.Module):
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
 
-        # exp50: 3-layer outcome head (was 2-layer); exp24 widening D→2D→D→K failed,
-        # but pure depth D→D→D→K hasn't been tried with shared hazard arch (exp46+).
+        # 2-layer MLP outcome classifier (exp50 confirmed adding depth delays curriculum
+        # gating; exp24 confirmed widening also hurts).
         self.outcome_head = nn.Sequential(
-            nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
-            nn.ReLU(),
-            nn.Dropout(cfg["dropout"]),
             nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
             nn.Dropout(cfg["dropout"]),
@@ -389,6 +386,25 @@ class GPT(nn.Module):
             torch.tensor([tok.token2id[n] for n in in_vocab], dtype=torch.long),
             persistent=True,
         )
+
+        # Narrower buffer: LM vocab IDs in the SAME order as outcome_names — used by
+        # outcome→LM coupling (Task 3b / exp51). Aligned so outcome_logits[..., k] maps to
+        # LM logits at _outcome_lm_ids[k].
+        self.register_buffer(
+            "_outcome_lm_ids",
+            torch.tensor([tok.token2id[n] for n in self.outcome_names], dtype=torch.long),
+            persistent=True,
+        )
+
+        # Outcome→LM coupling (exp51 / Task 3b). Adds an additive logit correction
+        # from outcome_head's signal to LM logits at outcome token positions.
+        # Zero-init → no-op at start, so Phase-2 LM quality is preserved.
+        # Trained ONLY in Phase-3 (.requires_grad_(False) at init; P3 enables).
+        self.outcome_to_lm = nn.Linear(self.num_outcomes, self.num_outcomes)
+        nn.init.zeros_(self.outcome_to_lm.weight)
+        nn.init.zeros_(self.outcome_to_lm.bias)
+        for p in self.outcome_to_lm.parameters():
+            p.requires_grad_(False)
 
         # Discrete-time hazard: shares weights with outcome_head; per-(outcome, bin) bias
         # adds temporal structure on top of the outcome head's base logit.
@@ -528,6 +544,11 @@ class GPT(nn.Module):
         # 4. Outcome Prediction Head (Auxiliary Task)
         outcome_logits = self.outcome_head(x)           # [B, T, K]
 
+        # 4b. Outcome→LM coupling (Task 3b). .detach() blocks LM loss from
+        # corrupting outcome_head. outcome_to_lm starts zero → no-op until P3 enables it.
+        lm_bias = self.outcome_to_lm(outcome_logits.detach())  # [B, T, K]
+        logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)
+
         # 5. Discrete-time hazard: outcome_logits + per-(outcome, bin) bias
         hazard_logits = outcome_logits.unsqueeze(-1) + self.hazard_time_bias  # [B, T, K, n_bins]
 
@@ -603,6 +624,9 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
+        # Outcome→LM coupling (Task 3b); detach blocks LM loss → outcome_head.
+        lm_bias = self.outcome_to_lm(outcome_logits.detach())
+        logits  = logits.index_add(2, self._outcome_lm_ids, lm_bias)
         hazard_logits  = outcome_logits.unsqueeze(-1) + self.hazard_time_bias
 
         gate_logit = self.dt_gate(x).squeeze(-1)
@@ -687,16 +711,17 @@ class GPT(nn.Module):
         ckpt_keys  = set(state_dict.keys())
         missing    = model_keys - ckpt_keys
         unexpected = ckpt_keys - model_keys
-        # Tolerate stale keys from Task-A experiments (outcome_to_lm removed in exp37+).
-        stale_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids"}
-        # Tolerate missing time_bias_w/b (pre-Task-4A) and hazard_time_bias (pre-exp46).
-        # Both default to zero-init (no-op) so skipping them on load is safe.
-        # Also tolerate stale hazard_x_bias.* keys from exp47 (DISCARD).
+        # Tolerate missing time_bias_w/b (pre-Task-4A), hazard_time_bias (pre-exp46),
+        # outcome_to_lm.* + _outcome_lm_ids (pre-exp51 / Task 3b). All default to
+        # zero-init (no-op) so skipping them on load is safe.
         new_keys = {k for k in missing if
                     k.endswith(".time_bias_w") or k.endswith(".time_bias_b")
-                    or k == "hazard_time_bias"}
+                    or k == "hazard_time_bias"
+                    or k.startswith("outcome_to_lm.")
+                    or k == "_outcome_lm_ids"}
         missing = missing - new_keys
-        stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_x_bias.")}
+        # Stale hazard_x_bias.* keys from exp47 (DISCARD): ignore if present.
+        stale_keys = {k for k in unexpected if k.startswith("hazard_x_bias.")}
         # Stale hazard_head weights (pre-exp46 Linear) are ignored — replaced by hazard_time_bias.
         stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_head.")}
         unexpected_non_stale = unexpected - stale_keys
@@ -1233,10 +1258,16 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             param.requires_grad_(True)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head", "hazard_time_bias"}
+        # exp51 / Task 3b: outcome_to_lm is Phase-3-only — explicitly enable here
+        # (was frozen in __init__) and include in head param group.
+        for p in m.outcome_to_lm.parameters():
+            p.requires_grad_(True)
+        head_names = {"outcome_head", "hazard_time_bias", "outcome_to_lm"}
         backbone_params = [p for n, p in m.named_parameters()
                            if not any(h in n for h in head_names)]
-        head_params = list(m.outcome_head.parameters()) + [m.hazard_time_bias]
+        head_params = (list(m.outcome_head.parameters())
+                       + [m.hazard_time_bias]
+                       + list(m.outcome_to_lm.parameters()))
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1276,14 +1307,21 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     _TAU     = training_settings.get("outcome_decay_tau_hours", 12.0) / _ABS_TS_SCALE
     _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
 
+    # Tensor of outcome LM ids on device, for CE-at-outcome-positions in P3.
+    outcome_lm_ids_tensor = torch.tensor(
+        [tok.token2id[n] for n in model.outcome_names], dtype=torch.long, device=device
+    )
+    p3_outcome_ce_weight = training_settings.get("phase3_outcome_ce_weight", 1.0)
+
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
         model.eval()
         if train_flag:
             model.outcome_head.train()
+            model.outcome_to_lm.train()
             # hazard_time_bias is a plain Parameter — no module to set to train()
 
-        total_loss = total_outcome = total_hazard_p3 = 0.0
+        total_loss = total_outcome = total_hazard_p3 = total_outcome_ce = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
@@ -1338,7 +1376,21 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 else:
                     loss_hazard_p3 = loss_outcome.new_tensor(0.0)
 
-                loss = loss_outcome + loss_hazard_p3
+                # exp51 / Task 3b: CE at positions whose target is an outcome token.
+                # Trains outcome_to_lm (via lm_bias path) to nudge LM logits toward the
+                # right outcome. outcome_head is detached → only LM-side params update.
+                is_outcome_pos = torch.isin(target_ids, outcome_lm_ids_tensor) & nonpad
+                if is_outcome_pos.any():
+                    pred_logits_fp = pred_logits.float()
+                    loss_outcome_ce = F.cross_entropy(
+                        pred_logits_fp[is_outcome_pos],
+                        target_ids[is_outcome_pos],
+                        reduction="mean",
+                    )
+                else:
+                    loss_outcome_ce = loss_outcome.new_tensor(0.0)
+
+                loss = loss_outcome + loss_hazard_p3 + p3_outcome_ce_weight * loss_outcome_ce
 
                 if train_flag:
                     if not torch.isfinite(loss):
@@ -1352,6 +1404,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 total_loss       += loss.item()
                 total_outcome    += loss_outcome.item()
                 total_hazard_p3  += loss_hazard_p3.item()
+                total_outcome_ce += loss_outcome_ce.item()
 
         n = max(len(loader), 1)
         if train_flag:
