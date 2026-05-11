@@ -369,12 +369,9 @@ class GPT(nn.Module):
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
 
-        # exp50: 3-layer outcome head (was 2-layer); exp24 widening D→2D→D→K failed,
-        # but pure depth D→D→D→K hasn't been tried with shared hazard arch (exp46+).
+        # 2-layer MLP outcome classifier (exp50 confirmed adding depth delays curriculum
+        # gating via slower val_total descent; exp24 confirmed widening also hurts).
         self.outcome_head = nn.Sequential(
-            nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
-            nn.ReLU(),
-            nn.Dropout(cfg["dropout"]),
             nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
             nn.Dropout(cfg["dropout"]),
