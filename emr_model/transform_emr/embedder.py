@@ -60,6 +60,20 @@ class Time2Vec(nn.Module):
         self.linear = nn.Linear(1, 1, bias=True)          # ω0 t + b0 -> Linear component
         self.freq   = nn.Linear(1, out_dim - 1, bias=True) # ω_i t + b_i -> Sinusiodal component
 
+        # Log-spaced periodic-frequency init: input t is hours/336, so values
+        # are O(1e-3)–O(1) across the dataset. With default Linear init the
+        # frequencies cluster in [-1, 1] rad/unit, which puts sin(ω·t) into the
+        # quasi-linear regime for every realistic Δt → no per-event resolution.
+        # Anchor ωs on a log grid that resolves 5 min (ω≈25k) through 1 week
+        # (ω≈12), so the basis spans the inter-event timescales actually present
+        # in the data.  Biases stay at their default (small uniform) so each
+        # channel still gets an independent random phase.
+        with torch.no_grad():
+            k = out_dim - 1
+            freqs = torch.logspace(math.log10(12.0), math.log10(25000.0), k)
+            sign  = torch.where(torch.arange(k) % 2 == 0, 1.0, -1.0)
+            self.freq.weight.copy_((freqs * sign).unsqueeze(-1))
+
     def forward(self, t):
         """
         t: [B, T] or [B*T] float tensor of time deltas
