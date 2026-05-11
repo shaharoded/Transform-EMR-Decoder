@@ -386,13 +386,14 @@ class GPT(nn.Module):
             persistent=True,
         )
 
-        # Discrete-time hazard head: predicts P(first-event in bin b | survived to bin b).
-        # n_bins × 4h = 48h, aligned with outcome_horizon_hours.
-        # Initialised to near-zero so it starts as a no-op and learns gradually.
+        # Discrete-time hazard: shares weights with outcome_head; per-(outcome, bin) bias
+        # adds temporal structure on top of the outcome head's base logit.
+        # hazard_logit[k, b] = outcome_logit[k] + hazard_time_bias[k, b]
+        # Zero-init bias → starts equal to outcome logits; learns bin-specific offsets.
+        # Forces outcome_head to satisfy both "is event likely (decay-weighted)" and
+        # "what is the survival structure" — additional supervision on the same params.
         self.hazard_bins = cfg.get("hazard_bins", 12)
-        self.hazard_head = nn.Linear(cfg["embed_dim"], self.num_outcomes * self.hazard_bins)
-        nn.init.normal_(self.hazard_head.weight, std=0.01)
-        nn.init.zeros_(self.hazard_head.bias)
+        self.hazard_time_bias = nn.Parameter(torch.zeros(self.num_outcomes, self.hazard_bins))
 
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
@@ -525,9 +526,8 @@ class GPT(nn.Module):
         # 4. Outcome Prediction Head (Auxiliary Task)
         outcome_logits = self.outcome_head(x)           # [B, T, K]
 
-        # 5. Discrete-time hazard head
-        B_x, T_x, _ = x.shape
-        hazard_logits = self.hazard_head(x).view(B_x, T_x, self.num_outcomes, self.hazard_bins)
+        # 5. Discrete-time hazard: outcome_logits + per-(outcome, bin) bias
+        hazard_logits = outcome_logits.unsqueeze(-1) + self.hazard_time_bias  # [B, T, K, n_bins]
 
         # 6. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
@@ -601,8 +601,7 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
-        B_x, T_x, _ = x.shape
-        hazard_logits  = self.hazard_head(x).view(B_x, T_x, self.num_outcomes, self.hazard_bins)
+        hazard_logits  = outcome_logits.unsqueeze(-1) + self.hazard_time_bias
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
@@ -688,12 +687,14 @@ class GPT(nn.Module):
         unexpected = ckpt_keys - model_keys
         # Tolerate stale keys from Task-A experiments (outcome_to_lm removed in exp37+).
         stale_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids"}
-        # Tolerate missing time_bias_w/b (pre-Task-4A) and hazard_head (pre-exp41).
+        # Tolerate missing time_bias_w/b (pre-Task-4A) and hazard_time_bias (pre-exp46).
         # Both default to zero-init (no-op) so skipping them on load is safe.
         new_keys = {k for k in missing if
                     k.endswith(".time_bias_w") or k.endswith(".time_bias_b")
-                    or k.startswith("hazard_head.")}
+                    or k == "hazard_time_bias"}
         missing = missing - new_keys
+        # Stale hazard_head weights (pre-exp46 Linear) are ignored — replaced by hazard_time_bias.
+        stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_head.")}
         unexpected_non_stale = unexpected - stale_keys
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
@@ -1228,11 +1229,10 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             param.requires_grad_(True)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head", "hazard_head"}
+        head_names = {"outcome_head", "hazard_time_bias"}
         backbone_params = [p for n, p in m.named_parameters()
                            if not any(h in n for h in head_names)]
-        head_params = (list(m.outcome_head.parameters()) +
-                       list(m.hazard_head.parameters()))
+        head_params = list(m.outcome_head.parameters()) + [m.hazard_time_bias]
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1277,7 +1277,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         model.eval()
         if train_flag:
             model.outcome_head.train()
-            model.hazard_head.train()
+            # hazard_time_bias is a plain Parameter — no module to set to train()
 
         total_loss = total_outcome = total_hazard_p3 = 0.0
         with torch.set_grad_enabled(train_flag):

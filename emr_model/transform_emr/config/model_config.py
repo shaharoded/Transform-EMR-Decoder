@@ -16,7 +16,7 @@ MODEL_CONFIG = {
       "n_layer": 4,
       "dropout": 0.1,
       "bias": True,
-      "hazard_bins": 6,   # exp45: 12→6; bins 8h each (was 4h); fewer bins → more positives per bin, easier survival task
+      "hazard_bins": 12,   # discrete-time survival bins (12 × 4h = 48h, matches outcome_horizon)
     }
 
 TRAINING_SETTINGS = {
