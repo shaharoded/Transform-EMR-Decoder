@@ -16,7 +16,7 @@ MODEL_CONFIG = {
       "n_layer": 4,
       "dropout": 0.1,
       "bias": True,
-      "hazard_bins": 12,   # discrete-time survival bins (12 × 4h = 48h, matches outcome_horizon)
+      "hazard_bins": 6,   # exp45: 12→6; bins 8h each (was 4h); fewer bins → more positives per bin, easier survival task
     }
 
 TRAINING_SETTINGS = {
@@ -81,7 +81,7 @@ TRAINING_SETTINGS = {
             "ce":      0,
             "dt":      0,
             "outcome": 3,  # Ramp over 3 epochs (confirmed optimal in exp30)
-            "hazard":  1,  # Faster ramp than outcome (exp44: 3→1; hazard converges faster, more full-active epochs before P2 end)
+            "hazard":  3,  # Same ramp as outcome (exp42 confirmed; exp44 ramp=1 DISCARD)
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
