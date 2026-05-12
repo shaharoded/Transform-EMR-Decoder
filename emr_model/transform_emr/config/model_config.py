@@ -42,6 +42,11 @@ TRAINING_SETTINGS = {
     "grad_accumulation_steps": 4, # Accumulate gradients over N steps before optimizer.step()
     "phase1_bce_window_hours": 3.0,
     "phase2_bce_window_hours": 12.0,
+    # exp59: terminals (DEATH/RELEASE) get a wider future window in the LM-head
+    # multi-hot BCE — denser pre-terminal positive signal so the model learns
+    # to assign higher terminal logits hours-to-days before the actual event.
+    # 168h = 7 days, well within the 336h training horizon.
+    "phase2_terminal_bce_window_hours": 168.0,
 
     # Phase-1 auxiliary scheduler.
     # Single stage: dt activates after bce_only_epochs of pure BCE training.

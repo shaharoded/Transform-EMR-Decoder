@@ -403,6 +403,18 @@ class GPT(nn.Module):
             persistent=True,
         )
 
+        # exp59: terminal token ids — used by get_temporal_multi_hot_targets to
+        # apply a wider future BCE window (so the LM head sees many pre-terminal
+        # positions as terminal-positive instead of just the immediate-next).
+        self.register_buffer(
+            "_terminal_ids",
+            torch.tensor(
+                [tok.token2id[n] for n in TERMINAL_OUTCOMES if n in tok.token2id],
+                dtype=torch.long,
+            ),
+            persistent=True,
+        )
+
         # Discrete-time hazard: shares weights with outcome_head; per-(outcome, bin) bias
         # adds temporal structure on top of the outcome head's base logit.
         # hazard_logit[k, b] = outcome_logit[k] + hazard_time_bias[k, b]
@@ -972,8 +984,13 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 # === Loss: BCE with logits — temporal targets ===
                 # For each position t, mark all tokens within the next phase2_bce_window_hours as positives.
                 # abs_ts = hours / 336.
+                # exp59: terminals (DEATH/RELEASE) use a wider future window so many
+                # pre-terminal positions are positive in the LM-head BCE, not just
+                # the immediate-next position.
                 _ABS_TS_SCALE = 336.0
                 _BCE_WIN = training_settings.get("phase2_bce_window_hours", 12.0) / _ABS_TS_SCALE
+                _TERM_WIN_H = training_settings.get("phase2_terminal_bce_window_hours", 168.0)
+                _TERM_WIN = _TERM_WIN_H / _ABS_TS_SCALE
                 multi_hot = get_temporal_multi_hot_targets(
                     target_ids=full_targets,
                     all_abs_ts=batch["abs_ts"],
@@ -983,6 +1000,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     window_size=_BCE_WIN,
                     outcome_ids=model._outcome_ids,
                     next_token_ids=full_targets[:, 1:],
+                    wide_token_ids=model._terminal_ids,
+                    wide_window_size=_TERM_WIN,
                 )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 
