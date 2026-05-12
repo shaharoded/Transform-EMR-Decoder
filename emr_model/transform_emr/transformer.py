@@ -1003,6 +1003,10 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 _TERM_WIN = _TERM_WIN_H / _ABS_TS_SCALE
                 _COMP_WIN_H = training_settings.get("phase2_complication_bce_window_hours", 48.0)
                 _COMP_WIN = _COMP_WIN_H / _ABS_TS_SCALE
+                # Task-0.4 AUDIT: wide_tiers removed to attribute exp59/60's gain.
+                # All other aux losses unchanged. If AUROC/AUPRC drop materially vs
+                # exp60's KEEP, the gain was the data-shape change (wide BCE windows
+                # for terminals + complications). Will be reverted after measurement.
                 multi_hot = get_temporal_multi_hot_targets(
                     target_ids=full_targets,
                     all_abs_ts=batch["abs_ts"],
@@ -1012,10 +1016,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     window_size=_BCE_WIN,
                     outcome_ids=model._outcome_ids,
                     next_token_ids=full_targets[:, 1:],
-                    wide_tiers=[
-                        (model._terminal_ids,     _TERM_WIN),
-                        (model._complication_ids, _COMP_WIN),
-                    ],
                 )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 
