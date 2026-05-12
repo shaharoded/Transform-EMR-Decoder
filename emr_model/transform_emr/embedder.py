@@ -408,9 +408,9 @@ class EMREmbedding(nn.Module):
             embed_dim=config["embed_dim"],
             dropout=config["dropout"]
         )
-        # Tolerate stale keys from exp39 (token-type flags removed in exp40+).
-        # mlm_head.weight kept for backwards-compat with pre-exp54 phase1 checkpoints
-        # (MLM was removed in exp54 — the weight-tied head can be ignored on load).
+        # Tolerate stale keys from removed components so older checkpoints still load:
+        #   token_type_embeds.weight / _token_type_flags — token-type flag embeddings (removed)
+        #   mlm_head.weight                              — Phase-1 MLM head (removed)
         stale_keys = {"token_type_embeds.weight", "_token_type_flags", "mlm_head.weight"}
         state = ckpt["model_state"]
         unexpected = set(state.keys()) - set(model.state_dict().keys())
@@ -439,7 +439,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     """
     Trains an EMREmbedding model using temporal multi-hot BCE and Δt regression.
     Total Loss = λ1 * BCE(temporal multi-hot) + λ_dt * (gate BCE + magnitude MSE)
-    (MLM removed in exp54 — Task B fail/remove option after exp37/exp38/exp53.)
 
     Legality-aware BCE notes:
      - We compute BCE per element (reduction="none") and then mask out illegal classes.

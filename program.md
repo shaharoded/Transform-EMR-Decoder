@@ -639,6 +639,23 @@ architectural change with a hypothesis and a falsifiable probe.
 
 ---
 
+### Direction G — Fully remove outcome soft-BCE, keep ranking-only
+
+**Status of evidence.** Audit_0.2c already ablated outcome soft-BCE (with hazard already removed in 0.2a) and reported AUROC −0.009 / AUPRC **+0.027** / RELEASE 0.698→0.651. The agent kept outcome soft-BCE because the AUROC cost just cleared the Rule 2(b) 0.005 bar. But the AUPRC clearly improved without it, and Rule 6 only mandates that *at least one* of {outcome soft-BCE, ranking, hazard} is active — ranking alone satisfies the mandate.
+
+**The proposed experiment.** Permanently delete the outcome soft-BCE term (and its `aux_fraction_caps["outcome"]` entry, its scheduler stage, its `outcome_log_tau` learnable parameter if any) — keep ranking as the sole outcome-direction signal. The outcome *head* (the `[B, T, K]` logits) stays, used only by the ranking loss (training) and by the eval (risk scores).
+
+**Why this is principled, not a sweep.**
+- Ranking was confirmed real and dominant (audit 0.2b ablation cost −0.044 AUROC, vs outcome BCE's −0.009).
+- Outcome BCE drives the *calibration* of the head's logit scale, while ranking only cares about order. Removing BCE may shift logits to a different scale, but that scale change doesn't matter for the AUROC/AUPRC metric, which is rank-based.
+- The +0.027 AUPRC gain in audit_0.2c is *exactly* what a "less constrained head" should produce: the head can use its full output range to rank, instead of fighting calibration noise.
+
+**Risk.** AUROC may drop more than 0.009 in a clean run-from-scratch (vs audit_0.2c which used a partly-trained checkpoint). Smoke-test first; if AUROC drops more than 0.015 vs the current best, restore outcome BCE.
+
+**Implementation.** Delete the outcome-BCE term in `transformer.py` / Phase-3's `finetune_transformer`, the `outcome_log_tau` parameter wiring if BCE was the only consumer, the relevant `aux_fraction_caps` and `order` entries in `phase2_scheduler`, and any tau-related code in soft-target construction (`get_outcome_soft_targets` or equivalent). One commit.
+
+---
+
 ### Direction A — Phase 3 is damaging RELEASE. Replace its loss, not its LR.
 
 **The evidence.** RELEASE is the only outcome that gets worse in Phase 3:
@@ -784,6 +801,36 @@ This is the **cheapest, most informative single experiment** in the queue.
 It is not a hyperparameter sweep; it is a structural ablation of an entire
 pipeline phase. Strongly recommend running it first, then deciding A vs B
 vs C from the result.
+
+---
+
+### Direction F — Reasoning audit of the DEATH/RELEASE scoring (one-shot, no experiment)
+
+**Not an experiment.** `evaluation.py` is locked. This is a documented reasoning check: does the current scoring measure something clinically meaningful, and how should DEATH=0.988 be interpreted?
+
+**The mechanism.** Terminal outcomes (DEATH, RELEASE) are always the last token of every patient's actual sequence (`_truncate_after_terminal_event` ensures one terminal at the end). Generation continues until the model emits a terminal (or `max_len` triggers a forced terminal). `pooled_episode_auc` divides generated trajectories into 24 h windows, scores each window with `max P_<outcome>` and labels it 1 if the ground-truth terminal is within ±24 h.
+
+Two facts interact to make terminal-AUROC slightly different from complication-AUROC:
+1. The model's generated trajectory always ends with a terminal token (or hits the horizon).
+2. The outcome head has a one-hot override at training and inference (`utils.py` / `embedder.py`): when the input/emitted token equals an outcome, `P_<outcome>` is hard-set to ~1.
+
+Consequence: the window containing the emitted terminal carries `label≈1` (if the emit time is near the GT terminal time) AND `score≈1` (one-hot override). So part of the terminal AUROC measures "did the model emit the right terminal near the right time", not exclusively "did the model anticipate the terminal early from features".
+
+**Is this a problem?**
+For the clinical deployment goal — *"given an in-progress trajectory, can the model tell me this patient is about to die?"* — the answer is **no, it's not a problem**:
+- The 24 h window includes positions strictly before the emit time too (each generated step has a P_DEATH from the outcome head). If the model only spiked P_DEATH at the emit position, the window's `max P_DEATH` would still capture that as score=1 *at that timestamp*, which is what a clinician would see.
+- The one-hot override is applied symmetrically across all 18 outcomes (DEATH, RELEASE, and the 16 complications), so the scoring bias toward terminals also exists for any complication that was emitted as a token within the generation window. The metric is internally consistent.
+- More importantly, the clinical question is "is this patient at imminent risk of dying?" not "did you guess death 12h earlier than your own emission?". The current AUROC answers the clinical question. A model that emits DEATH at the right time is a model that signaled high P_DEATH at the right time — that's the deployment signal.
+
+**The right caveat to record (not fix).**
+In any external write-up the DEATH=0.988 number should be reported with the methodological note:
+> "AUROC is computed on the autoregressively generated trajectory. Risk scores include the one-hot signal at the moment the model emits the terminal token. This reflects the deployment regime (a continuously updated risk score that spikes when the model commits to a DEATH trajectory), not a held-out-from-features anticipation metric."
+
+**Why RELEASE is not at 0.988 too.** RELEASE windows dominate the negative class (most patients are released), so even small score noise on the many true-RELEASE windows penalises AUROC heavily. RELEASE 0.694 is the actually-difficult number, and it is the right target for further work (see Direction B).
+
+**Conclusion — audit verdict.** The evaluation scoring is doing the right thing for the clinical-deployment goal. The 0.988 is real but should be reported with the deployment-regime caveat above. No code change is required. No experiment is queued for Direction F.
+
+(Data-side concerns — context column leakage, the 30-day-post-release relabel, sub-48 h patient cohort — have been confirmed by the user as non-issues for this dataset.)
 
 ---
 

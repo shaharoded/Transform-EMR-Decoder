@@ -16,7 +16,6 @@ MODEL_CONFIG = {
       "n_layer": 4,
       "dropout": 0.1,
       "bias": True,
-      "hazard_bins": 12,   # discrete-time survival bins (12 × 4h = 48h, matches outcome_horizon)
     }
 
 TRAINING_SETTINGS = {
@@ -28,7 +27,7 @@ TRAINING_SETTINGS = {
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
     "lr_warmup_epochs": 5,
-    "early-stop-patience": 10,  # exp49: 5→10; P3 in exp46 cut short at 9 ep (vs exp42's 25) — shared hazard arch plateaus val faster, need more patience
+    "early-stop-patience": 10,  # Longer patience lets the outcome head converge through transient val plateaus
     "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,
@@ -42,21 +41,15 @@ TRAINING_SETTINGS = {
     "grad_accumulation_steps": 4, # Accumulate gradients over N steps before optimizer.step()
     "phase1_bce_window_hours": 3.0,
     "phase2_bce_window_hours": 12.0,
-    # exp59: terminals (DEATH/RELEASE) get a wider future window in the LM-head
-    # multi-hot BCE — denser pre-terminal positive signal so the model learns
-    # to assign higher terminal logits hours-to-days before the actual event.
-    # 168h = 7 days, well within the 336h training horizon.
+    # Terminal tokens (DEATH/RELEASE) use a wider future window in the LM-head
+    # multi-hot BCE so many pre-terminal positions are positive — denser supervision
+    # for the model to assign higher terminal logits hours-to-days before the event.
     "phase2_terminal_bce_window_hours": 168.0,
-    # exp60: clinical complications (CARDIO/KIDNEY/HYPO/HYPER) also get a wider
-    # window — matched to the outcome_horizon_hours (48 h) so the lm_head BCE
-    # signal for complications aligns with the outcome head's training horizon.
-    "phase2_complication_bce_window_hours": 48.0,
 
     # Phase-1 auxiliary scheduler.
     # Single stage: dt activates after bce_only_epochs of pure BCE training.
     # Lambda max is calibrated ONCE from training losses at the first active epoch,
     # then kept fixed. Weighted contribution is capped to `fraction` of training BCE.
-    # (MLM removed in exp54 — Task B fail/remove after exp37/exp38/exp53.)
     "phase1_scheduler": {
         "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
         "aux_fraction_caps": {
@@ -80,16 +73,15 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 10.00,   # Confirmed peak across exp30/exp42/exp46; exp48 cap=12 hurt
-            # hazard: REMOVED for audit_0.2a — flat at 4-decimal weighted suspect; ablate to measure cost per Task 0.2.
-            "ranking": 0.20,    # Task C: pairwise AUROC-proxy ranking loss; cap conservative
+            "outcome": 10.00,   # Soft-BCE outcome head; higher caps over-dominate the backbone
+            "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss; conservative cap
         },
         "order": [["ce", "dt"], ["outcome", "ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
-            "outcome": 3,  # Ramp over 3 epochs (confirmed optimal in exp30)
-            "ranking": 3,  # Same ramp as outcome — Task C activates alongside outcome stage
+            "outcome": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
+            "ranking": 3,  # Same ramp as outcome — both activate together in stage 1
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]

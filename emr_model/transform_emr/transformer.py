@@ -21,7 +21,6 @@ from tqdm.auto import tqdm
 from transform_emr.embedder import EMREmbedding
 from transform_emr.config.model_config import *
 from transform_emr.utils import *
-from transform_emr.utils import get_hazard_targets
 from transform_emr.loss import MaskedFocalBCE, MaskedSetCE, pairwise_ranking_loss
 from transform_emr.schedulers import LambdaScheduleController, LRScheduleController
 
@@ -385,8 +384,8 @@ class GPT(nn.Module):
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
 
-        # 2-layer MLP outcome classifier (exp50 confirmed adding depth delays curriculum
-        # gating via slower val_total descent; exp24 confirmed widening also hurts).
+        # 2-layer MLP outcome classifier. Adding more depth / width was tested
+        # and consistently hurt by delaying the curriculum's stage-1 unlock.
         self.outcome_head = nn.Sequential(
             nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
@@ -403,9 +402,9 @@ class GPT(nn.Module):
             persistent=True,
         )
 
-        # exp59: terminal token ids — used by get_temporal_multi_hot_targets to
-        # apply a wider future BCE window (so the LM head sees many pre-terminal
-        # positions as terminal-positive instead of just the immediate-next).
+        # Terminal token ids — get_temporal_multi_hot_targets applies a wider
+        # future BCE window for these so the LM head sees many pre-terminal
+        # positions as terminal-positive instead of only the immediate-next one.
         self.register_buffer(
             "_terminal_ids",
             torch.tensor(
@@ -415,32 +414,11 @@ class GPT(nn.Module):
             persistent=True,
         )
 
-        # exp60: clinical complication ids (OUTCOMES minus TERMINAL_OUTCOMES) —
-        # second wide-window tier for the LM-head BCE. Same mechanism that worked
-        # for terminals in exp59, applied to under-supported complication tokens.
-        _complication_names = [n for n in OUTCOMES if n not in TERMINAL_OUTCOMES and n in tok.token2id]
-        self.register_buffer(
-            "_complication_ids",
-            torch.tensor([tok.token2id[n] for n in _complication_names], dtype=torch.long),
-            persistent=True,
-        )
-
-        # exp62: per-outcome learnable log-tau for the outcome-head soft target.
-        # get_future_outcome_targets currently uses a fixed scalar tau (12h). Letting
-        # each outcome learn its own tau means RELEASE (distinct healthy-patient
-        # dynamics) can pick a different decay constant from clinical complications.
-        # Aligned with f770850's "learn the window" guidance, scoped to the outcome
-        # head (not the lm-head BCE — terminals' hard 168h split is principled per
-        # the same caveat). K = num_outcomes new parameters.
+        # Per-outcome learnable log-tau for the outcome-head soft target. Each
+        # outcome learns its own decay constant — RELEASE's healthy-patient
+        # dynamics need a different tau than the clinical complications.
         _init_log_tau = math.log(12.0 / 336.0)
         self.outcome_log_tau = nn.Parameter(torch.full((self.num_outcomes,), _init_log_tau))
-
-        # Discrete-time hazard: shares weights with outcome_head; per-(outcome, bin) bias
-        # adds temporal structure on top of the outcome head's base logit.
-        # hazard_logit[k, b] = outcome_logit[k] + hazard_time_bias[k, b]
-        # Zero-init bias → starts equal to outcome logits; learns bin-specific offsets.
-        self.hazard_bins = cfg.get("hazard_bins", 12)
-        self.hazard_time_bias = nn.Parameter(torch.zeros(self.num_outcomes, self.hazard_bins))
 
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
@@ -578,10 +556,7 @@ class GPT(nn.Module):
         # 4. Outcome Prediction Head (Auxiliary Task)
         outcome_logits = self.outcome_head(x)           # [B, T, K]
 
-        # 5. Discrete-time hazard: outcome_logits + per-(outcome, bin) bias
-        hazard_logits = outcome_logits.unsqueeze(-1) + self.hazard_time_bias  # [B, T, K, n_bins]
-
-        # 6. Absolute time prediction (two-head: gate + magnitude)
+        # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
         mag_raw = self.dt_magnitude(x).squeeze(-1)     # [B,T]
         mag_pos = F.softplus(mag_raw)                  # non-negative magnitude
@@ -590,7 +565,7 @@ class GPT(nn.Module):
         delta_pos = gate_prob * mag_pos
         abs_t_pred = abs_ts + delta_pos                # [B, T]
 
-        return logits, abs_t_pred, outcome_logits, gate_logit, hazard_logits
+        return logits, abs_t_pred, outcome_logits, gate_logit
 
 
     @torch.no_grad()
@@ -653,14 +628,13 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
-        hazard_logits  = outcome_logits.unsqueeze(-1) + self.hazard_time_bias
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
         delta_pos  = torch.sigmoid(gate_logit) * mag_pos
         abs_t_pred = abs_ts + delta_pos
 
-        return logits, abs_t_pred, outcome_logits, gate_logit, hazard_logits, new_kvs
+        return logits, abs_t_pred, outcome_logits, gate_logit, new_kvs
 
 
     def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None,
@@ -737,21 +711,21 @@ class GPT(nn.Module):
         ckpt_keys  = set(state_dict.keys())
         missing    = model_keys - ckpt_keys
         unexpected = ckpt_keys - model_keys
-        # Tolerate stale keys from Task-A experiments (outcome_to_lm removed in exp37+).
-        stale_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids"}
-        # Tolerate missing time_bias_w/b (pre-Task-4A) and hazard_time_bias (pre-exp46).
-        # Both default to zero-init (no-op) so skipping them on load is safe.
-        # Also tolerate stale hazard_x_bias.* keys from exp47 (DISCARD).
+        # Tolerate stale keys from removed components so older checkpoints load:
+        #   outcome_to_lm.*    — outcome→LM coupling (removed; structurally incompatible with AR eval)
+        #   hazard_time_bias / hazard_x_bias.* / hazard_head.*   — discrete-time hazard head (removed)
+        #   _complication_ids                                    — second wide-window BCE tier (removed)
+        stale_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids",
+                      "hazard_time_bias", "_complication_ids"}
+        stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_x_bias.")}
+        stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_head.")}
+        # Tolerate missing parameters added later. Defaults are no-op (zero init or
+        # log-init equivalent to the legacy hard-coded value), so loading older
+        # checkpoints into the current model is safe.
         new_keys = {k for k in missing if
                     k.endswith(".time_bias_w") or k.endswith(".time_bias_b")
-                    or k == "hazard_time_bias"
-                    or k == "outcome_log_tau"
-                    or k == "_complication_ids"
-                    or k == "_terminal_ids"}
+                    or k in {"outcome_log_tau", "_terminal_ids"}}
         missing = missing - new_keys
-        stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_x_bias.")}
-        # Stale hazard_head weights (pre-exp46 Linear) are ignored — replaced by hazard_time_bias.
-        stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_head.")}
         unexpected_non_stale = unexpected - stale_keys
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
@@ -915,8 +889,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_outcome = total_dt = total_hazard = total_ranking = 0.0
-        total_ce_raw = total_outcome_raw = total_dt_raw = total_hazard_raw = total_ranking_raw = 0.0
+        total_loss = total_bce = total_ce = total_outcome = total_dt = total_ranking = 0.0
+        total_ce_raw = total_outcome_raw = total_dt_raw = total_ranking_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -939,7 +913,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
                 # === Original logits from Model ===
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    logits, abs_t_pred, outcome_logits, dt_gate_logit, hazard_logits = model(
+                    logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
@@ -951,7 +925,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 abs_t_pred = abs_t_pred.float()
                 outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
                 dt_gate_logit = dt_gate_logit.float()
-                hazard_logits = hazard_logits.float()
 
                 # logits is [B, T, V]
                 # abs_t_pred: [B, T]
@@ -1005,25 +978,13 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 true_abs = batch["abs_ts"][:, 1:] # [B, T-1] (Shifted true times)
 
                 # === Loss: BCE with logits — temporal targets ===
-                # For each position t, mark all tokens within the next phase2_bce_window_hours as positives.
-                # abs_ts = hours / 336.
-                # exp59: terminals (DEATH/RELEASE) use a wider future window so many
-                # pre-terminal positions are positive in the LM-head BCE, not just
-                # the immediate-next position.
+                # For each position t, mark all tokens within the next phase2_bce_window_hours
+                # as positives. Terminal tokens (DEATH/RELEASE) get a much wider window so the
+                # LM head sees dense pre-terminal positive signal, not just the immediate-next
+                # position. abs_ts is hours / _ABS_TS_SCALE.
                 _ABS_TS_SCALE = 336.0
-                _BCE_WIN = training_settings.get("phase2_bce_window_hours", 12.0) / _ABS_TS_SCALE
-                _TERM_WIN_H = training_settings.get("phase2_terminal_bce_window_hours", 168.0)
-                _TERM_WIN = _TERM_WIN_H / _ABS_TS_SCALE
-                _COMP_WIN_H = training_settings.get("phase2_complication_bce_window_hours", 48.0)
-                _COMP_WIN = _COMP_WIN_H / _ABS_TS_SCALE
-                # Task-0.4b AUDIT: keep ONLY the terminals wide-window tier; drop the
-                # complications 48h tier (per program.md caveat f770850 — per-family
-                # windows for clinical complications are hand-picked / non-transferable).
-                # This is the "two-tier split (terminals vs. everything else)"
-                # the caveat actually endorses. If audit_0.4b ≈ exp60, the
-                # complications tier was decorative and we adopt terminals-only as
-                # the new principled baseline. If audit_0.4b << exp60, the
-                # complications tier was load-bearing.
+                _BCE_WIN  = training_settings.get("phase2_bce_window_hours", 12.0)            / _ABS_TS_SCALE
+                _TERM_WIN = training_settings.get("phase2_terminal_bce_window_hours", 168.0) / _ABS_TS_SCALE
                 multi_hot = get_temporal_multi_hot_targets(
                     target_ids=full_targets,
                     all_abs_ts=batch["abs_ts"],
@@ -1080,7 +1041,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 # outcomes. No hard window boundaries — decay handles separation naturally.
                 _ABS_TS_SCALE = 336.0
                 _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
-                # exp62: per-outcome learnable tau (init log(12h/336)).
+                # Per-outcome learnable tau (initialised at log(12h / _ABS_TS_SCALE)).
                 _TAU = model.outcome_log_tau.exp()
                 outcome_targets = get_future_outcome_targets(
                     target_ids=full_targets,
@@ -1096,40 +1057,12 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
                 loss_outcome = lambdas["outcome"] * loss_outcome_raw
 
-                # === Loss: Discrete-time hazard (survival) ===
-                # For each position t and outcome k, predict which time bin (0-47h in 4h steps)
-                # the first future occurrence of k falls in. Properly conditions on survival.
-                _N_BINS = model.hazard_bins
-                hazard_tgt, hazard_loss_mask = get_hazard_targets(
-                    target_ids=full_targets,
-                    outcome_ids=outcome_token_ids,
-                    all_abs_ts=batch["abs_ts"],
-                    query_abs_ts=batch["abs_ts"][:, :-1],
-                    n_bins=_N_BINS,
-                    horizon=_HORIZON,
-                )  # [B, T-1, K, n_bins]
-
-                hazard_logits_q = hazard_logits[:, :-1, :, :]  # [B, T-1, K, n_bins]
-                # Apply padding mask: don't learn from pad positions
-                hazard_loss_mask &= nonpad.unsqueeze(-1).unsqueeze(-1)
-
-                if hazard_loss_mask.any():
-                    loss_hazard_raw = F.binary_cross_entropy_with_logits(
-                        hazard_logits_q[hazard_loss_mask],
-                        hazard_tgt[hazard_loss_mask],
-                        reduction="mean",
-                    )
-                else:
-                    loss_hazard_raw = hazard_logits_q.new_tensor(0.0)
-                loss_hazard = lambdas.get("hazard", 0.0) * loss_hazard_raw
-
-                # === Loss: Pairwise ranking (Task C — direct AUROC proxy) ===
+                # === Loss: Pairwise ranking (direct AUROC proxy on the outcome head) ===
                 # Positive positions: outcome_targets > 0 (outcome occurs within horizon).
                 # Negative positions: outcome_targets == 0 (no outcome within horizon).
                 # Both masked by non-pad. Independent of soft-BCE — direct AUROC signal.
-                # Always compute the raw loss so the lambda scheduler can calibrate it
-                # at the stage-1-unlock-minus-1 epoch (gating on lam > 0 created a
-                # deadlock — exp55 ranking stayed pending across all 50 P2 epochs).
+                # The raw loss is always computed so the lambda scheduler can calibrate it
+                # at stage-1 unlock; gating on lam > 0 would deadlock calibration.
                 _rank_pos = (outcome_targets > 0.0) & valid_pos
                 _rank_neg = (outcome_targets == 0.0) & valid_pos
                 loss_ranking_raw = pairwise_ranking_loss(
@@ -1138,14 +1071,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_hazard + loss_ranking
+                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_ranking
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "hazard": loss_hazard, "ranking": loss_ranking, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "ranking": loss_ranking, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1177,12 +1110,10 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce      += loss_ce.item()
                 total_outcome += loss_outcome.item()
                 total_dt      += abs_t_loss.item()
-                total_hazard  += loss_hazard.item()
                 total_ranking += loss_ranking.item()
                 total_ce_raw      += loss_ce_raw.item()
                 total_outcome_raw += loss_outcome_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
-                total_hazard_raw  += loss_hazard_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
@@ -1203,26 +1134,24 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_outcome / n_batches,
             total_dt      / n_batches,
-            total_hazard  / n_batches,
             total_ranking / n_batches,
             total_ce_raw      / n_batches,
             total_outcome_raw / n_batches,
             total_dt_raw      / n_batches,
-            total_hazard_raw  / n_batches,
             total_ranking_raw / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_hazard, tr_ranking, tr_ce_raw, tr_outcome_raw, tr_dt_raw, tr_hazard_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, vl_hazard, vl_ranking, _, _, _, _, _                                                       = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_ranking, tr_ce_raw, tr_outcome_raw, tr_dt_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, vl_ranking, _, _, _, _                                          = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f}, Haz={tr_hazard:.4f}, Rank={tr_ranking:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f}, Haz={vl_hazard:.4f}, Rank={vl_ranking:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} outcome={tr_outcome_raw:.7f} hazard={tr_hazard_raw:.7f} ranking={tr_ranking_raw:.7f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} outcome={tr_outcome_raw:.7f} ranking={tr_ranking_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1231,7 +1160,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             outcome=tr_outcome_raw,
-            hazard=tr_hazard_raw,
             ranking=tr_ranking_raw,
         )
         for msg in schedule_events:
@@ -1280,8 +1208,8 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     The backbone is kept in eval mode (deterministic features, no dropout) but receives
     tiny gradient updates guided by outcome loss. This allows micro-adaptation of the
-    backbone without catastrophic forgetting (unlike exp7 which unfroze at full LR).
-    Setting phase3_backbone_lr_factor=0.0 (default) is equivalent to full freeze.
+    backbone without catastrophic forgetting. Setting phase3_backbone_lr_factor=0.0
+    is equivalent to a full freeze.
 
     The outcome loss uses the same time-decayed soft labels as Phase 2 (same
     get_future_outcome_targets formula), so the head learns from exactly the same target
@@ -1320,11 +1248,13 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     p3_wd = training_settings.get("phase3_weight_decay", training_settings["weight_decay"])
 
     def _freeze_backbone_only(m):
-        """Enable gradients for all params; optimizer LR controls effective freeze.
-        exp63: outcome_log_tau is HARD-frozen in P3 — exp62b showed P3 drift in
-        tau destroys the P2-built RELEASE signal (RELEASE 0.813 P2-only →
-        0.674 with P3 trained). The soft-label horizon should be a Phase-2
-        decision; P3 only refines the outcome head's classifier weights.
+        """
+        Enable gradients on all params; the optimizer's per-group LRs control the
+        effective freeze (backbone LR is multiplied by phase3_backbone_lr_factor).
+
+        outcome_log_tau is hard-frozen in Phase 3 — letting it drift here destroys
+        the RELEASE signal Phase 2 built. The soft-label decay constants are a
+        Phase-2 decision; Phase 3 only refines the classifier weights.
         """
         for param in m.parameters():
             param.requires_grad_(True)
@@ -1332,10 +1262,10 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head", "hazard_time_bias"}
+        head_names = {"outcome_head"}
         backbone_params = [p for n, p in m.named_parameters()
                            if not any(h in n for h in head_names)]
-        head_params = list(m.outcome_head.parameters()) + [m.hazard_time_bias]
+        head_params = list(m.outcome_head.parameters())
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1373,7 +1303,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     _ABS_TS_SCALE = 336.0
     _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
-    # exp62: read learnable per-outcome tau from the model. In Phase 3 the param
+    # Read the learnable per-outcome tau from the model. In Phase 3 the param
     # continues to be trained alongside the outcome head.
 
     use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
@@ -1383,9 +1313,8 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         model.eval()
         if train_flag:
             model.outcome_head.train()
-            # hazard_time_bias is a plain Parameter — no module to set to train()
 
-        total_loss = total_outcome = total_hazard_p3 = 0.0
+        total_loss = total_outcome = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
@@ -1395,7 +1324,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 # inside GPT.forward also re-enters autocast for backward). Matches
                 # Phase-2 precision regime and cuts activation memory roughly in half.
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    logits, _, outcome_logits, _, hazard_logits_p3 = model(
+                    logits, _, outcome_logits, _ = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
@@ -1426,25 +1355,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
                 loss_outcome = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
 
-                # Hazard loss in Phase-3
-                hazard_tgt_p3, hazard_mask_p3 = get_hazard_targets(
-                    target_ids=full_targets,
-                    outcome_ids=outcome_token_ids,
-                    all_abs_ts=batch["abs_ts"],
-                    query_abs_ts=batch["abs_ts"][:, :-1],
-                    n_bins=model.hazard_bins,
-                    horizon=_HORIZON,
-                )
-                hazard_logits_p3_q = hazard_logits_p3.float()[:, :-1, :, :]
-                hazard_mask_p3 &= nonpad.unsqueeze(-1).unsqueeze(-1)
-                if hazard_mask_p3.any():
-                    loss_hazard_p3 = F.binary_cross_entropy_with_logits(
-                        hazard_logits_p3_q[hazard_mask_p3], hazard_tgt_p3[hazard_mask_p3], reduction="mean"
-                    )
-                else:
-                    loss_hazard_p3 = loss_outcome.new_tensor(0.0)
-
-                loss = loss_outcome + loss_hazard_p3
+                loss = loss_outcome
 
                 if train_flag:
                     if not torch.isfinite(loss):
@@ -1455,9 +1366,8 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     if torch.isfinite(p3_norm):
                         optimizer.step()
 
-                total_loss       += loss.item()
-                total_outcome    += loss_outcome.item()
-                total_hazard_p3  += loss_hazard_p3.item()
+                total_loss    += loss.item()
+                total_outcome += loss_outcome.item()
 
         n = max(len(loader), 1)
         if train_flag:
