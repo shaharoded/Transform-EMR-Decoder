@@ -1308,6 +1308,23 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
 
+    # Mirror P2's pairwise ranking loss in Phase 3 so the outcome head stays in
+    # the joint (outcome BCE + ranking) optimum it converged into at the end of
+    # P2, rather than being pulled toward a BCE-only fit on the natural-
+    # distribution loader. λ is calibrated once at the end of epoch 1 from the
+    # epoch-1 raw outcome / raw ranking ratio, using the same fraction cap that
+    # P2 uses for ranking — no new hyperparameter.
+    #
+    # Early-stop watches val_outcome_raw (not val_total): the joint training
+    # loss surface changes at epoch-2 calibration (λ goes 0→λ_cal), so
+    # val_total isn't comparable across that boundary. val_outcome_raw is
+    # stable, and it is the metric the eventual eval cares about (outcome head
+    # calibration on the natural distribution).
+    ranking_cap = (training_settings.get("phase2_scheduler", {})
+                                     .get("aux_fraction_caps", {})
+                                     .get("ranking", 0.20))
+    lambda_ranking: float | None = None  # set after epoch 1
+
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
         model.eval()
@@ -1315,6 +1332,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             model.outcome_head.train()
 
         total_loss = total_outcome = 0.0
+        total_outcome_raw = total_ranking_raw = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
@@ -1352,10 +1370,18 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 nonpad    = (target_ids != model.embedder.padding_idx)  # [B, T-1]
                 valid_pos = nonpad.unsqueeze(-1)                        # [B, T-1, 1]
 
-                loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
-                loss_outcome = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+                loss_outcome_raw = (OutcomeCriterion(outcome_pred, outcome_targets)
+                                    * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+                loss_outcome = loss_outcome_raw
 
-                loss = loss_outcome
+                # Pairwise ranking — same pos/neg construction as P2.
+                _rank_pos = (outcome_targets > 0.0) & valid_pos
+                _rank_neg = (outcome_targets == 0.0) & valid_pos
+                loss_ranking_raw = pairwise_ranking_loss(outcome_pred, _rank_pos, _rank_neg)
+                _lam = lambda_ranking if lambda_ranking is not None else 0.0
+                loss_ranking = _lam * loss_ranking_raw
+
+                loss = loss_outcome + loss_ranking
 
                 if train_flag:
                     if not torch.isfinite(loss):
@@ -1366,32 +1392,50 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     if torch.isfinite(p3_norm):
                         optimizer.step()
 
-                total_loss    += loss.item()
-                total_outcome += loss_outcome.item()
+                total_loss        += loss.item()
+                total_outcome     += loss_outcome.item()
+                total_outcome_raw += loss_outcome_raw.item()
+                total_ranking_raw += loss_ranking_raw.item()
 
         n = max(len(loader), 1)
-        if train_flag:
-            pass  # logged below
-        return total_loss / n
+        return {
+            "loss":        total_loss        / n,
+            "outcome":     total_outcome     / n,
+            "outcome_raw": total_outcome_raw / n,
+            "ranking_raw": total_ranking_raw / n,
+        }
 
     n_epochs = training_settings["phase3_n_epochs"]
     patience = training_settings["early-stop-patience"]
 
     for epoch in range(start_epoch, start_epoch + n_epochs):
-        tr_loss = run_epoch(train_dl, train_flag=True)
-        vl_loss = run_epoch(val_dl,   train_flag=False)
+        tr = run_epoch(train_dl, train_flag=True)
+        vl = run_epoch(val_dl,   train_flag=False)
 
+        # One-shot λ_ranking calibration at the end of epoch 1 (mirrors P2).
+        if lambda_ranking is None and tr["ranking_raw"] > 0.0:
+            lambda_ranking = ranking_cap * (tr["outcome_raw"] / tr["ranking_raw"])
+            print(f"[Phase-3]: λ_ranking calibrated = {lambda_ranking:.6f} "
+                  f"(cap={ranking_cap}, raw_outcome={tr['outcome_raw']:.6f}, "
+                  f"raw_ranking={tr['ranking_raw']:.6f})")
+
+        tr_loss, vl_loss = tr["loss"], vl["loss"]
+        # Selection metric: pure outcome BCE (stable across the λ=0 → λ=λ_cal
+        # transition). This is what the eval ultimately measures.
+        vl_select = vl["outcome_raw"]
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}")
+        print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}  "
+              f"raw_out={tr['outcome_raw']:.7f}  raw_rank={tr['ranking_raw']:.7f}  "
+              f"vl_select={vl_select:.6f}")
 
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)
 
         min_delta_rel = training_settings.get("early-stop-min-delta-rel", 1e-3)
-        if vl_loss < best_val * (1.0 - min_delta_rel):
-            best_val = vl_loss
+        if vl_select < best_val * (1.0 - min_delta_rel):
+            best_val = vl_select
             bad_epochs = 0
             model.save(ckpt_path, epoch=epoch, best_val=best_val, optimizer=optimizer,
                        training_settings=training_settings)
