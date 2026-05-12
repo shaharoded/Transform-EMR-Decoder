@@ -492,19 +492,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         [embedder.tokenizer.token2id[n] for n in _all_outcome_names if n in embedder.tokenizer.token2id],
         dtype=torch.long, device=device,
     )
-    # exp61: wide-tier token ids for Phase-1 lm-head BCE — same mechanism as
-    # exp59/exp60 used in Phase-2: terminals get a much wider future window
-    # (denser pre-event positive signal) so the embedder's decoder learns to
-    # assign them higher logits hours-to-days before the actual event.
-    p1_terminal_ids = torch.tensor(
-        [embedder.tokenizer.token2id[n] for n in TERMINAL_OUTCOMES if n in embedder.tokenizer.token2id],
-        dtype=torch.long, device=device,
-    )
-    p1_complication_ids = torch.tensor(
-        [embedder.tokenizer.token2id[n] for n in OUTCOMES
-         if n not in TERMINAL_OUTCOMES and n in embedder.tokenizer.token2id],
-        dtype=torch.long, device=device,
-    )
 
     # ----- Resume logic -----
     train_losses, val_losses = [], []
@@ -573,10 +560,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             # Temporal: all tokens within phase1_bce_window_hours
             _ABS_TS_SCALE = 336.0
             _P1_WIN = training_settings.get("phase1_bce_window_hours", 3.0) / _ABS_TS_SCALE
-            # exp61: wider future windows for terminals and clinical complications.
-            # Reuses the phase-2 settings (same physical meaning).
-            _P1_TERM_WIN = training_settings.get("phase2_terminal_bce_window_hours", 168.0) / _ABS_TS_SCALE
-            _P1_COMP_WIN = training_settings.get("phase2_complication_bce_window_hours", 48.0) / _ABS_TS_SCALE
             # next_token_ids for phase-1: query positions cover full T, so shift by 1
             # and pad the last column with padding_idx (no next token after last position).
             _pos_ids = batch["position_ids"]
@@ -592,10 +575,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 window_size=_P1_WIN,
                 outcome_ids=p1_outcome_ids,
                 next_token_ids=_next_tok,
-                wide_tiers=[
-                    (p1_terminal_ids,     _P1_TERM_WIN),
-                    (p1_complication_ids, _P1_COMP_WIN),
-                ],
             )
             multi_hot_targets = multi_hot_targets.masked_fill(illegal, 0.0)
 
