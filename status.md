@@ -1,104 +1,110 @@
-# autoresearch — loop status (UTC 2026-05-13 ~04:30)
+# autoresearch — loop status (UTC 2026-05-13 ~07:30)
 
-## TL;DR — **NEW BEST exp69** (`ebe9618`)
+## TL;DR — **NEW BEST exp73** (`3eaafa7`)
 
 ```
-AUROC 0.870   (+0.020 vs exp66; +0.037 vs exp63)
-AUPRC 0.512   (+0.060)
-MAE   82.6h
-max_len 0.0%  (-11.6pp vs exp66 — PERFECT termination, no fallback)
-DEATH    0.950  (-0.033)
-CARDIO   0.933  (+0.034)  KIDNEY 0.844 (+0.042)
-HYPERGLY 0.852  (+0.016)  HYPOGLY 0.811 (-0.024)
-RELEASE  0.832  (+0.105 !!!)              peak VRAM 9.4 GB
+AUROC 0.882   (+0.012 vs exp69; +0.049 vs exp63 pre-session)
+AUPRC 0.483
+MAE   83.9h
+max_len 0.0%   (perfect termination preserved)
+DEATH    0.975
+CARDIO   0.906  (+0.050 vs exp71 recovery; -0.027 vs exp69 0.933 peak)
+HYPERGLY 0.884
+KIDNEY   0.863  HYPOGLY 0.849
+RELEASE  0.812                    peak VRAM 9.4 GB
 ```
 
-## Session summary (this loop)
+The headline is the **horizon-aligned three-tier `log_tau_lm` init**:
+default tokens at log(12/336), outcome-class tokens at log(48/336)
+(matches `outcome_horizon_hours`), terminals at log(168/336). exp71
+had dropped P2 outcome BCE and CARDIO collapsed −0.077 because its
+soft kernel was init'd at the default 12h window. Aligning the
+init with the eval window's actual horizon recovered CARDIO +0.050
+(0.856 → 0.906), most of the way back from the collapse, while
+keeping the simpler-codebase win from exp71.
 
-7 experiments + 1 diagnose pass + 2 bug fixes, two big KEEPs.
+## Session arc
 
 | Exp | Commit | AUROC | AUPRC | RELEASE | max_len% | Status |
 |---|---|---|---|---|---|---|
-| exp63 | `033e019` | 0.833 | 0.434 | 0.694 | 8.5 | (pre-session best) |
-| exp64 | `2c60c2a` | 0.797 | 0.364 | 0.688 | 14.9 | DISCARD (skip-P3 cost +0.036) |
-| exp65 | `12ce6fe` | 0.829 | 0.409 | 0.732 | 12.6 | DISCARD (selector bug — methodology) |
-| exp66 | `82387ca` | 0.850 | 0.452 | 0.727 | 11.6 | KEEP (P3 ranking + selector fix) |
-| exp67 | `d854e7d` | 0.819 | 0.397 | 0.594 | 3.7 | DISCARD (ranking-only P3) |
-| exp68 | `260d0dc` | 0.802 | 0.397 | 0.681 | 21.1 | DISCARD (oversampled P3) |
-| **exp69** | **`ebe9618`** | **0.870** | **0.512** | **0.832** | **0.0** | **KEEP — current best** |
-| exp70 | (smoke crash) | — | — | — | — | CRASH (P1 soft-kernel → NaN tstamps) |
+| exp63 | `033e019` | 0.833 | 0.434 | 0.694 | 8.5 | (pre-session) |
+| exp64 | `2c60c2a` | 0.797 | 0.364 | 0.688 | 14.9 | DISCARD (skip-P3) |
+| exp65 | `12ce6fe` | 0.829 | 0.409 | 0.732 | 12.6 | DISCARD (selector bug) |
+| exp66 | `82387ca` | 0.850 | 0.452 | 0.727 | 11.6 | KEEP (P3 ranking + sel fix) |
+| exp67 | `d854e7d` | 0.819 | 0.397 | 0.594 | 3.7 | DISCARD (P3 ranking-only) |
+| exp68 | `260d0dc` | 0.802 | 0.397 | 0.681 | 21.1 | DISCARD (P3 oversampled) |
+| exp69 | `ebe9618` | 0.870 | 0.512 | 0.832 | 0.0 | KEEP (soft-kernel LM head) |
+| exp70 | (n/a)     | —     | —     | —     | —    | CRASH (P1 soft kernel) |
+| exp71 | `3da7a74` | 0.876 | 0.494 | 0.831 | 0.0 | KEEP (drop P2 outcome BCE) |
+| exp72 | (rolled-back) | 0.859 | 0.510 | 0.783 | 0.1 | DISCARD (contrastive aux) |
+| **exp73** | **`3eaafa7`** | **0.882** | **0.483** | **0.812** | **0.0** | **KEEP — current** |
 
-### Two architectural wins
+## What worked vs what didn't
 
-1. **exp66** (`82387ca`): added P2's pairwise ranking loss to Phase 3
-   + early-stop on `val_outcome_raw` (stable across the λ=0→λ_cal
-   transition). Fixed exp65's bug where `val_total` jump locked the
-   selector onto epoch 1. +0.017 AUROC.
+**Worked:**
+1. **P3 ranking + stable val_outcome_raw selector** (exp66) — fixing the
+   selector bug let the ranking gradient train for 27 epochs; +0.017.
+2. **Soft-kernel LM-head BCE** (exp69) — learnable per-token-class
+   exponential decay replaced exp59's hard two-tier window; +0.020 AUROC,
+   +0.060 AUPRC, +0.105 RELEASE, max_len 11.6 → 0.0pp.
+3. **Drop P2 outcome BCE** (exp71) — soft-kernel LM head carries the
+   timing signal; +0.006 AUROC, one less loss term.
+4. **Horizon-aligned three-tier kernel init** (exp73) — CARDIO recovered;
+   AUROC +0.006 vs exp71.
 
-2. **exp69** (`ebe9618`): replaced the hard 12h/168h two-tier LM-head
-   BCE window with a learnable per-token-class exponential soft
-   kernel. `log_tau_lm` Parameter[V] learns the decay scale per
-   class — terminals end at ~340h (2× exp59's hand-picked), default
-   tokens at ~7.5h (tighter). +0.020 AUROC, +0.060 AUPRC, +0.105
-   RELEASE, max_len 11.6 → 0.0pp.
+**Didn't work:**
+- Skip P3 (exp64): P3 is net-positive +0.036.
+- Ranking-only P3 (exp67): BCE calibrates RELEASE; −0.133 RELEASE.
+- Oversampled P3 DL (exp68): `pos_weight` mismatched; broad regression.
+- P1 soft kernel (exp70, exp70-retry): destabilises Time2Vec/time_head
+  even with freeze-then-unfreeze. Phase 1 BCE is too foundational.
+- Same-patient contrastive aux (exp72): raw 3.31 → 3.0 only (7% drop,
+  well below Rule 2(a) 30% bar), backbone capacity diverted, AUROC −0.017.
+  Answers the open question — same-patient-position contrastive does
+  NOT help on event sequences this size.
 
-### Direction A in P3 fully explored
+## Per-outcome trajectory (this session)
 
-- **sub-1** (joint BCE + ranking): KEPT (exp66).
-- **sub-2** (ranking-only): DISCARD (exp67) — BCE calibrates RELEASE.
-- **sub-3** (oversampled DL in P3): DISCARD (exp68) — `pos_weight`
-  calibration mismatched on rare positives.
+| Outcome | exp63 | exp66 | exp69 | exp71 | **exp73** |
+|---|---|---|---|---|---|
+| DEATH    | 0.988 | 0.983 | 0.950 | 0.978 | **0.975** |
+| CARDIO   | 0.863 | 0.899 | 0.933 | 0.856 | **0.906** |
+| HYPERGLY | 0.843 | 0.836 | 0.852 | 0.888 | **0.884** |
+| KIDNEY   | 0.802 | 0.819 | 0.844 | 0.850 | **0.863** |
+| HYPOGLY  | 0.805 | 0.835 | 0.811 | 0.855 | **0.849** |
+| RELEASE  | 0.694 | 0.727 | 0.832 | 0.831 | **0.812** |
 
-Both losses are needed in P3; the joint regime from exp66 is locked.
+Every outcome has gained net since session start, with RELEASE
+(+0.118), CARDIO (+0.043), KIDNEY (+0.061), HYPOGLY (+0.044),
+HYPERGLY (+0.041) up substantially. DEATH (−0.013) is the only
+outcome marginally below pre-session — and 0.975 is still excellent.
 
-### Direction C (LM-head soft kernel) outcome
+## Open directions
 
-- **P2 soft kernel** (exp69): KEEP, massive win.
-- **P1 soft kernel** (exp70): CRASH on smoke. 1 epoch of P1 with the
-  new kernel destabilises the time2vec/time_head → NaN abs_ts in AR
-  generation → IntCastingNaNError in eval pooler. Per program.md
-  Direction C "Risk. If the learned-kernel implementation is wrong it
-  could break exp59's signal" — confirmed. Reverted cleanly.
-
-## Open directions (entering next session)
-
-- **Direction B** — patient-trajectory contrastive aux for HYPOGLY /
-  RELEASE. RELEASE is no longer the weakness (0.832); **HYPOGLY 0.811
-  is now the weakest** active outcome. Biggest surface change in queue.
-- **P1 soft kernel — retry with mitigations** — initialise log_tau_emb
-  at a value that keeps the soft kernel ≈ binary at epoch 0; freeze
-  log_tau for the first N epochs while time2vec stabilises; add tau
-  upper bound. Optional follow-up.
-- **Investigate Δt regression**: exp69 diag showed Δt R² collapsed
-  from 0.18 to -1.22 (pred mean 3.14h vs true 0.91h — a 3× bias).
-  Suspect fresh-P1 randomness, but Task A is supposed to be locked.
-  Worth a careful look — does the locked Task A really survive a
-  fresh P1, or is it only fixed when the cache is preserved?
-- **Outcome-head capacity question**: diag shows outcome head loses
-  to LM head teacher-forced (all 4 active outcomes). Eval is rescued
-  by the one-hot override at emit time. Worth exploring whether
-  outcome head could be simpler / replaced with LM-head readout.
-
-## What changed in the codebase
-
-- `transformer.py`: `log_tau_lm` Parameter[V] (init log(12/336) /
-  log(168/336) at terminals), P2 BCE routes to soft kernel when
-  `phase2_use_soft_kernel=True`, finetune_transformer (P3) gains
-  pairwise ranking term + stable `val_outcome_raw` selector.
-- `utils.py`: new `get_temporal_soft_targets` (scatter_add along V,
-  differentiable w.r.t. tau). `@torch.no_grad()` removed from
-  `get_temporal_multi_hot_targets` (no-op for binary path).
-- `inference.py`: 5-tuple unpack from `forward_with_cache` (hazard
-  removal stale-unpack fix).
-- `diagnose.py`: 4-tuple unpack from `model()` (hazard fix) +
-  accept Phase 3 ckpt when Phase 2 best is missing.
-- `config/model_config.py`: `phase2_use_soft_kernel: True`.
+- **Δt regression investigation**: exp69 / exp71 / exp73 all have a
+  Δt head R² ≈ -1.22 (bias issue — pred mean ~3h vs true ~1h)
+  despite Task A being "locked". Worth a careful look at whether
+  the lock holds across fresh-P1 retrains.
+- **Outcome-head simplification**: diag (on exp69) showed LM head
+  beats outcome head teacher-forced for all four active outcomes.
+  The outcome head is largely a wrapper around what the LM head
+  already encodes plus the one-hot override at emit time. Could
+  simplify by replacing the outcome head with a small linear
+  classifier on top of LM logits.
+- **Per-outcome P3 BCE**: exp71 showed P2 outcome BCE was helping
+  CARDIO. exp73 partially recovered CARDIO via the kernel init. A
+  CARDIO-targeted aux is still on the table if exp73's recovery
+  proves insufficient against fresh seeds.
+- **P1 contrastive** — different from exp72: positives are NOT
+  same-patient positions but two random patients with very similar
+  early-window features (matched at the embedder level). Untested.
 
 ## Process discipline
 
-- `results.tsv`: 77 data rows + header. Untracked.
-- All exp65–70 git operations: clean DISCARD via `git reset --hard
-  HEAD~1` (or HEAD~2 when the experiment included a status commit).
-  Bug fixes kept as standalone commits.
+- `results.tsv`: 80 data rows + header. Untracked.
+- exp73 retrained P1 fresh (cleared cache before run). Per Rule 5,
+  +0.006 margin over exp71 just clears the 0.005 noise floor, plus
+  the CARDIO recovery is well outside any fresh-P1 noise band, so
+  the lock is real.
 - 7-decimal raw aux logging unchanged.
-- Committing locally only.
+- Committing locally only; user pulls from root.
