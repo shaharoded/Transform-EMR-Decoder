@@ -422,13 +422,22 @@ class GPT(nn.Module):
 
         # Direction C: per-token-class learnable log-tau for the LM-head
         # multi-hot BCE soft kernel. Replaces the hard two-tier window
-        # (12h default / 168h terminals from exp59). Initialised to match
-        # the hard-window values so the soft kernel starts at exp(-1)=0.37
-        # weight at the boundary that used to give weight 1.0 — the model
-        # learns the kernel scale per class from there.
+        # (12h default / 168h terminals from exp59). Three-tier init aligned
+        # with how each class is used downstream (exp73):
+        #   - default tokens          → log(12 / 336)  (~12h)
+        #   - outcome-class tokens    → log(48 / 336)  (matches outcome_horizon_hours)
+        #   - terminal tokens         → log(168 / 336) (matches exp59 wide-window)
+        # The outcome-class tier means CARDIO / KIDNEY / HYPER / HYPOGLY etc.
+        # start with a wider kernel that aligns with the eval window. exp71
+        # showed CARDIO regressed −0.077 when P2 outcome BCE was removed;
+        # the hypothesis is that the default 12h init was too narrow for
+        # complications. Model still learns per-class scale from these inits.
         _log_tau_default  = math.log(12.0  / 336.0)
+        _log_tau_outcome  = math.log(48.0  / 336.0)
         _log_tau_terminal = math.log(168.0 / 336.0)
         _log_tau_lm = torch.full((vocab_size,), _log_tau_default)
+        if self._outcome_ids.numel() > 0:
+            _log_tau_lm[self._outcome_ids] = _log_tau_outcome
         if self._terminal_ids.numel() > 0:
             _log_tau_lm[self._terminal_ids] = _log_tau_terminal
         self.log_tau_lm = nn.Parameter(_log_tau_lm)
