@@ -81,124 +81,225 @@ emr_model/
 
 ---
 
-## RunPod: SSH setup
+## End-to-end workflow
 
-The agent runs on a RunPod GPU pod (A40, 48 GB VRAM).
+The agent runs autonomously on a RunPod GPU pod (A40 / A5000, 24–48 GB VRAM). The pattern that works reliably:
 
-### First-time SSH key setup (local, run once)
+- The pod runs Claude Code inside `tmux` so it survives SSH drops.
+- A non-root `agent` user runs Claude (the `--dangerously-skip-permissions` flag refuses to run as root).
+- The agent commits experiments locally only. **Root pushes to GitHub** periodically; you `git pull origin main` on your own machine to read the latest `status.md` / `results.tsv` / code.
+- The agent maintains a running `status.md` at the repo root (overwritten every meaningful step), which is the canonical source of progress.
 
-```powershell
-ssh-keygen -t ed25519 -C "runpod" -f "$env:USERPROFILE\.ssh\runpod_ed25519"
-```
+### One-time local setup
 
-Copy the public key to your clipboard:
-```powershell
-Get-Content "$env:USERPROFILE\.ssh\runpod_ed25519.pub" | clip
-```
-
-Paste it into **RunPod → Settings → SSH Public Keys**.
-
-### Add the pod to your SSH config (local)
-
-Edit `~/.ssh/config` (create if it doesn't exist) and add:
-
-```
-Host runpod
-    HostName 194.68.245.49
-    Port     22036
-    User     root
-    IdentityFile ~/.ssh/runpod_ed25519
-```
-
-Replace the `HostName` and `Port` each time you start a new pod (RunPod shows these on the pod's Connect page under "SSH over exposed TCP").
-
-### Connect from VSCode
-
-1. Install the **Remote - SSH** extension.
-2. Press `Ctrl+Shift+P` → `Remote-SSH: Connect to Host` → select `runpod`.
-3. Once connected: **File → Open Folder** → `/workspace/autoresearch`.
-4. Open a terminal and run `claude` to start the agent.
-
-### Connect from PowerShell
+Generate a key for the pod (run once on your local Windows machine):
 
 ```powershell
-ssh runpod
+ssh-keygen -t ed25519 -C "runpod" -f "$env:USERPROFILE\.ssh\id_ed25519"
+Get-Content "$env:USERPROFILE\.ssh\id_ed25519.pub" | clip
 ```
 
-Or without the config entry:
-```powershell
-ssh -i "$env:USERPROFILE\.ssh\runpod_ed25519" -p 22036 root@194.68.245.49
-```
+Paste it into **RunPod → Settings → SSH Public Keys**, and also into **GitHub → Settings → SSH and GPG keys → New SSH key** (so the pod can both be SSH-targeted and push to GitHub from inside).
 
 ---
 
-## RunPod: pod lifecycle
+### First-time pod bring-up (per pod)
 
-### Starting a session
-
-1. Go to [runpod.io](https://runpod.io) → **My Pods** → start the pod (or create a new one).
-2. Wait for status to show **Running**.
-3. Click **Connect** → copy the "SSH over exposed TCP" address.
-4. Update `~/.ssh/config` with the new `HostName` and `Port` if they changed.
-5. SSH in and resume work.
-
-### Before stopping the pod (save your work)
-
-The pod's **container disk** is ephemeral — it is wiped when the pod is stopped or deleted. Always save before stopping.
-
-**What needs saving** (copy to your local machine or a RunPod network volume):
-
-| What | Why |
-|------|-----|
-| `results.tsv` | The full experiment log — not in git |
-| `emr_model/checkpoints/tokenizer.pt` | Tokenizer cache — slow to rebuild |
-| `emr_model/checkpoints/phase1/ckpt_best.pt` | Cached embedder — saves ~30 min per experiment |
-| `run.log` | Last run output (optional) |
-
-**Copy everything to local with SCP** (run from PowerShell locally):
+RunPod gives you the SSH command on the pod's Connect page — looks like `ssh root@<HOST> -p <PORT>`. Use it from local PowerShell:
 
 ```powershell
-# Create a local backup folder
-New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\runpod_backup"
-
-# Copy the files
-scp -P 22036 root@194.68.245.49:/workspace/autoresearch/results.tsv "$env:USERPROFILE\runpod_backup\"
-scp -P 22036 root@194.68.245.49:/workspace/autoresearch/emr_model/checkpoints/tokenizer.pt "$env:USERPROFILE\runpod_backup\"
-scp -r -P 22036 root@194.68.245.49:/workspace/autoresearch/emr_model/checkpoints/phase1 "$env:USERPROFILE\runpod_backup\"
+ssh root@<HOST> -p <PORT> -i ~/.ssh/id_ed25519
 ```
 
-Or use a RunPod **Network Volume** (persistent across pod restarts) and mount it at `/workspace`.
-
-### Restoring to a new pod
-
-```powershell
-# Push saved files back to the new pod
-scp -P <NEW_PORT> "$env:USERPROFILE\runpod_backup\results.tsv" root@<NEW_HOST>:/workspace/autoresearch/
-scp -P <NEW_PORT> "$env:USERPROFILE\runpod_backup\tokenizer.pt" root@<NEW_HOST>:/workspace/autoresearch/emr_model/checkpoints/
-scp -r -P <NEW_PORT> "$env:USERPROFILE\runpod_backup\phase1" root@<NEW_HOST>:/workspace/autoresearch/emr_model/checkpoints/
-```
-
-Then reinstall dependencies (if not using a network volume):
+On the pod, install tooling and clone the repo (~5 min total):
 
 ```bash
+# tmux for persistent sessions
+apt-get update && apt-get install -y tmux
+
+# Node 20 (Claude Code requires Node 18+; the default Node 12 has a conflict)
+apt-get remove --purge -y nodejs libnode-dev libnode72 2>/dev/null
+apt-get autoremove -y
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+npm install -g @anthropic-ai/claude-code
+
+# Clone the repo (works because root's SSH key is registered with GitHub)
+cd /workspace
+git clone git@github.com:shaharoded/AutoResearcher-TransformEMR.git autoresearch
+cd autoresearch
+pip install -e .
 pip install scikit-learn tqdm openpyxl joblib matplotlib pandas pyarrow
+
+# Drop the data CSVs into place — SCP them from local (see "Copying data" below)
+mkdir -p emr_model/data/source
+# scp emr_model/data/source/temporal_data.csv and context_data.csv from local
+
+# Create a non-root user for the agent (the --dangerously-skip-permissions flag won't run as root)
+useradd -m -s /bin/bash agent
+mkdir -p /home/agent/.ssh
+cp /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub /home/agent/.ssh/
+chmod 700 /home/agent/.ssh
+chmod 600 /home/agent/.ssh/id_ed25519
+chmod 644 /home/agent/.ssh/id_ed25519.pub
+chmod -R a+rwX /workspace/autoresearch     # network volume blocks chown; chmod works
 ```
 
-### Stopping the pod
+#### Copying data to the pod
 
-Once files are saved: **RunPod → My Pods → Stop**. This pauses billing. The pod can be restarted later.
+The training CSVs are gitignored. SCP them from your local repo (run in local PowerShell):
 
-To permanently delete: **Terminate** (irreversible — all container data is lost).
+```powershell
+scp -P <PORT> -i ~/.ssh/id_ed25519 emr_model\data\source\temporal_data.csv root@<HOST>:/workspace/autoresearch/emr_model/data/source/
+scp -P <PORT> -i ~/.ssh/id_ed25519 emr_model\data\source\context_data.csv  root@<HOST>:/workspace/autoresearch/emr_model/data/source/
+```
 
 ---
 
-## Running the agent
+### Daily workflow
 
-Start a Claude Code session in this directory and say:
+#### Starting the agent
+
+Always SSH in as root, switch to `agent`, then attach a tmux session:
+
+```bash
+# Local PowerShell:
+ssh root@<HOST> -p <PORT> -i ~/.ssh/id_ed25519
+
+# On the pod:
+su - agent
+cd /workspace/autoresearch
+git config --global --add safe.directory /workspace/autoresearch   # needed because of network-volume ownership
+
+tmux new -s claude
+claude --dangerously-skip-permissions
+```
+
+On first launch Claude will prompt for a browser login — paste the URL into your local browser, log in, paste the token back. Then in the Claude prompt:
+
+> Read `program.md` and all files in its Setup section. Check `results.tsv` and `git log --oneline -10` for state. Begin the experiment loop now. Update `status.md` after every meaningful step and commit it locally; do NOT push — root will push.
+
+Detach the tmux session with `Ctrl+B` then `D`. The agent keeps running.
+
+#### Reconnecting after an SSH drop
+
+The tmux session survives SSH disconnects. Just re-SSH and reattach:
+
+```bash
+# Local:
+ssh root@<HOST> -p <PORT> -i ~/.ssh/id_ed25519
+
+# On the pod:
+su - agent
+cd /workspace/autoresearch
+tmux ls                            # confirm 'claude' is listed
+tmux attach -t claude              # or `-d` to detach any other viewer
+```
+
+If `tmux ls` says "no server running", the session is gone (pod was restarted). Start fresh with `tmux new -s claude && claude --dangerously-skip-permissions`.
+
+#### Watching progress externally
+
+The agent commits locally only — `status.md` is the canonical progress file. As **root** in `/workspace/autoresearch`, push to GitHub whenever you want a sync point:
+
+```bash
+# As root on the pod (root has working GitHub SSH auth):
+cd /workspace/autoresearch
+git push origin main
+```
+
+Then locally, fetch and read:
+
+```powershell
+git fetch origin
+git pull --ff-only origin main
+cat status.md
+```
+
+If `git pull` complains about local `status.md` changes, move it aside first:
+```powershell
+move status.md $env:TEMP\status_local_old.md
+git pull --ff-only origin main
+```
+
+#### Running an experiment yourself
+
+You don't usually need to; the agent does it. If you want to verify the pipeline manually:
+
+```bash
+# As agent in /workspace/autoresearch:
+python api.py > run.log 2>&1
+grep "^outcome_auroc:\|^outcome_auprc:\|^onset_mae_hrs:\|^peak_vram_mb:" run.log
+```
+
+Smoke test first by setting `sample=50, phase{1,2,3}_n_epochs=1` in `emr_model/transform_emr/config/model_config.py`.
+
+---
+
+### Pausing / stopping a session
+
+The agent pauses on its own when `program.md`'s stop criterion is met. To stop manually:
+- Reattach the tmux session (`tmux attach -t claude`).
+- Send `/exit` to Claude, or interrupt with `Esc` then exit.
+- Detach (`Ctrl+B D`).
+- Kill the tmux session when done: `tmux kill-session -t claude`.
+
+### Stopping the pod (pause billing)
+
+The pod's **container disk** is ephemeral — wiped on stop unless you used a Network Volume. Before stopping, decide what to preserve:
+
+| What | Where it lives | Survives pod stop? |
+|---|---|---|
+| Code, `program.md`, `status.md` | Git (push to origin) | Yes — via GitHub |
+| `results.tsv` | Container disk (gitignored) | **No** — SCP it off if you want the history |
+| Phase-1/2/3 checkpoints | Container disk | **No** — SCP if you want to resume the trained model |
+| Tokenizer cache | Container disk | **No** — slow to rebuild (~minutes) |
+
+To save the artifacts before stopping (run in local PowerShell):
+
+```powershell
+$DST = "$env:USERPROFILE\runpod_backup\$(Get-Date -Format yyyy-MM-dd)"
+New-Item -ItemType Directory -Force -Path $DST
+
+# Experiment log
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<HOST>:/workspace/autoresearch/results.tsv $DST\
+
+# Best-model checkpoints (skip if you'll retrain on different data anyway)
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<HOST>:/workspace/autoresearch/emr_model/checkpoints/phase3/ckpt_best.pt $DST\phase3_ckpt_best.pt
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<HOST>:/workspace/autoresearch/emr_model/checkpoints/phase2/ckpt_best.pt $DST\phase2_ckpt_best.pt
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<HOST>:/workspace/autoresearch/emr_model/checkpoints/phase1/ckpt_best.pt $DST\phase1_ckpt_best.pt
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<HOST>:/workspace/autoresearch/emr_model/checkpoints/tokenizer.pt $DST\tokenizer.pt
+```
+
+Then **RunPod → My Pods → Stop** (not Terminate — Stop pauses billing but keeps the pod definition).
+
+If you used a **Network Volume** mounted at `/workspace`, everything persists across stops and SCP is unnecessary.
+
+---
+
+### Common gotchas
+
+- **`chown` fails on `/workspace`** — RunPod's network volume disallows ownership changes. Use `chmod -R a+rwX /workspace/autoresearch` instead. Run as root after pulling new files.
+- **`fatal: detected dubious ownership`** when `agent` runs git in `/workspace` — fix once: `git config --global --add safe.directory /workspace/autoresearch`.
+- **Agent can't push to GitHub** — agent's SSH key may not have correct perms on the network volume. Workaround: agent commits locally only; root pushes. See the "Watching progress externally" section.
+- **`--dangerously-skip-permissions cannot be used with root/sudo privileges`** — switch to the non-root `agent` user before launching Claude.
+- **`git pull --ff-only` rejects** — usually the agent did a `git reset --hard` for a DISCARD that re-shaped local history, and origin moved forward via root push. Compare with `git log --oneline main..origin/main`; if you're sure remote is canonical, `git reset --hard origin/main`.
+- **GitHub authenticity prompt** when `agent` runs git — pre-trust the host key:
+  ```bash
+  ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+  ```
+- **Old node 12 conflict** when installing Node 20 — first `apt-get remove --purge -y nodejs libnode-dev libnode72`, then install the nodesource Node 20 package.
+
+---
+
+## Running the agent (quick reference)
+
+In the `claude` prompt, after `program.md` exists and the data is in place:
 
 ```
 Read program.md and all files listed in its Setup section.
-Begin the experiment loop now.
+Check results.tsv and git log --oneline -10 for state.
+Begin the experiment loop now. Update status.md after every meaningful step and commit locally; do NOT push — I will push from root.
 ```
 
-The agent will iterate autonomously, logging every result to `results.tsv`.
+The agent will iterate autonomously: smoke test → commit → full run → log row to `results.tsv` → KEEP/DISCARD per `program.md` rules → update `status.md` → repeat.
