@@ -23,6 +23,7 @@ TRAINING_SETTINGS = {
     "phase2_n_epochs": 50,
     "phase3_n_epochs": 50,
     "sample": None,  # set to int (e.g. 50) for a quick smoke-test
+    "phase2_use_soft_kernel": True,  # exp69 — Direction C: learnable per-class decay replaces 12h/168h two-tier
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.

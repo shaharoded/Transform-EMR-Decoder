@@ -218,6 +218,88 @@ def get_temporal_multi_hot_targets(
     return multi_hot
 
 
+def get_temporal_soft_targets(
+    target_ids: torch.Tensor,
+    all_abs_ts: torch.Tensor,
+    query_abs_ts: torch.Tensor,
+    padding_idx: int,
+    vocab_size: int,
+    tau: torch.Tensor,
+    horizon: float,
+) -> torch.Tensor:
+    """
+    Soft-kernel LM-head BCE targets — exp59's two-tier window replaced by a
+    learnable per-token-class decay constant.
+
+    For each query step t and each token id v in the vocabulary:
+        target[b, t, v] = clamp_{0..1}( sum_{s : 0 < dt(t,s) <= horizon}
+                                        exp(-dt(t,s) / tau[v])
+                                        * 1[target_ids[b, s] == v] )
+
+    Matches the formula already used by `get_future_outcome_targets` for the
+    outcome head, extended to the full LM-head vocabulary. Implementation
+    uses scatter_add along the V dimension to avoid materialising a
+    [B, T, V] one-hot intermediate — memory cost is the same as the binary
+    version's [B, T_q, V] target tensor, plus a [B, T_q, T] decay matrix.
+
+    NOTE: NOT decorated with @torch.no_grad(): gradient flows through tau so
+    the learnable `log_tau_lm` parameter trains end-to-end with the LM-head
+    BCE. The binary `get_temporal_multi_hot_targets` path remains
+    non-differentiable (boolean → float cast) so removing its no_grad would
+    be a no-op.
+
+    Args:
+        target_ids:    [B, T] token ids whose occurrences mark positives.
+        all_abs_ts:    [B, T] absolute timestamps (normalised, same units as horizon).
+        query_abs_ts:  [B, T_q] query timestamps.
+        padding_idx:   PAD id. PAD positions in target_ids contribute 0, and
+                       target[..., padding_idx] is zeroed.
+        vocab_size:    V.
+        tau:           [V] per-token-class decay constants (positive, same
+                       normalised units as horizon). Differentiable.
+        horizon:       Hard horizon — positives at dt > horizon contribute 0.
+
+    Returns:
+        FloatTensor [B, T_q, V] with soft targets in [0, 1].
+    """
+    B, T_all = target_ids.shape
+    T_q = query_abs_ts.size(1)
+    V = vocab_size
+    device = target_ids.device
+
+    # Per-source-position tau: tau_per_s[b, s] = tau[target_ids[b, s]].
+    # Clamp index to V-1 so the lookup is safe even if rare ids land outside.
+    safe_ids = target_ids.clamp(0, V - 1)
+    tau_per_s = tau[safe_ids]  # [B, T_all], differentiable
+
+    # Δt: [B, T_q, T_all]. Positive = future.
+    dt = all_abs_ts.unsqueeze(1) - query_abs_ts.unsqueeze(2)
+    in_horizon = (dt > 0) & (dt <= horizon)
+
+    # decay[b, t, s] = exp(-Δt / tau_per_s[b, s]) inside the horizon, else 0.
+    # Clamp tau ≥ 1e-6 to keep the division finite if any tau gets pushed to 0.
+    decay = torch.exp(-dt / tau_per_s.unsqueeze(1).clamp(min=1e-6))
+    decay = decay.masked_fill(~in_horizon, 0.0)
+
+    # Source-side PAD mask: PAD never contributes a positive.
+    if 0 <= padding_idx < V:
+        nonpad_src = (target_ids != padding_idx).to(decay.dtype)
+        decay = decay * nonpad_src.unsqueeze(1)
+
+    # Scatter-add into the V dim using target_ids as the column index.
+    target = torch.zeros(B, T_q, V, device=device, dtype=decay.dtype)
+    idx = target_ids.unsqueeze(1).expand(B, T_q, T_all)
+    target.scatter_add_(2, idx, decay)
+    target = target.clamp(0.0, 1.0)
+
+    if 0 <= padding_idx < V:
+        pad_mask = torch.ones(V, device=device, dtype=target.dtype)
+        pad_mask[padding_idx] = 0.0
+        target = target * pad_mask
+
+    return target
+
+
 @torch.no_grad()
 def get_future_outcome_targets(
     target_ids: torch.Tensor,      # [B, T] token ids

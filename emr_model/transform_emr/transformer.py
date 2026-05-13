@@ -420,6 +420,19 @@ class GPT(nn.Module):
         _init_log_tau = math.log(12.0 / 336.0)
         self.outcome_log_tau = nn.Parameter(torch.full((self.num_outcomes,), _init_log_tau))
 
+        # Direction C: per-token-class learnable log-tau for the LM-head
+        # multi-hot BCE soft kernel. Replaces the hard two-tier window
+        # (12h default / 168h terminals from exp59). Initialised to match
+        # the hard-window values so the soft kernel starts at exp(-1)=0.37
+        # weight at the boundary that used to give weight 1.0 — the model
+        # learns the kernel scale per class from there.
+        _log_tau_default  = math.log(12.0  / 336.0)
+        _log_tau_terminal = math.log(168.0 / 336.0)
+        _log_tau_lm = torch.full((vocab_size,), _log_tau_default)
+        if self._terminal_ids.numel() > 0:
+            _log_tau_lm[self._terminal_ids] = _log_tau_terminal
+        self.log_tau_lm = nn.Parameter(_log_tau_lm)
+
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
         # Head 2 (magnitude): regression of Δt magnitude for non-zero cases only
@@ -985,19 +998,33 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 _ABS_TS_SCALE = 336.0
                 _BCE_WIN  = training_settings.get("phase2_bce_window_hours", 12.0)            / _ABS_TS_SCALE
                 _TERM_WIN = training_settings.get("phase2_terminal_bce_window_hours", 168.0) / _ABS_TS_SCALE
-                multi_hot = get_temporal_multi_hot_targets(
-                    target_ids=full_targets,
-                    all_abs_ts=batch["abs_ts"],
-                    query_abs_ts=batch["abs_ts"][:, :-1],
-                    padding_idx=model.embedder.padding_idx,
-                    vocab_size=pred_logits.size(-1),
-                    window_size=_BCE_WIN,
-                    outcome_ids=model._outcome_ids,
-                    next_token_ids=full_targets[:, 1:],
-                    wide_tiers=[
-                        (model._terminal_ids, _TERM_WIN),
-                    ],
-                )
+                if training_settings.get("phase2_use_soft_kernel", False):
+                    # Direction C: learnable per-token-class soft decay replaces
+                    # the hard two-tier window. tau is `model.log_tau_lm.exp()`,
+                    # horizon is the terminal window (widest of the old tiers).
+                    multi_hot = get_temporal_soft_targets(
+                        target_ids=full_targets,
+                        all_abs_ts=batch["abs_ts"],
+                        query_abs_ts=batch["abs_ts"][:, :-1],
+                        padding_idx=model.embedder.padding_idx,
+                        vocab_size=pred_logits.size(-1),
+                        tau=model.log_tau_lm.exp(),
+                        horizon=_TERM_WIN,
+                    )
+                else:
+                    multi_hot = get_temporal_multi_hot_targets(
+                        target_ids=full_targets,
+                        all_abs_ts=batch["abs_ts"],
+                        query_abs_ts=batch["abs_ts"][:, :-1],
+                        padding_idx=model.embedder.padding_idx,
+                        vocab_size=pred_logits.size(-1),
+                        window_size=_BCE_WIN,
+                        outcome_ids=model._outcome_ids,
+                        next_token_ids=full_targets[:, 1:],
+                        wide_tiers=[
+                            (model._terminal_ids, _TERM_WIN),
+                        ],
+                    )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 
                 # mask out illegal classes AND PAD steps from the denominator
