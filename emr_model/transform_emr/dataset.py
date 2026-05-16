@@ -50,6 +50,9 @@ class DataProcessor:
         if not isinstance(self.repo, dict):
             raise ValueError("'taks' must be a dictionary.")
         
+        # Handle compatability issue in complete flow
+        if "StartTime" in df.columns and "EndTime" in df.columns:
+            df.rename(columns={"StartTime": "StartDateTime", "EndTime": "EndDateTime"}, inplace=True)
         df['StartDateTime'] = pd.to_datetime(df['StartDateTime'], format='ISO8601', utc=True, errors='raise')
         df['StartDateTime'] = df['StartDateTime'].dt.tz_convert(None)
         df['EndDateTime'] = pd.to_datetime(df['EndDateTime'], format='ISO8601', utc=True, errors='raise')
@@ -1229,13 +1232,15 @@ def get_dataloader(
     # that fire when DataLoader iterators are garbage-collected between epochs.
     persistent = num_workers > 0
 
-    # On Linux + CUDA the default 'fork' start method copies CUDA handles from the
-    # already-initialised parent into the workers, which deadlocks once any worker
-    # touches torch state. Forcing 'spawn' starts each worker as a fresh Python
-    # process — slower to launch, but `persistent_workers=True` amortises that to
-    # one-time-per-DataLoader. Pickle cost is fine: EMRDataset is pure-Python.
-    mp_ctx = "spawn" if (num_workers > 0 and torch.cuda.is_available()) else None
-    dl_extra = {"multiprocessing_context": mp_ctx} if mp_ctx else {}
+    # Use fork (Linux default) with pin_memory disabled.
+    # pin_memory=True triggers CUDA init when the first DataLoader iterator is
+    # created (via the pin-memory thread), after which forked workers inherit
+    # broken PyTorch thread state and die silently. Keeping pin_memory=False
+    # avoids that init; fork workers survive and run cleanly. The parallel-
+    # loading gain far exceeds the non-pinned H2D transfer cost on this model.
+    # api.py has no __main__ guard so spawn and forkserver both fail.
+    pin_memory = False
+    dl_extra = {}
 
     # ---------- no oversampling ----------
     if not oversample:
@@ -1246,7 +1251,7 @@ def get_dataloader(
                               collate_fn=collate_fn,
                               num_workers=num_workers,
                               persistent_workers=persistent,
-                              pin_memory=torch.cuda.is_available(),
+                              pin_memory=pin_memory,
                               **dl_extra)
         return DataLoader(dataset,
                           batch_size=batch_size,
@@ -1254,7 +1259,7 @@ def get_dataloader(
                           collate_fn=collate_fn,
                           num_workers=num_workers,
                           persistent_workers=persistent,
-                          pin_memory=torch.cuda.is_available(),
+                          pin_memory=pin_memory,
                           **dl_extra)
 
     # ---------- build sample weights ----------
@@ -1288,7 +1293,7 @@ def get_dataloader(
                           collate_fn=collate_fn,
                           num_workers=num_workers,
                           persistent_workers=persistent,
-                          pin_memory=torch.cuda.is_available(),
+                          pin_memory=pin_memory,
                           **dl_extra)
 
     sampler = WeightedRandomSampler(sample_w,
@@ -1301,5 +1306,5 @@ def get_dataloader(
                       collate_fn=collate_fn,
                       num_workers=num_workers,
                       persistent_workers=persistent,
-                      pin_memory=torch.cuda.is_available(),
+                      pin_memory=pin_memory,
                       **dl_extra)
