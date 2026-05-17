@@ -1,6 +1,6 @@
 # autoresearch — EMR Event Prediction
 
-Autonomous hyperparameter and architecture search for a clinical EMR sequence model.
+Autonomous hyperparameter and architecture search for my thesis's model, adapted from Karpathy's [autoresearcher](https://github.com/karpathy/autoresearch) repo.
 
 ## What this is
 
