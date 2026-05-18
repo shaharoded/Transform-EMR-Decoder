@@ -21,10 +21,8 @@ dev/
 
 # Autoresearch runtime outputs (untracked across experiments)
 results.tsv
-run.log
+*.log
 progress.png
-diag.log
-smoke.log
 .claude/
 
 # Model checkpoints (large, rebuilt each experiment)
