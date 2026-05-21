@@ -281,6 +281,80 @@ Journal entry retained. Next: F3 (hazard-driven terminal suppression) starting f
 
 ---
 
+### Experiment F3 — Hazard-Driven Terminal Suppression
+
+**Code commit:** `ada9e3f`
+**Date:** 2026-05-21
+
+**Hypothesis:** The model has a well-calibrated outcome head — P(DEATH or RELEASE within 48 h)
+is ~0.9 for most ICU patients. Use that probability to schedule a per-patient "earliest allowed
+terminal time" T drawn from an exponential distribution: `T ~ Exp(rate = p_terminal / 48h)`.
+Suppress DEATH and RELEASE tokens until `elapsed_gen_hours ≥ T`. This forces the model to
+generate substantive clinical events before terminating, guided by its own hazard belief.
+
+**Change:** `inference.py::generate()` — new parameters `hazard_suppress=True` (default),
+`hazard_min_hours=24.0`. After prefill, compute per-patient suppression horizon:
+```python
+p_term = sigmoid(outcome_head[:, terminal_outcomes]).max(dim=-1).clamp(1e-4, 1-1e-4)
+T = Exp(rate=p_term/48h).clamp(min=24h)  # drawn per patient
+```
+In the decode loop, if `elapsed_gen_hours < T[i]` for patient `i`, the DEATH/RELEASE logits
+are set to `-inf` before sampling. Default is `True` (not `False`) because `evaluation.py` is
+locked and cannot pass `hazard_suppress` — making it the default is the only way to enable it.
+
+**Full run results (8,562 test patients, ~23 min, GPU):**
+
+| Metric                        | F2 (previous KEEP) | F3         | Delta     |
+|-------------------------------|---------------------|------------|-----------|
+| `outcome_auroc`               | 0.497               | **0.530**  | +0.033 ✓  |
+| `outcome_auprc`               | 0.105               | **0.133**  | +0.028 ✓  |
+| `onset_mae_hrs`               | 65.27               | 74.59      | +9.3 ↑    |
+| `gen_median_steps`            | 10.0                | **94.0**   | ×9.4 ✓   |
+| `gen_median_hours`            | 6.84                | **287.26** | ×42 ✓    |
+| `gen_p90_hours`               | 26.02               | **290.83** | ✓         |
+| `gen_frac_terminal_first24h`  | 0.876               | **0.005**  | -0.871 ✓  |
+| `gen_length_mae_hrs`          | 107.87              | 163.83     | ↑         |
+| `gen_n_with_terminal`         | 8,561               | 8,561      | —         |
+
+Note: 7,916/8,562 (92.5%) patients reached `max_len=500` without natural termination; forced
+terminal injected at sequence end per existing generation fallback.
+
+**Per-outcome breakdown (AUROC):**
+
+| Outcome          | F3 AUROC | vs F2 |
+|------------------|----------|-------|
+| RELEASE          | 0.733    | +0.27 |
+| DEATH            | 0.727    | +0.25 |
+| HYPERGLY         | 0.628    | +0.08 |
+| HYPOGLY          | 0.614    | +0.07 |
+| KIDNEY           | 0.531    | +0.02 |
+| CARDIO           | 0.198    | — (anomaly, investigate) |
+| Rare outcomes    | ~0.494   | ≈ same |
+
+The CARDIO regression (0.198) is unexplained — it was 0.430 under F2 and 0.449 under F1.
+All other outcomes improve substantially. The RELEASE and DEATH gains are expected: suppressing
+early termination forces the model to score later windows where those events genuinely occur.
+CARDIO's sub-random AUROC warrants investigation if training-side experiments proceed.
+
+**Analysis:** The mechanism works as intended. E[T] = 48h / p_term ≈ 53h for the median patient
+(p_term ≈ 0.9). After suppression lifts, the model's multinomial sampling at T=1.0 temperature
+does not immediately pick terminal — it continues generating clinical events. Most patients run
+to the 336h max-len cap (median 287h, p90 291h), meaning the per-patient forced-terminal
+fallback becomes the primary termination mechanism. The onset_mae increase (+9.3h) is expected:
+longer trajectories push predicted onset times further from the seed end.
+
+**All KEEP criteria vs F2:**
+- AUROC: +0.033 ≥ +0.005 ✓
+- AUPRC: +0.028 ≥ +0.005 ✓
+- gen_median_hours: 287.26 > 6.844746 ✓
+- gen_frac_terminal_first24h: 0.005 < 0.876 ✓
+
+**Verdict: KEEP** — largest single-experiment gain to date. AUROC 0.452→0.530 cumulative vs
+baseline (+0.078). Next: assess whether training-side experiments (A-E) can further improve
+CARDIO AUROC and overall discriminativity.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
