@@ -394,3 +394,30 @@ print(f"embed_dim:        {MODEL_CONFIG['embed_dim']}")
 print(f"n_layer:          {MODEL_CONFIG['n_layer']}")
 print(f"n_head:           {MODEL_CONFIG['n_head']}")
 print(f"num_params:       {num_params:,}")
+
+# Per-outcome AUROC / AUPRC / window counts — grep-friendly tabular block.
+# Each emitted line is prefixed with `per_outcome\t` so `grep "^per_outcome" run.log`
+# yields a TSV that can be fed directly into pandas / a spreadsheet for AUPRC-vs-
+# prevalence interpretation. n_pos / (n_pos + n_neg) is the AUPRC random baseline.
+print("per_outcome\toutcome\tauroc\tauprc\tn_pos\tn_neg")
+_auc_table = eval_results.get("auc_table")
+if _auc_table is not None:
+    for _outcome, _row in _auc_table.iterrows():
+        _auroc = f"{_row['auroc']:.6f}" if not pd.isna(_row['auroc']) else "nan"
+        _auprc = f"{_row['auprc']:.6f}" if not pd.isna(_row['auprc']) else "nan"
+        print(f"per_outcome\t{_outcome}\t{_auroc}\t{_auprc}\t{int(_row['n_pos_windows'])}\t{int(_row['n_neg_windows'])}")
+
+# Persist the full per-outcome AUC table next to the run.log for thesis-grade
+# downstream analysis. Filename is keyed by commit so multiple runs accumulate.
+try:
+    import subprocess
+    _commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       cwd=PROJECT_ROOT).decode().strip()
+except Exception:
+    _commit = "unknown"
+if _auc_table is not None:
+    _out_dir = os.path.join(PROJECT_ROOT, "results")
+    os.makedirs(_out_dir, exist_ok=True)
+    _out_path = os.path.join(_out_dir, f"per_outcome_{_commit}.tsv")
+    _auc_table.to_csv(_out_path, sep="\t", index=True, index_label="outcome")
+    print(f"per_outcome_csv:  {os.path.relpath(_out_path, PROJECT_ROOT)}")
