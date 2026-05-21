@@ -19,7 +19,10 @@ Optimization target (all from the held-out test set, not the val split):
     onset_mae_hrs  — tertiary,  lower is better
 """
 
+import gc
+import json
 import os
+import subprocess
 import sys
 import time
 import shutil
@@ -30,6 +33,18 @@ import pandas as pd
 from joblib import load as joblib_load
 from sklearn.model_selection import train_test_split
 import torch
+
+# ----------------------------------------------------------------------------
+# Mode flag: training + eval run in SEPARATE PROCESSES so cumulative training
+# RAM cannot kill the eval step (the pattern that crashed L-384 / XL-512 in
+# the architecture sweep — autoregressive generation needs a clean memory
+# slate). When invoked normally, this script trains all three phases, saves a
+# small train_summary.json, frees memory, and subprocess.run()s itself with
+# `--eval-only`. The eval subprocess loads the saved checkpoints + summary
+# and prints the final summary block; its stdout/stderr inherit through to
+# the parent's run.log redirection so the user sees one continuous log.
+# ----------------------------------------------------------------------------
+EVAL_ONLY = "--eval-only" in sys.argv
 
 # Force UTF-8 stdout/stderr so Windows cp1252 doesn't choke on Δ, etc. in training logs
 if hasattr(sys.stdout, "reconfigure"):
@@ -224,25 +239,31 @@ def load_data(sample=None, batch_size=64):
     return embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl, tokenizer, (test_temporal_raw, test_ctx_raw)
 
 
-# ===========================================================================
-# Training orchestration
-# ===========================================================================
+TRAIN_SUMMARY_PATH = os.path.join(CHECKPOINT_DIR, "train_summary.json")
 
 t_start = time.time()
 device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}")
+print(f"Device: {device}  |  EVAL_ONLY={EVAL_ONLY}")
 
-# Clear Phase-2 and Phase-3 checkpoints for a fresh run.
-# Phase-1 (embedder) is preserved and reused when the config matches — no need
-# to re-train the embedder unless embed_dim / time2vec_dim / ctx_dim changes.
-for _phase in ["phase2", "phase3"]:
-    _phase_path = Path(CHECKPOINT_DIR) / _phase
-    if _phase_path.exists():
-        shutil.rmtree(_phase_path)
-    _phase_path.mkdir(parents=True, exist_ok=True)
-(Path(CHECKPOINT_DIR) / "phase1").mkdir(parents=True, exist_ok=True)
+# ===========================================================================
+# Training orchestration (skipped in --eval-only mode)
+# ===========================================================================
 
-# Load data — keeps raw TEST data for final held-out evaluation
+if not EVAL_ONLY:
+    # Clear Phase-2 and Phase-3 checkpoints for a fresh run.
+    # Phase-1 (embedder) is preserved and reused when the config matches — no
+    # need to re-train the embedder unless embed_dim / time2vec_dim / ctx_dim
+    # changes.
+    for _phase in ["phase2", "phase3"]:
+        _phase_path = Path(CHECKPOINT_DIR) / _phase
+        if _phase_path.exists():
+            shutil.rmtree(_phase_path)
+        _phase_path.mkdir(parents=True, exist_ok=True)
+    (Path(CHECKPOINT_DIR) / "phase1").mkdir(parents=True, exist_ok=True)
+
+# Load data — keeps raw TEST data for final held-out evaluation.
+# In --eval-only mode this hits the processed_datasets.pt cache from the
+# training run (built by the parent process) and returns in seconds.
 embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl, tokenizer, test_raw = load_data(
     sample=TRAINING_SETTINGS.get("sample"),
     batch_size=TRAINING_SETTINGS["batch_size"],
@@ -255,6 +276,28 @@ for _batch in embedder_train_dl:
 
 print(f"Model config: {MODEL_CONFIG}")
 
+if EVAL_ONLY:
+    # ─── eval-only path ──────────────────────────────────────────────────────
+    # Re-attach the saved Phase-1 embedder + Phase-3 model from disk, replay
+    # the training summary the parent process wrote, and jump straight to the
+    # final-evaluation block. No training memory ever loaded into this process.
+    print("[Eval-only] Loading deployed checkpoints from disk...")
+    embedder, *_ = EMREmbedding.load(str(Path(EMBEDDER_CHECKPOINT)), tokenizer=tokenizer)
+    train_summary = {}
+    if os.path.exists(TRAIN_SUMMARY_PATH):
+        with open(TRAIN_SUMMARY_PATH, "r") as f:
+            train_summary = json.load(f)
+        print(f"[Eval-only] Loaded train summary ({len(train_summary)} keys)")
+    else:
+        print(f"[Eval-only] No train_summary.json at {TRAIN_SUMMARY_PATH}; phase stats will be n/a.")
+    # Free the train/val dataloaders we won't use in eval-only mode.
+    del embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl
+    gc.collect()
+    # Phase-2 / Phase-3 training stat placeholders for the summary block below.
+    val_losses    = []
+    p3_val_losses = []
+    model_p3      = None
+
 # ---------------------------------------------------------------------------
 # Phase 1 — Train embedder (token + time + context representations)
 # ---------------------------------------------------------------------------
@@ -266,81 +309,118 @@ _embedder_key = (
     MODEL_CONFIG["ctx_dim"],
 )
 
-_cached_ckpt     = Path(EMBEDDER_CHECKPOINT)
-_embedder_reused = False
+if not EVAL_ONLY:
+    _cached_ckpt     = Path(EMBEDDER_CHECKPOINT)
+    _embedder_reused = False
 
-if _cached_ckpt.exists():
-    try:
-        _ckpt_cfg   = torch.load(str(_cached_ckpt), map_location="cpu", weights_only=True)["config"]
-        _cached_key = (
-            _ckpt_cfg["embed_dim"],
-            _ckpt_cfg["time2vec_dim"],
-            _ckpt_cfg["ctx_dim"],
+    if _cached_ckpt.exists():
+        try:
+            _ckpt_cfg   = torch.load(str(_cached_ckpt), map_location="cpu", weights_only=True)["config"]
+            _cached_key = (
+                _ckpt_cfg["embed_dim"],
+                _ckpt_cfg["time2vec_dim"],
+                _ckpt_cfg["ctx_dim"],
+            )
+            if _cached_key == _embedder_key:
+                print("[Phase 1]: Config unchanged — loading cached embedder, skipping training.")
+                embedder, *_ = EMREmbedding.load(str(_cached_ckpt), tokenizer=tokenizer)
+                _embedder_reused = True
+        except Exception as e:
+            print(f"[Phase 1]: Could not load cached embedder ({e}), retraining.")
+
+    if not _embedder_reused:
+        embedder = EMREmbedding(
+            tokenizer    = tokenizer,
+            ctx_dim      = MODEL_CONFIG["ctx_dim"],
+            time2vec_dim = MODEL_CONFIG["time2vec_dim"],
+            embed_dim    = MODEL_CONFIG["embed_dim"],
+            dropout      = MODEL_CONFIG["dropout"],
         )
-        if _cached_key == _embedder_key:
-            print("[Phase 1]: Config unchanged — loading cached embedder, skipping training.")
-            embedder, *_ = EMREmbedding.load(str(_cached_ckpt), tokenizer=tokenizer)
-            _embedder_reused = True
-    except Exception as e:
-        print(f"[Phase 1]: Could not load cached embedder ({e}), retraining.")
+        embedder, _, _ = train_embedder(
+            embedder          = embedder,
+            train_loader      = embedder_train_dl,
+            val_loader        = val_dl,
+            resume            = False,
+            checkpoint_path   = EMBEDDER_CHECKPOINT,
+            training_settings = TRAINING_SETTINGS,
+        )
 
-if not _embedder_reused:
-    embedder = EMREmbedding(
-        tokenizer    = tokenizer,
-        ctx_dim      = MODEL_CONFIG["ctx_dim"],
-        time2vec_dim = MODEL_CONFIG["time2vec_dim"],
-        embed_dim    = MODEL_CONFIG["embed_dim"],
-        dropout      = MODEL_CONFIG["dropout"],
-    )
-    embedder, _, _ = train_embedder(
-        embedder          = embedder,
-        train_loader      = embedder_train_dl,
-        val_loader        = val_dl,
+    # -----------------------------------------------------------------------
+    # Phase 2 — Pretrain GPT transformer over learned embeddings
+    # -----------------------------------------------------------------------
+    model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
+    model, _, val_losses = pretrain_transformer(
+        model             = model,
+        train_dl          = transformer_train_dl,
+        val_dl            = val_dl,
         resume            = False,
-        checkpoint_path   = EMBEDDER_CHECKPOINT,
+        checkpoint_path   = TRANSFORMER_CHECKPOINT,
         training_settings = TRAINING_SETTINGS,
     )
 
+    # -----------------------------------------------------------------------
+    # Phase 3 — Fine-tune outcome head (backbone frozen, natural data)
+    # -----------------------------------------------------------------------
+    _p2_best = Path(TRANSFORMER_CHECKPOINT)
+    _p2_last = _p2_best.parent / "ckpt_last.pt"
+    _p2_ckpt = _p2_best if _p2_best.exists() else (_p2_last if _p2_last.exists() else None)
+
+    if _p2_ckpt is not None:
+        model_p3, *_ = GPT.load(str(_p2_ckpt), embedder=embedder)
+    else:
+        model_p3 = model
+
+    model_p3, _, p3_val_losses = finetune_transformer(
+        model             = model_p3,
+        train_dl          = phase3_train_dl,
+        val_dl            = val_dl,
+        resume            = False,
+        checkpoint_path   = PHASE3_CHECKPOINT,
+        training_settings = TRAINING_SETTINGS,
+    )
+
+    # -----------------------------------------------------------------------
+    # Persist training summary, free memory, hand off to eval subprocess.
+    # -----------------------------------------------------------------------
+    train_summary = {
+        "phase2_best_val": float(min(val_losses)) if val_losses else float("nan"),
+        "phase2_epochs":   int(len(val_losses)),
+        "phase3_best_val": float(min(p3_val_losses)) if p3_val_losses else float("nan"),
+        "phase3_epochs":   int(len(p3_val_losses)),
+        "training_seconds": float(time.time() - t_start),
+        "embed_dim":       MODEL_CONFIG["embed_dim"],
+        "n_layer":         MODEL_CONFIG["n_layer"],
+        "n_head":          MODEL_CONFIG["n_head"],
+    }
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    with open(TRAIN_SUMMARY_PATH, "w") as f:
+        json.dump(train_summary, f, indent=2)
+    print(f"[Train] Done. Summary persisted to {TRAIN_SUMMARY_PATH}")
+
+    # Aggressively release every training reference before re-launching for
+    # eval. Even though subprocess gives a fresh address space, freeing
+    # locally keeps the brief moment both processes coexist cheap.
+    try:
+        del embedder, model, model_p3
+        del embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl
+        del val_losses, p3_val_losses
+    except NameError:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print("[Train] Re-launching api.py --eval-only in a fresh process so eval starts with a clean RAM slate...")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    completed = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--eval-only"],
+        check=False,
+    )
+    sys.exit(completed.returncode)
+
 # ---------------------------------------------------------------------------
-# Phase 2 — Pretrain GPT transformer over learned embeddings
-# ---------------------------------------------------------------------------
-
-model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
-
-model, _, val_losses = pretrain_transformer(
-    model             = model,
-    train_dl          = transformer_train_dl,
-    val_dl            = val_dl,
-    resume            = False,
-    checkpoint_path   = TRANSFORMER_CHECKPOINT,
-    training_settings = TRAINING_SETTINGS,
-)
-
-# ---------------------------------------------------------------------------
-# Phase 3 — Fine-tune outcome head (backbone frozen, natural-distribution data)
-# ---------------------------------------------------------------------------
-
-# Load best Phase-2 checkpoint as the starting point for Phase-3.
-_p2_best = Path(TRANSFORMER_CHECKPOINT)
-_p2_last = _p2_best.parent / "ckpt_last.pt"
-_p2_ckpt = _p2_best if _p2_best.exists() else (_p2_last if _p2_last.exists() else None)
-
-if _p2_ckpt is not None:
-    model_p3, *_ = GPT.load(str(_p2_ckpt), embedder=embedder)
-else:
-    model_p3 = model
-
-model_p3, _, p3_val_losses = finetune_transformer(
-    model             = model_p3,
-    train_dl          = phase3_train_dl,   # natural distribution (no oversampling)
-    val_dl            = val_dl,
-    resume            = False,
-    checkpoint_path   = PHASE3_CHECKPOINT,
-    training_settings = TRAINING_SETTINGS,
-)
-
-# ---------------------------------------------------------------------------
-# Final evaluation on held-out test set
+# Final evaluation on held-out test set (eval-only subprocess path)
 # ---------------------------------------------------------------------------
 
 # Prefer Phase-3 best, then Phase-2 best, then last in-memory model
@@ -375,10 +455,15 @@ eval_results = evaluate_on_test_set(
 t_end         = time.time()
 peak_vram_mb  = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
 num_params    = best_model.get_num_params() if hasattr(best_model, "get_num_params") else sum(p.numel() for p in best_model.parameters())
-phase2_best   = min(val_losses)    if val_losses    else float("nan")
-phase2_epochs = len(val_losses)
-phase3_best   = min(p3_val_losses) if p3_val_losses else float("nan")
-phase3_epochs = len(p3_val_losses)
+
+# Pull training-phase stats from train_summary.json (written by the parent
+# process). Falls back to in-memory variables in the rare case eval is run
+# inside the training process (e.g. while debugging).
+_ts = train_summary if EVAL_ONLY else {}
+phase2_best   = _ts.get("phase2_best_val", min(val_losses)    if val_losses    else float("nan"))
+phase2_epochs = _ts.get("phase2_epochs",   len(val_losses))
+phase3_best   = _ts.get("phase3_best_val", min(p3_val_losses) if p3_val_losses else float("nan"))
+phase3_epochs = _ts.get("phase3_epochs",   len(p3_val_losses))
 
 print("---")
 print(f"outcome_auroc:    {eval_results['mean_auroc']:.6f}")
