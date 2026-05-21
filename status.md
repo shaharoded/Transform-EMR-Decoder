@@ -43,6 +43,51 @@ onset-MAE, then mean across complications with ≥ 3 positive windows.
 
 Mean AUPRC across all six complications: **0.6298**.
 
+### Class support and metric interpretation
+
+Class imbalance is large and varies by outcome. The numbers below are the actual
+positive-window prevalence on the held-out test split (8,562 patients,
+~45,876 evaluation windows per outcome), computed with the same windowing
+`evaluation.py` uses (24 h non-overlapping windows after a 2-day seed, ±24 h
+grace, 14-day horizon):
+
+| Outcome   | Window prevalence | Patients with ≥1 positive window | Random AUPRC | Model AUROC |
+|-----------|-------------------|----------------------------------|--------------|-------------|
+| CARDIO    | 1.70 %            | 3.7 %                            | 0.017        | 0.968       |
+| DEATH     | 3.67 %            | 10.6 %                           | 0.037        | 0.943       |
+| HYPOGLY   | 3.84 %            | 7.4 %                            | 0.038        | 0.916       |
+| KIDNEY    | 15.78 %           | 23.7 %                           | 0.158        | 0.911       |
+| HYPERGLY  | 21.85 %           | 32.3 %                           | 0.218        | 0.936       |
+| RELEASE   | 30.77 %           | 87.0 %                           | 0.308        | 0.817       |
+| **Mean**  | **12.94 %**       | —                                | **0.129**    | **0.9150**  |
+
+**Why both metrics are reported, and how to read them.**
+
+AUROC measures the probability that a random positive window is scored higher
+than a random negative window. Its random baseline is fixed at 0.5 regardless
+of prevalence, and the FPR axis is normalised by the (large) negative count, so
+a model can post a high AUROC even when most of its positive-class alerts are
+false in absolute terms — the false alarms barely move FPR. With prevalences
+as low as 1.7 % (CARDIO) and 3.7 % (DEATH), AUROC alone risks looking better
+than the operational behaviour warrants.
+
+AUPRC fixes that. Its random baseline equals the positive-class prevalence,
+so the baselines per outcome above (0.017 to 0.308) anchor what "lift" means:
+the mean AUPRC of 0.630 sits at **~4.9× the chance baseline of 0.129**, which
+is the headline number. For the rarest outcomes (CARDIO 0.017, DEATH 0.037)
+the lift is much larger; for RELEASE (0.308, near-every-patient) it is modest
+because the chance baseline is already high. Both metrics are kept because
+they answer complementary questions:
+
+- **AUROC** — does the model rank positive windows above negative windows
+  on average? Standard in the medical literature.
+- **AUPRC** — at any chosen alert threshold, how many of the model's alerts
+  are real? More sensitive to false-positive cost and to prevalence.
+
+Per-outcome AUPRC would let us compute per-outcome lift directly; that view is
+not yet logged but is straightforward to add by re-running `evaluate_on_test_set`
+and saving the full `auc_table` instead of just the mean.
+
 ---
 
 ## 2. Architecture sweep
