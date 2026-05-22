@@ -101,20 +101,50 @@ sensible values. Check, in the smoke's per-epoch print lines (`tr_bce`,
 If all four hold, the loss is *wired*. Whether it actually helps is what
 the **full run** measures (see KEEP / DISCARD rules below).
 
-### Gate 3 — every change starts from the canonical baseline
+### Gate 3 — never chain on top of another experiment; let `api.py` manage reuse
 
-Before each training experiment:
+`api.py` already does the right thing on every run:
 
-```bash
-rm -rf emr_model/checkpoints
-cp -r emr_model/checkpoints.bak_originals emr_model/checkpoints
-```
+- **Phase 2 and Phase 3** are wiped (`shutil.rmtree`) at startup, so they
+  always train **from scratch**. No "resume from previous experiment's
+  `ckpt_last`" ever happens. All three training calls use `resume=False`.
+- **Phase 1** is **cache-hit** when the architecture key
+  `(embed_dim, time2vec_dim, ctx_dim)` matches the cached checkpoint —
+  it loads instantly and skips retraining. Otherwise it retrains.
+- **`processed_datasets.pt`** is invariant across model experiments
+  (keyed on data config, not model config). Kept; saves ~10 min per run.
 
-Never chain on top of a previous experiment's "fixed" backbone. Each
-experiment's headline must be measured **against the canonical baseline**,
-not against the most recent intermediate.
+You only manually intervene in **two** cases:
 
-Only when all three gates pass → run `python api.py > run.log 2>&1`.
+1. **Your experiment modifies the Phase-1 architecture or its loss.**
+   Force a retrain by deleting the cached embedder:
+   ```bash
+   rm -f emr_model/checkpoints/phase1/ckpt_best.pt
+   ```
+2. **The Phase-1 checkpoint on disk got clobbered** (e.g. by a previous
+   experiment that did modify it). Restore from canonical:
+   ```bash
+   cp -f emr_model/checkpoints.bak_originals/phase1/ckpt_best.pt \
+         emr_model/checkpoints/phase1/ckpt_best.pt
+   ```
+
+For most experiments on this branch (training-side and inference-side
+both), **you do not need to touch checkpoints between experiments**. The
+canonical Phase-1 stays cached on disk; Phase 2/3 are always rebuilt; the
+data cache stays. That's the intended steady state.
+
+**Forbidden** (this was the previous session's failure mode):
+
+- Do **NOT** use `phase2_warm_start_path` / `phase3_warm_start_path` to
+  load a previous experiment's Phase 2/3 as the starting point for a new
+  experiment. Each experiment must train Phase 2 and Phase 3 from scratch
+  from the canonical Phase-1 cache.
+- Do **NOT** measure an experiment's verdict against a previous
+  experiment's checkpoint. The canonical baseline (the deployed M-256
+  checkpoints + their `multi_horizon` curve in Section 1b of `status.md`)
+  is the only KEEP/DISCARD reference.
+
+Only when all three gates pass → `python api.py > run.log 2>&1`.
 
 ---
 
