@@ -893,7 +893,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             model.eval()
 
         total_loss = total_bce = total_ce = total_dt = total_ranking = total_traj = 0.0
+        total_ranking_long = 0.0
         total_ce_raw = total_dt_raw = total_ranking_raw = total_traj_raw = 0.0
+        total_ranking_long_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -1083,15 +1085,37 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 )
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
+                # === Loss: Pairwise ranking, LONG horizon (direction G) ===
+                # Same outcome head, same per-outcome learnable tau — only the hard
+                # horizon changes (48 h → 168 h), so slow-developing outcomes
+                # (CARDIO/KIDNEY) get non-zero soft labels at positions where the
+                # short-horizon target is hard-zeroed. Calibrated by the scheduler at
+                # stage-1 unlock; raw loss computed every epoch so calibration can fire.
+                _HORIZON_LONG = training_settings.get("outcome_horizon_hours_long", 168.0) / _ABS_TS_SCALE
+                outcome_targets_long = get_future_outcome_targets(
+                    target_ids=full_targets,
+                    outcome_ids=outcome_token_ids,
+                    all_abs_ts=batch["abs_ts"],
+                    query_abs_ts=batch["abs_ts"][:, :-1],
+                    tau=_TAU,
+                    horizon=_HORIZON_LONG,
+                )  # [B, T-1, K]
+                _rank_pos_long = (outcome_targets_long > 0.0) & valid_pos
+                _rank_neg_long = (outcome_targets_long == 0.0) & valid_pos
+                loss_ranking_long_raw = pairwise_ranking_loss(
+                    outcome_pred, _rank_pos_long, _rank_neg_long,
+                )
+                loss_ranking_long = lambdas.get("ranking_long", 0.0) * loss_ranking_long_raw
+
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + loss_ranking_long + traj_length_loss
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "traj": traj_length_loss, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "ranking_long": loss_ranking_long, "traj": traj_length_loss, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1126,8 +1150,10 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce_raw      += loss_ce_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
-                total_traj        += traj_length_loss.item()
-                total_traj_raw    += traj_length_loss_raw.item()
+                total_traj             += traj_length_loss.item()
+                total_traj_raw         += traj_length_loss_raw.item()
+                total_ranking_long     += loss_ranking_long.item()
+                total_ranking_long_raw += loss_ranking_long_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1147,24 +1173,28 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_dt      / n_batches,
             total_ranking / n_batches,
+            total_ranking_long / n_batches,
             total_traj    / n_batches,
             total_ce_raw      / n_batches,
             total_dt_raw      / n_batches,
             total_ranking_raw / n_batches,
+            total_ranking_long_raw / n_batches,
             total_traj_raw    / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_traj, tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_traj_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_traj, _, _, _, _                                       = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        (tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ranking_long, tr_traj,
+         tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_ranking_long_raw, tr_traj_raw) = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        (vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_ranking_long, vl_traj,
+         _, _, _, _, _)                                                           = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f}, Traj={tr_traj:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f}, Traj={vl_traj:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f} traj={tr_traj_raw:.7f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f}, RankLong={tr_ranking_long:.4f}, Traj={tr_traj:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f}, RankLong={vl_ranking_long:.4f}, Traj={vl_traj:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f} ranking_long={tr_ranking_long_raw:.7f} traj={tr_traj_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1173,6 +1203,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             ranking=tr_ranking_raw,
+            ranking_long=tr_ranking_long_raw,
             traj=tr_traj_raw,
         )
         for msg in schedule_events:

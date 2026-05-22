@@ -71,20 +71,26 @@ TRAINING_SETTINGS = {
     "phase2_scheduler": {
         "bce_only_epochs": 4,
         "aux_fraction_caps": {
-            "ce":      0.50,    # Next-token CE nudge cap
-            "dt":      0.50,    # Time regression cap
-            "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
-            "traj":    0.30,    # Trajectory-length cumulative-Δt loss (direction B)
+            "ce":           0.50,   # Next-token CE nudge cap
+            "dt":           0.50,   # Time regression cap
+            "ranking":      0.20,   # Pairwise ranking on outcome head, 48 h horizon (short-term AUROC proxy)
+            "ranking_long": 0.20,   # W (direction G): pairwise ranking on outcome head, 168 h horizon
+            "traj":         0.30,   # Trajectory-length cumulative-Δt loss (direction B)
         },
-        "order": [["ce", "dt", "traj"], ["ranking"]],
+        # Stage 1 unlocks BOTH ranking heads together once stage 0 plateaus.
+        # ranking saturates in 3 epochs; ranking_long ramps over 10 — direction G's
+        # "multi-day weight ramping up" — so the long-horizon signal grows after the
+        # short-horizon signal has anchored the outcome head.
+        "order": [["ce", "dt", "traj"], ["ranking", "ranking_long"]],
         "ramp_epochs": {
-            "ce":      0,
-            "dt":      0,
-            "traj":    0,   # Activates with stage-0 auxiliaries; calibrated at first active epoch
-            "ranking": 3,   # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
+            "ce":           0,
+            "dt":           0,
+            "traj":         0,
+            "ranking":      3,
+            "ranking_long": 10,
         },
         "plateau_min_delta": 1e-3,
-        "plateau_patience":  [2],  # Patience per transition: [0→1]
+        "plateau_patience":  [2],
     },
 
     # Outcome head — time-decayed soft labels.
@@ -93,5 +99,9 @@ TRAINING_SETTINGS = {
     # tau_k is a per-outcome learnable parameter (model.outcome_log_tau), initialised
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
-    "outcome_horizon_hours": 48.0,
+    "outcome_horizon_hours":      48.0,
+    # W (direction G): long-horizon used by the ranking_long aux only. Phase 2/3
+    # outcome BCE + the short-horizon ranking aux keep their 48 h targets — this is
+    # purely an additive multi-day signal layered on top.
+    "outcome_horizon_hours_long": 168.0,
 }
