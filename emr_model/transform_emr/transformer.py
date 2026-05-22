@@ -393,20 +393,6 @@ class GPT(nn.Module):
             nn.Linear(cfg["embed_dim"], self.num_outcomes)
         )
 
-        # Q (direction C): Time-to-terminal regression head.
-        # Auxiliary regression on log1p(t_terminal - t_now) at every non-terminal
-        # position. Provides explicit temporal-distance signal that the per-position
-        # dt MSE doesn't capture: tells the backbone how FAR terminal is, not just
-        # what the next single-step Δt is. The hypothesis (program.md direction C)
-        # is that this auxiliary forces the hidden state to encode time-to-terminal,
-        # which then propagates to the LM-head and dt-head behaviour.
-        self.ttt_head = nn.Sequential(
-            nn.Linear(cfg["embed_dim"], cfg["embed_dim"] // 2),
-            nn.GELU(),
-            nn.Dropout(cfg["dropout"]),
-            nn.Linear(cfg["embed_dim"] // 2, 1)
-        )
-
         # Vocab positions for ALL OUTCOMES+TERMINAL_OUTCOMES that exist in vocab.
         # Broader than outcome_names (includes outcomes filtered by rarity); used
         # for the 1-hot override in multi-hot BCE targets during phase-2 training.
@@ -601,13 +587,7 @@ class GPT(nn.Module):
         delta_pos = gate_prob * mag_pos
         abs_t_pred = abs_ts + delta_pos                # [B, T]
 
-        # Q (direction C): time-to-terminal regression head output.
-        # Predicts log1p(dt_to_terminal_normalised) at every position. Used as
-        # an auxiliary signal during Phase 2 training; ignored at inference
-        # (decoder doesn't need it once the backbone has been shaped by this loss).
-        ttt_pred = self.ttt_head(x).squeeze(-1)        # [B, T]
-
-        return logits, abs_t_pred, outcome_logits, gate_logit, ttt_pred
+        return logits, abs_t_pred, outcome_logits, gate_logit
 
 
     @torch.no_grad()
@@ -936,7 +916,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
                 # === Original logits from Model ===
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    logits, abs_t_pred, outcome_logits, dt_gate_logit, ttt_pred = model(
+                    logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
@@ -946,7 +926,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     )
                 logits = logits.float()
                 abs_t_pred = abs_t_pred.float()
-                ttt_pred = ttt_pred.float()
                 outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
                 dt_gate_logit = dt_gate_logit.float()
 
@@ -1053,32 +1032,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 abs_t_loss_raw = gate_loss + mag_loss
                 abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
-                # Q (direction C): time-to-terminal regression loss.
-                # For each query position t, regress log1p(t_terminal - t_now)
-                # (hours, unnormalised). Forces backbone hidden state to encode
-                # how far terminal is from the current position. Hypothesis:
-                # explicit TTT signal reshapes the time-head / LM-head distribution
-                # so the model "knows" terminal is far away at the seed-end
-                # position (the position where retraining collapses to large Δt).
-                if model._terminal_ids.numel() > 0:
-                    _is_term_full = torch.isin(full_targets, model._terminal_ids)
-                    _term_abs = batch["abs_ts"].clone()
-                    _term_abs[~_is_term_full] = float("inf")
-                    _first_term_t = _term_abs.min(dim=-1, keepdim=True).values  # [B, 1]
-                    _q_abs = batch["abs_ts"][:, :-1]                              # [B, T-1]
-                    _dt_to_term = (_first_term_t - _q_abs).clamp(min=0)           # [B, T-1]
-                    _ttt_target = torch.log1p(_dt_to_term * 336.0)                # log1p(hours)
-                    _ttt_pred_q = ttt_pred[:, :-1]                                # [B, T-1]
-                    _ttt_valid  = nonpad & (_dt_to_term > 0)
-                    if _ttt_valid.any():
-                        ttt_loss_raw = F.mse_loss(_ttt_pred_q[_ttt_valid], _ttt_target[_ttt_valid])
-                    else:
-                        ttt_loss_raw = torch.tensor(0.0, device=ttt_pred.device)
-                else:
-                    ttt_loss_raw = torch.tensor(0.0, device=ttt_pred.device)
-                _ttt_lam = training_settings.get("phase2_ttt_lambda", 0.5)
-                ttt_loss = _ttt_lam * ttt_loss_raw
-
                 # O (direction B): trajectory-length loss.
                 # Penalises systematic Δt-prediction bias that per-position MSE
                 # misses. Per-position MSE only minimises |pred[t] - true[t]|² per
@@ -1127,14 +1080,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss + ttt_loss
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "traj": traj_length_loss, "ttt": ttt_loss, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "traj": traj_length_loss, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1392,7 +1345,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 # inside GPT.forward also re-enters autocast for backward). Matches
                 # Phase-2 precision regime and cuts activation memory roughly in half.
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    logits, _, outcome_logits, _, _ = model(
+                    logits, _, outcome_logits, _ = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
