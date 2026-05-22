@@ -92,9 +92,4 @@ TRAINING_SETTINGS = {
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
     "outcome_horizon_hours": 48.0,
-    # Phase 3 uses a longer horizon so late-developing outcomes (CARDIO, NEUROVASC)
-    # receive training signal. Phase 2 is intentionally kept at 48h to preserve
-    # backbone token-timing behavior (api.py retrains Phase 2 from scratch each run;
-    # changing this setting breaks gen_median_steps).
-    "phase3_outcome_horizon_hours": 168.0,
 }
