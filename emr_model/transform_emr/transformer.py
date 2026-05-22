@@ -1240,19 +1240,19 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         Enable gradients on all params; the optimizer's per-group LRs control the
         effective freeze (backbone LR is multiplied by phase3_backbone_lr_factor).
 
-        outcome_log_tau is hard-frozen in Phase 3 — letting it drift here destroys
-        the RELEASE signal Phase 2 built. The soft-label decay constants are a
-        Phase-2 decision; Phase 3 only refines the classifier weights.
+        outcome_log_tau is trainable in Phase 3 (placed in the head group at p3_lr)
+        so each outcome's decay constant can self-calibrate to its natural timescale
+        under the extended phase3_outcome_horizon_hours.
         """
         for param in m.parameters():
             param.requires_grad_(True)
-        m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head"}
+        # outcome_log_tau joins the head group so it trains at p3_lr, not backbone_lr.
+        head_names = {"outcome_head", "outcome_log_tau"}
         backbone_params = [p for n, p in m.named_parameters()
                            if not any(h in n for h in head_names)]
-        head_params = list(m.outcome_head.parameters())
+        head_params = list(m.outcome_head.parameters()) + [m.outcome_log_tau]
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1283,15 +1283,34 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         start_epoch += 1
         print(f"[Phase-3]: Resumed at epoch {start_epoch} (best val: {best_val:.4f})")
     else:
+        # Per-outcome tau initialisation aligned with each outcome's clinical timescale.
+        # DEATH/RELEASE/HYPOGLY develop within 24h → tau=24h.
+        # CARDIO/NEUROVASC/RETINOPATHY develop over days → tau=120h.
+        # Everything else (HYPERGLY, KIDNEY, ACIDOSIS, …) → tau=48h.
+        _SHORT_TAU_KW = ('DEATH', 'RELEASE', 'Hypoglycemia')
+        _LONG_TAU_KW  = ('CARDIO', 'NEUROVASC', 'RETINOPATHY')
+        for i, oname in enumerate(valid_outcomes):
+            if any(k in oname for k in _SHORT_TAU_KW):
+                tau_h = 24.0
+            elif any(k in oname for k in _LONG_TAU_KW):
+                tau_h = 120.0
+            else:
+                tau_h = 48.0
+            model.outcome_log_tau.data[i] = math.log(tau_h / 336.0)
         model.to(device)
+        tau_summary = {n: round(math.exp(model.outcome_log_tau.data[i].item()) * 336, 1)
+                       for i, n in enumerate(valid_outcomes)}
+        print(f"[Phase-3]: Per-outcome tau_h init: {tau_summary}")
         print(f"[Phase-3]: Fine-tuning outcome head (backbone_lr_factor={backbone_lr_factor})...")
 
     train_losses, val_losses = [], []
 
     _ABS_TS_SCALE = 336.0
-    _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
-    # Read the learnable per-outcome tau from the model. In Phase 3 the param
-    # continues to be trained alongside the outcome head.
+    # Phase 3 uses phase3_outcome_horizon_hours (168h) to give late-developing
+    # outcomes (CARDIO, NEUROVASC) training signal. Phase 2 keeps outcome_horizon_hours
+    # (48h) so the backbone's token-timing behavior is not affected.
+    _HORIZON = training_settings.get("phase3_outcome_horizon_hours",
+               training_settings.get("outcome_horizon_hours", 48.0)) / _ABS_TS_SCALE
 
     use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
 
