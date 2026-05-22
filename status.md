@@ -715,6 +715,29 @@ Added to total loss with `phase2_traj_length_lambda=1.0`.
 
 ---
 
+### CRITICAL FIX (post-experiments P-T): Trajectory-length loss scheduler integration
+
+**Date:** 2026-05-22 (mid-session)
+**Bug:** Original O (commit `c6c1c05`) added `traj_length_loss` with raw `phase2_traj_length_lambda=1.0` *outside* the LambdaScheduleController. At Phase-2 init, the magnitude head's softplus output ≈ 0.69 (i.e. ~232h per step), producing per-batch cumulative-Δt MSE ≈ 31000 vs BCE ≈ 0.42. The traj_loss dominated gradients by ~70,000× and **starved BCE/CE/Δt of gradient signal** — those losses stayed flat for all 27 epochs of "training". The user (reviewing the loss logs) caught this. **All subsequent experiments P (narrow-tau), Q (TTT-head), R (mag-cap), S (R+Q), T (soft-pen) were built on an untrained backbone — their results are invalid.**
+
+**Fix (`19682c5`):** Add `traj` to `phase2_scheduler.aux_fraction_caps={traj: 0.30}` and stage-0 `order`. The LambdaScheduleController now calibrates `λ_traj = 0.30 * tr_bce / tr_traj_raw` at the first active epoch (post BCE-only warmup), bounding traj contribution to 30% of BCE. Same calibration regime as ce/dt/ranking.
+
+**Verification (O2 run, raw inference baseline):**
+- BCE descends 0.40→0.32 ✓ (was flat in broken O)
+- CE descends 1.30→1.18 ✓
+- Δt descends 0.82→0.71 ✓
+- traj descends 31000→11000 (raw) ✓
+- phase2_best_val: **0.383** (vs broken O's 5196 — scale restored)
+- AUROC: 0.499→0.503 (flat vs raw baseline)
+- gen_median_hours: 1.08→211h (eliminated trajectory collapse) ✓
+- gen_frac_terminal_first24h: 0.999→0.0 ✓
+
+**Implication:** Failed experiments P/Q/R/S/T must be re-run on top of the fixed backbone (O2). Their previous DISCARD verdicts are not reliable because the underlying backbone wasn't training.
+
+**Also in this cleanup:** Rolled back F2/F3/F4 inference defaults (`temperature_start=1.0`, `hazard_suppress=False`, `freeze_risk_at_seed=False`) to raw baseline per user instruction — inference modifications will be re-applied once backbone stabilises.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
