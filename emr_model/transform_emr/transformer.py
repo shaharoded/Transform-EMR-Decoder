@@ -434,13 +434,31 @@ class GPT(nn.Module):
         # complications. Model still learns per-class scale from these inits.
         _log_tau_default  = math.log(12.0  / 336.0)
         _log_tau_outcome  = math.log(48.0  / 336.0)
-        _log_tau_terminal = math.log(168.0 / 336.0)
+        # P (direction E, combined with O's trajectory-length loss):
+        # Narrow tau_terminal from 168h to 12h. The wide 168h kernel taught the
+        # backbone that TERMINAL is likely at every position (most sequences
+        # end within 168h). N alone failed (gen_median_steps=4) but combined
+        # with O's traj-length signal, narrow tau may permit the model to
+        # actually use the additional capacity for non-TERMINAL events.
+        _log_tau_terminal = math.log(12.0 / 336.0)
         _log_tau_lm = torch.full((vocab_size,), _log_tau_default)
         if self._outcome_ids.numel() > 0:
             _log_tau_lm[self._outcome_ids] = _log_tau_outcome
         if self._terminal_ids.numel() > 0:
             _log_tau_lm[self._terminal_ids] = _log_tau_terminal
         self.log_tau_lm = nn.Parameter(_log_tau_lm)
+
+        # P: freeze tau_lm at terminal indices so the optimiser cannot drift
+        # tau_terminal back toward 168h. Gradient hook zeros gradient at
+        # terminal indices; non-terminal taus remain fully learnable.
+        if self._terminal_ids.numel() > 0:
+            _frozen_term_ids_list = self._terminal_ids.tolist()
+            def _freeze_terminal_tau_grad(grad):
+                grad = grad.clone()
+                for _tid in _frozen_term_ids_list:
+                    grad[_tid] = 0.0
+                return grad
+            self.log_tau_lm.register_hook(_freeze_terminal_tau_grad)
 
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
