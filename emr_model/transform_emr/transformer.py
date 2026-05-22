@@ -1173,7 +1173,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             bad_epochs = 0
         elif epoch >= warmup_gate:
             bad_epochs += 1
-            if bad_epochs >= training_settings["early-stop-patience"]:
+            _p2_patience = training_settings.get("phase2_early_stop_patience",
+                           training_settings["early-stop-patience"])
+            if bad_epochs >= _p2_patience:
                 print("[Phase-2]: Early stopping triggered.")
                 break
         else:
