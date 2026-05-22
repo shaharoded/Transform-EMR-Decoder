@@ -591,6 +591,38 @@ The original Phase 2 checkpoint (which gave gen_median_steps=94) was created wit
 
 ---
 
+### Experiment L — Dense Generation via Time-Delta Cap + Extended Hazard Suppression
+
+**Date:** 2026-05-22
+**Code commit:** `7a5e25f` (reverted — DISCARD)
+**Mode:** eval-only on K checkpoint (no retraining)
+
+**Hypothesis:** K's gen_median_steps=4 comes from sparse windows (4 windows per patient instead of 94). Capping per-step time-delta at 3h (`max_step_hours=3.0`) and forcing full-trajectory suppression (`hazard_min_hours=336.0`) should restore dense ~96-step trajectories, improving window coverage and hence AUROC.
+
+**Changes (inference.py only):**
+- `hazard_min_hours` default: 24h → 336h (all patients suppressed until time_exceeded)
+- `max_step_hours=3.0` new parameter (cap per-step Δt to 3h/336 in normalized units)
+
+**Results (eval-only on K checkpoint):**
+
+| Metric                        | K (retrained) | L (eval-only) | Delta     |
+|-------------------------------|---------------|---------------|-----------|
+| `outcome_auroc`               | 0.499202      | **0.498281**  | −0.001    |
+| `gen_median_steps`            | 4.0           | **71.0**      | ×17.8 ✓  |
+| `gen_frac_terminal_first24h`  | 0.007         | **0.0**       | ✓         |
+
+Per-outcome: DEATH +0.046, HYPERGLY +0.039, RELEASE +0.036, KIDNEY −0.028, HYPOGLY −0.031, CARDIO −0.068. Mixed changes.
+
+**Post-mortem:** Dense windows alone cannot compensate for poor seed-end risk scores. The retrained Phase 3 (trained on broken backbone) produces weak between-patient discrimination. AUROC is unchanged despite 17× more windows per patient. The broken backbone generates poor hidden-state representations at the 2-day seed-end position → Phase 3 head learns poor risk scores → AUROC ≈ 0.50 regardless of window count.
+
+**Root cause confirmed:** Must fix Phase 2 backbone encoding quality (not just inference coverage). The TERMINAL-dominant BCE in Phase 2 prevents the backbone from learning rich temporal representations.
+
+**Verdict: DISCARD.**
+
+**Next: Experiment M — Anti-terminal-dominance training mask.** Zero out TERMINAL soft-labels in Phase 2 BCE at positions where the true terminal is >24h away. Forces backbone to learn non-TERMINAL distributions for early positions.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
