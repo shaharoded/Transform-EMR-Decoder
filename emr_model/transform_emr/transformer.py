@@ -1173,9 +1173,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             bad_epochs = 0
         elif epoch >= warmup_gate:
             bad_epochs += 1
-            _p2_patience = training_settings.get("phase2_early_stop_patience",
-                           training_settings["early-stop-patience"])
-            if bad_epochs >= _p2_patience:
+            if bad_epochs >= training_settings["early-stop-patience"]:
                 print("[Phase-2]: Early stopping triggered.")
                 break
         else:
@@ -1242,18 +1240,19 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         Enable gradients on all params; the optimizer's per-group LRs control the
         effective freeze (backbone LR is multiplied by phase3_backbone_lr_factor).
 
-        outcome_log_tau is trainable in Phase 3 (head param group, p3_lr) so each
-        outcome's decay constant self-calibrates under phase3_outcome_horizon_hours.
+        outcome_log_tau is hard-frozen in Phase 3 — letting it drift here destroys
+        the RELEASE signal Phase 2 built. The soft-label decay constants are a
+        Phase-2 decision; Phase 3 only refines the classifier weights.
         """
         for param in m.parameters():
             param.requires_grad_(True)
+        m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
-        # outcome_log_tau joins the head group so it trains at p3_lr, not backbone_lr.
-        head_names = {"outcome_head", "outcome_log_tau"}
+        head_names = {"outcome_head"}
         backbone_params = [p for n, p in m.named_parameters()
                            if not any(h in n for h in head_names)]
-        head_params = list(m.outcome_head.parameters()) + [m.outcome_log_tau]
+        head_params = list(m.outcome_head.parameters())
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1284,30 +1283,15 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         start_epoch += 1
         print(f"[Phase-3]: Resumed at epoch {start_epoch} (best val: {best_val:.4f})")
     else:
-        # Per-outcome tau init based on each outcome's clinical timescale.
-        _SHORT_TAU_KW = ('DEATH', 'RELEASE', 'Hypoglycemia')
-        _LONG_TAU_KW  = ('CARDIO', 'NEUROVASC', 'RETINOPATHY')
-        for i, oname in enumerate(valid_outcomes):
-            if any(k in oname for k in _SHORT_TAU_KW):
-                tau_h = 24.0
-            elif any(k in oname for k in _LONG_TAU_KW):
-                tau_h = 120.0
-            else:
-                tau_h = 48.0
-            model.outcome_log_tau.data[i] = math.log(tau_h / 336.0)
         model.to(device)
-        tau_summary = {n: round(math.exp(model.outcome_log_tau.data[i].item()) * 336, 1)
-                       for i, n in enumerate(valid_outcomes)}
-        print(f"[Phase-3]: Per-outcome tau_h init: {tau_summary}")
         print(f"[Phase-3]: Fine-tuning outcome head (backbone_lr_factor={backbone_lr_factor})...")
 
     train_losses, val_losses = [], []
 
     _ABS_TS_SCALE = 336.0
-    # Phase 3 uses phase3_outcome_horizon_hours (168h) for late-developing outcome signal.
-    # Phase 2 keeps outcome_horizon_hours (48h) to preserve backbone token-timing.
-    _HORIZON = training_settings.get("phase3_outcome_horizon_hours",
-               training_settings.get("outcome_horizon_hours", 48.0)) / _ABS_TS_SCALE
+    _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
+    # Read the learnable per-outcome tau from the model. In Phase 3 the param
+    # continues to be trained alongside the outcome head.
 
     use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
 
