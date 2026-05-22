@@ -92,4 +92,14 @@ TRAINING_SETTINGS = {
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
     "outcome_horizon_hours": 48.0,
+
+    # M: Anti-terminal-dominance training mask for Phase-2 BCE.
+    # At positions where the TRUE time-to-terminal > this threshold, TERMINAL
+    # token soft-labels are zeroed out. Prevents Phase-2 BCE from driving the
+    # backbone into a TERMINAL-dominant local minimum by teaching TERMINAL at
+    # all positions (even 200h before actual discharge/death).
+    # With threshold=24h: TERMINAL only gets BCE gradient within the last 24h
+    # before the actual terminal event — everywhere else the backbone must learn
+    # to predict clinical events instead.
+    "phase2_terminal_threshold_hours": 24.0,
 }

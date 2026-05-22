@@ -998,6 +998,29 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 
+                # M: anti-terminal-dominance mask.
+                # Zero out TERMINAL soft-labels at positions where the ground-truth
+                # terminal token is >threshold hours away. This prevents Phase-2 BCE
+                # from driving the backbone into the TERMINAL-dominant local minimum.
+                # Without this, the BCE kernel (tau_terminal=168h) gives every position
+                # high TERMINAL weight (most sequences end within 168h), teaching
+                # TERMINAL at ALL positions — causing gen_median_steps=4 collapse.
+                _term_thresh = training_settings.get("phase2_terminal_threshold_hours", None)
+                if _term_thresh is not None and model._terminal_ids.numel() > 0:
+                    _T_THRESH = _term_thresh / _ABS_TS_SCALE
+                    # Find earliest terminal token time in each sequence
+                    _is_term = torch.isin(full_targets, model._terminal_ids)  # [B, T]
+                    _term_abs = batch["abs_ts"].clone()
+                    _term_abs[~_is_term] = float("inf")
+                    _first_term_t = _term_abs.min(dim=-1, keepdim=True).values  # [B, 1]
+                    # Query times (the positions from which we're predicting)
+                    _q_abs = batch["abs_ts"][:, :-1]                            # [B, T-1]
+                    _dt_to_term = (_first_term_t - _q_abs).clamp(min=0)         # [B, T-1]
+                    _not_imminent = _dt_to_term > _T_THRESH                     # [B, T-1]
+                    for _tid in model._terminal_ids.tolist():
+                        if 0 <= _tid < multi_hot.size(-1):
+                            multi_hot[:, :, _tid] *= (~_not_imminent).float()
+
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = nonpad.unsqueeze(-1)            # [B,T,1] bool
                 allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool
