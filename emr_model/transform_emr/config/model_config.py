@@ -91,5 +91,5 @@ TRAINING_SETTINGS = {
     # tau_k is a per-outcome learnable parameter (model.outcome_log_tau), initialised
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
-    "outcome_horizon_hours": 168.0,
+    "outcome_horizon_hours": 48.0,
 }

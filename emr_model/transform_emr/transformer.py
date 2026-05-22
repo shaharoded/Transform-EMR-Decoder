@@ -1240,18 +1240,19 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         Enable gradients on all params; the optimizer's per-group LRs control the
         effective freeze (backbone LR is multiplied by phase3_backbone_lr_factor).
 
-        outcome_log_tau is trainable in Phase 3 so it can adapt to the extended
-        outcome_horizon_hours. It is placed in the head param group (p3_lr) rather
-        than the backbone group.
+        outcome_log_tau is hard-frozen in Phase 3 — letting it drift here destroys
+        the RELEASE signal Phase 2 built. The soft-label decay constants are a
+        Phase-2 decision; Phase 3 only refines the classifier weights.
         """
         for param in m.parameters():
             param.requires_grad_(True)
+        m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head", "outcome_log_tau"}
+        head_names = {"outcome_head"}
         backbone_params = [p for n, p in m.named_parameters()
                            if not any(h in n for h in head_names)]
-        head_params = list(m.outcome_head.parameters()) + [m.outcome_log_tau]
+        head_params = list(m.outcome_head.parameters())
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1282,13 +1283,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         start_epoch += 1
         print(f"[Phase-3]: Resumed at epoch {start_epoch} (best val: {best_val:.4f})")
     else:
-        # Reset tau to match the extended outcome_horizon_hours (96h for 168h horizon).
-        # tau=96h → exp(-168/96)=0.17 weight at the horizon edge; gives meaningful
-        # training signal for late-developing outcomes like CARDIO.
-        new_tau_init = math.log(96.0 / 336.0)
-        model.outcome_log_tau.data.fill_(new_tau_init)
         model.to(device)
-        print(f"[Phase-3]: Reset outcome_log_tau to tau=96h (log_tau={new_tau_init:.4f})")
         print(f"[Phase-3]: Fine-tuning outcome head (backbone_lr_factor={backbone_lr_factor})...")
 
     train_losses, val_losses = [], []
