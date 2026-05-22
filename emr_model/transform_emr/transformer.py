@@ -434,13 +434,27 @@ class GPT(nn.Module):
         # complications. Model still learns per-class scale from these inits.
         _log_tau_default  = math.log(12.0  / 336.0)
         _log_tau_outcome  = math.log(48.0  / 336.0)
-        _log_tau_terminal = math.log(168.0 / 336.0)
+        # P-redo (direction E): narrow tau_terminal 168h→12h. Tested on top of
+        # the O2 fixed backbone. With 168h kernel, TERMINAL soft-label leaks
+        # to all positions (most sequences end within 168h); narrowing concentrates
+        # gradient to within ~24h of actual terminal events.
+        _log_tau_terminal = math.log(12.0 / 336.0)
         _log_tau_lm = torch.full((vocab_size,), _log_tau_default)
         if self._outcome_ids.numel() > 0:
             _log_tau_lm[self._outcome_ids] = _log_tau_outcome
         if self._terminal_ids.numel() > 0:
             _log_tau_lm[self._terminal_ids] = _log_tau_terminal
         self.log_tau_lm = nn.Parameter(_log_tau_lm)
+
+        # P-redo: freeze tau_lm at terminal indices via gradient hook
+        if self._terminal_ids.numel() > 0:
+            _frozen_term_ids_list = self._terminal_ids.tolist()
+            def _freeze_terminal_tau_grad(grad):
+                grad = grad.clone()
+                for _tid in _frozen_term_ids_list:
+                    grad[_tid] = 0.0
+                return grad
+            self.log_tau_lm.register_hook(_freeze_terminal_tau_grad)
 
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
