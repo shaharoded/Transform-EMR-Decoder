@@ -502,7 +502,32 @@ Two failures combined:
 
 ---
 
-### Experiment I — Phase-3-Only Extended Horizon (Separated Horizons)
+### Experiment I — Separated Horizons (Phase3=168h, Phase2=48h)
+
+**Date:** 2026-05-22  
+**Code commit:** `8e6b4e6` (reverted — DISCARD)
+
+**Hypothesis:** G/H failed because api.py retrains Phase 2 from scratch, and `outcome_horizon_hours=168h` corrupted Phase 2. Fix: use `phase3_outcome_horizon_hours=168h` for Phase 3 only; keep `outcome_horizon_hours=48h` for Phase 2.
+
+**What happened:** Phase 2 retrained with 48h horizon (correct), but still early-stopped at epoch 23 (vl_loss plateaued at ~0.373). Backbone is still broken: gen_median_steps=4. Phase 3 per-outcome tau init and 168h horizon had no effect because the backbone produces degenerate generation regardless.
+
+**Root cause — Phase 2 early-stop mechanics:** Phase 2 early-stops when total val_loss (BCE+CE+dt+rank) doesn't improve by 0.1% for 5 consecutive epochs. The ranking loss ramps in at epoch ~13 and quickly saturates. Total val_loss then plateaus → early-stop triggers at epoch 23. The ORIGINAL Phase 2 trained for 100 full epochs without early-stopping (val_loss was improving throughout). The retrained Phase 2 converges to a different, faster-converging regime with only 23 epochs.
+
+**Full-run results:**
+
+| Metric             | F4 (best) | I       | Delta  |
+|--------------------|-----------|---------|--------|
+| `outcome_auroc`    | 0.541570  | 0.496108 | −0.045 |
+| `gen_median_steps` | 94.0      | **4.0** | broken |
+| `phase2_epochs`    | (eval-only) | 23    | too few |
+
+**Verdict: DISCARD.** Gen_median_steps still 4 despite correct Phase 2 horizon.
+
+**Fix for experiment J:** Add `phase2_early_stop_patience: 80` (Phase 2 specific). With patience=80 and warmup_gate≈20, Phase 2 runs ~100 epochs (20+80=100) matching the original training budget. This should recover correct backbone token-timing.
+
+---
+
+### Experiment J — Force Phase 2 to Full 100 Epochs
 
 **Date:** 2026-05-22  
 **Code commit:** `<pending>`
