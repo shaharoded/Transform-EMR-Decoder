@@ -420,27 +420,56 @@ class GPT(nn.Module):
         _init_log_tau = math.log(12.0 / 336.0)
         self.outcome_log_tau = nn.Parameter(torch.full((self.num_outcomes,), _init_log_tau))
 
-        # Direction C: per-token-class learnable log-tau for the LM-head
-        # multi-hot BCE soft kernel. Replaces the hard two-tier window
-        # (12h default / 168h terminals from exp59). Three-tier init aligned
-        # with how each class is used downstream (exp73):
-        #   - default tokens          → log(12 / 336)  (~12h)
-        #   - outcome-class tokens    → log(48 / 336)  (matches outcome_horizon_hours)
-        #   - terminal tokens         → log(168 / 336) (matches exp59 wide-window)
-        # The outcome-class tier means CARDIO / KIDNEY / HYPER / HYPOGLY etc.
-        # start with a wider kernel that aligns with the eval window. exp71
-        # showed CARDIO regressed −0.077 when P2 outcome BCE was removed;
-        # the hypothesis is that the default 12h init was too narrow for
-        # complications. Model still learns per-class scale from these inits.
-        _log_tau_default  = math.log(12.0  / 336.0)
-        _log_tau_outcome  = math.log(48.0  / 336.0)
-        _log_tau_terminal = math.log(168.0 / 336.0)
+        # Direction E (Y-narrow-terminal-tau): per-token-class log-tau for the
+        # LM-head multi-hot BCE soft kernel.
+        #   - default tokens          → log(12 / 336)  (~12h, learnable)
+        #   - outcome-class tokens    → log(48 / 336)  (matches outcome_horizon_hours, learnable)
+        #   - terminal tokens         → log(24 / 336)  (NARROW, FROZEN — see below)
+        #
+        # Why terminal is narrow + frozen: the X-traj-length post-training
+        # diagnostic showed terminal log_tau drifting from its 168h init to
+        # ~640h — the model's free choice was to WIDEN the terminal kernel,
+        # not narrow it. With wide tau, the soft-BCE target for "terminal"
+        # is nonzero many hours before the actual terminal event, training
+        # the LM head to predict terminal at every position. Result: at
+        # autoregressive generation, the model emits a terminal token in
+        # the first ~1 hour (gen_median_hours=1.05 in baseline, 0.37 after
+        # X-traj). Narrowing alone (just changing the init) won't hold:
+        # gradient pushes it back to wide. So we freeze the terminal entries
+        # by registering a backward hook that zeros their grad — the param
+        # stays at its 24h init throughout Phase 2 / Phase 3.
+        # Default + outcome entries remain learnable (the diagnostic showed
+        # default tokens want to be narrow — median 4h — and outcomes spread
+        # 17-526h depending on token; let the model continue learning those).
+        _log_tau_default  = math.log(12.0 / 336.0)
+        _log_tau_outcome  = math.log(48.0 / 336.0)
+        _log_tau_terminal = math.log(24.0 / 336.0)   # was 168.0; direction E
         _log_tau_lm = torch.full((vocab_size,), _log_tau_default)
         if self._outcome_ids.numel() > 0:
             _log_tau_lm[self._outcome_ids] = _log_tau_outcome
         if self._terminal_ids.numel() > 0:
             _log_tau_lm[self._terminal_ids] = _log_tau_terminal
         self.log_tau_lm = nn.Parameter(_log_tau_lm)
+
+        # Direction E: freeze the terminal entries of log_tau_lm by zeroing
+        # their gradient on every backward pass. log_tau_lm is dim=1, so it
+        # lands in the no_decay optimizer group with weight_decay=0 — once
+        # grad is zero the AdamW update is zero. Outcome and default entries
+        # still get nonzero grad and continue learning.
+        if self._terminal_ids.numel() > 0:
+            _terminal_mask = torch.zeros(vocab_size, dtype=torch.bool)
+            _terminal_mask[self._terminal_ids] = True
+            self.register_buffer("_log_tau_terminal_freeze_mask", _terminal_mask, persistent=False)
+
+            # Resolve the mask through `self` at hook-invocation time so the
+            # buffer's current device (after model.to(device)) is used. A
+            # default-arg capture of the buffer object at registration time
+            # binds to the CPU tensor and breaks once the model moves to GPU.
+            _model_ref = self
+            def _freeze_terminal_log_tau_grad(grad):
+                return grad.masked_fill(_model_ref._log_tau_terminal_freeze_mask, 0.0)
+
+            self.log_tau_lm.register_hook(_freeze_terminal_log_tau_grad)
 
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
