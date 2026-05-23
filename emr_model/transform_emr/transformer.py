@@ -443,7 +443,16 @@ class GPT(nn.Module):
         # 17-526h depending on token; let the model continue learning those).
         _log_tau_default  = math.log(12.0 / 336.0)
         _log_tau_outcome  = math.log(48.0 / 336.0)
-        _log_tau_terminal = math.log(24.0 / 336.0)   # was 168.0; direction E
+        _log_tau_terminal = math.log(12.0 / 336.0)   # Z: pushed from 24→12h
+        # ^^ Direction E init was 24h (Y-narrow-terminal-tau, KEEP). Z probes
+        # whether pushing the terminal kernel even narrower extends generation
+        # further. With tau=12h the LM-head BCE target for a terminal 24h away
+        # is exp(-2)=0.135, halving Y's exp(-1)=0.368 at the same distance —
+        # the LM head sees terminal-positive examples only when terminal is
+        # actually within ~12h. Same freeze hook below ensures the entry
+        # stays at this init throughout training (the X-traj diagnostic
+        # showed the model widens the kernel when free; that effect doesn't
+        # change at 12h vs 24h).
         _log_tau_lm = torch.full((vocab_size,), _log_tau_default)
         if self._outcome_ids.numel() > 0:
             _log_tau_lm[self._outcome_ids] = _log_tau_outcome
