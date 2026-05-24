@@ -457,6 +457,143 @@ covers 58% of the true patient horizon (vs 1% in bak_originals,
 20% in Y). 90.5% of patients do not terminate in the first 24 h
 (vs 0.1% baseline, 45.8% Y).
 
+### Z@sample=10000 — reference for the 10k loop
+
+Per the program.md 10k-screening protocol, the running-best Z
+(full-data-trained) was re-evaluated at sample=10000 to set the
+reference for direction-C onward:
+
+| metric | Z@full | Z@10k |
+|---|---|---|
+| outcome_auroc | 0.5022 | 0.4997 |
+| outcome_auprc | 0.1264 | 0.1271 |
+| onset_mae_hrs | 63.04 | 63.49 |
+| gen_median_hours | 60.66 | 60.44 |
+| gen_to_gt_ratio_median | 0.585 | 0.588 |
+| gen_frac_terminal_first24h | 0.095 | 0.105 |
+| multi_horizon cap=48 mean | 0.530 | 0.514 |
+| multi_horizon cap=168 mean | 0.517 | 0.519 |
+
+The two evals agree closely. The 10k reference replaces the
+bak_originals canonical baseline for all subsequent experiments
+that compare against the running best.
+
+### C-ttt-head (direction C) at sample=10000 — DISCARD
+
+**Code SHA**: `dd3fc1b`. Backbone-shared ttt_head predicting
+log1p(t_terminal − t_now) in hours, MSE at every non-terminal,
+non-pad query position with a future terminal in the patient's
+sequence. fraction_cap=0.30 in stage 0 alongside ce/dt. Same
+backbone-freeze on terminal log_tau_lm inherited from Z.
+
+Phase 2 ran the full 50 epochs (no early stop). ttt λ_max
+calibrated at epoch 3 to **0.0037** (raw_ttt=21.29 at the
+calibration epoch, BCE=0.265). Raw_ttt descended monotonically
+21.29 → 0.43 (50× drop) — strong evidence the head learned
+distance-to-terminal. Phase 3 early-stopped at epoch 31.
+
+**Headlines vs Z@10k**:
+
+| metric | Z@10k | C@10k | Δ |
+|---|---|---|---|
+| outcome_auroc | 0.4997 | **0.3393** | **−0.160** (catastrophic) |
+| outcome_auprc | 0.1271 | 0.1269 | flat |
+| onset_mae_hrs | 63.49 | 81.92 | +18.4 h |
+| gen_median_hours | 60.44 | **287.5** | +227 h (5× longer) |
+| gen_p90_hours | 103.16 | 290.0 | +187 h |
+| gen_to_gt_ratio_median | 0.588 | **2.81** | OVERSHOT (target ~1.0) |
+| gen_frac_terminal_first24h | 0.105 | 0.203 | +0.10 |
+| gen_length_mae_hrs | 71.7 | 134.0 | +62 h |
+| multi_horizon cap=48 mean | 0.514 | 0.430 | **−0.084** (>0.07 limit) |
+
+The aggregate AUROC drop hides a **split**: common outcomes
+gained dramatically, rare outcomes flipped anti-discriminative.
+
+| outcome | per_outcome AUROC Z@10k | C@10k | Δ |
+|---|---|---|---|
+| DEATH_EVENT | 0.475 | **0.791** | **+0.316** |
+| DISGLY_Hyperglycemia | 0.619 | 0.694 | +0.075 |
+| DISGLY_Hypoglycemia | 0.551 | 0.652 | +0.101 |
+| RELEASE_EVENT | 0.516 | 0.628 | +0.112 |
+| KIDNEY_COMPLICATION | 0.527 | 0.562 | +0.036 |
+| CARDIO-VASCULAR | 0.357 | 0.222 | −0.135 |
+| NEUROVASCULAR (rare) | 0.493 | 0.126 | −0.367 |
+| KETOACIDOSIS (rare) | 0.493 | 0.126 | −0.367 |
+| RETINOPATHY (rare) | 0.493 | 0.126 | −0.367 |
+| HYPEROSMOLALITY (rare) | 0.493 | 0.125 | −0.368 |
+| INFECTION (rare) | 0.493 | 0.121 | −0.372 |
+| ACIDOSIS (rare) | 0.493 | 0.120 | −0.373 |
+| ACUTE_RESP_DISORDER (rare) | 0.493 | 0.118 | −0.375 |
+
+**Mechanism**: The TTT head's gradient flows through the shared
+backbone, reshaping the hidden state to encode distance-to-terminal.
+LM head's terminal-token logit consequently drops relative to other
+tokens at most positions — the model now waits **too long** before
+emitting a terminal (median 287 h ≈ full 14-day horizon vs GT
+median 102 h, a 2.81× overshoot). The outcome head, trained in
+Phase 3 on the new TF-time backbone, sees a different distribution
+at generation time (much longer trajectories than training). For
+the COMMON outcomes (DEATH, HYPER, HYPOGLY, KIDNEY, RELEASE) the
+discriminative signal is strong enough to survive that shift and
+in fact benefits from the longer scoring window (DEATH cap=48
+AUROC 0.61 → 0.88 — clinical grade). For the RARE outcomes
+(NEURO, KETO, RETINO, HYPEROSMO, INFECTION, ACIDOSIS,
+ACUTE_RESP), the Phase-3 outcome head's high pos_weight had
+pushed predictions up everywhere; the now-much-longer generated
+trajectories accumulate many positions where the outcome head
+fires positive but no GT positive exists — flipping AUROC below
+0.5 (model ranks negatives above positives).
+
+**KEEP gates vs Z@10k (running best at 10k)**:
+- T1 (raw loss descent): PASS — raw_ttt descends 21.29 → 0.43;
+  other auxes descend normally.
+- T2 (no premature early stop): PASS — Phase 2 ran full 50;
+  Phase 3 early-stopped at epoch 31 after warmup.
+- T3 (diagnose.py): pending at write time; expected per-outcome
+  AUROC ranking changes match the per_outcome table above (DEATH
+  up, rares flipped).
+- ≥ 1 headline improves past 10k noise floor:
+  outcome_auprc flat; outcome_auroc REGRESSED; gen_median_hours
+  numerically up by 227 h, but `gen_to_gt_ratio_median 2.81`
+  is moving AWAY from the target 1.0 — overshoot, not improvement.
+  No headline cleanly improves.
+- No headline regresses past floor:
+  **outcome_auroc regressed by 0.16**, way past the 0.010 floor.
+  Onset MAE regressed by +18 h. gen_frac_terminal_first24h
+  regressed by +0.10.
+- multi_horizon cap=48 mean drop < 0.07:
+  **drop is 0.084 > 0.07** — FAIL.
+
+Multiple gates fail.
+
+**Verdict: DISCARD** — direction C in this formulation pushes
+the trajectory but the shared-backbone shift breaks rare-outcome
+discrimination and the LM-head terminal-emission stops triggering
+near the right time. The reverted-from state is Z (still the
+running best).
+
+**What this experiment proved that's still useful**:
+- A backbone-shared time-to-terminal signal CAN push gen_median_hours
+  from 60h to ~300h — the gradient path program.md predicted works.
+- The signal also produces a 0.32-0.37 AUROC gain on DEATH and big
+  gains on HYPER/HYPOGLY/RELEASE/KIDNEY — the trajectory framework
+  for outcome scoring is sound when the model trains a stronger
+  backbone representation.
+- The two failure modes (overshoot + rare-outcome flip) are
+  controllable engineering problems, not a fundamental dead end:
+    - Overshoot ← need a length-budget signal (B-rollout's
+      sequence-level loss provides this directly).
+    - Rare-outcome flip ← Phase-3 outcome head trained on TF
+      backbone can't generalise to autoregressive backbone with
+      much longer trajectories. B-rollout's scheduled autoregression
+      means Phase-3 sees a backbone that has been trained on its
+      own predictions — partly closing the gap.
+
+So **C confirms B-rollout is the right next direction**: same
+mechanism (gradient into terminal-emission decision) but with the
+two missing pieces — explicit length budget and Phase-2 exposure
+to autoregressive generation — both included.
+
 **Direction-E saturation analysis**: the path E→24h→12h is a
 single-dimensional sweep. The next obvious extension (tau=6h)
 runs into a structural problem: the Δt MSE on non-zero deltas
