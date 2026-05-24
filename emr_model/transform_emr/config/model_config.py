@@ -37,6 +37,16 @@ TRAINING_SETTINGS = {
     "phase3_weight_decay":        1e-3,  # weight decay for outcome_head in P3 (matches backbone)
     "weight_decay": 1e-3,
 
+    # AA-scheduled-sampling (direction A, stacked on Z).
+    # Probability of replacing each non-protected GT input token with the model's
+    # own argmax prediction for that position. Ramps linearly from 0 to
+    # phase2_ss_max_rate between phase2_scheduler.bce_only_epochs and
+    # phase2_n_epochs. 0.0 disables (= teacher forcing). The 0.15 value is
+    # conservative vs the prior U experiment's 0.20 — Y/Z removed the terminal
+    # bias that caused U to self-amplify into immediate-terminal collapse, but a
+    # gentler start de-risks any remaining instability.
+    "phase2_ss_max_rate": 0.15,
+
     "batch_size": 16, # Number of patients processed concurrently (effective batch=64 via grad accumulation)
     "grad_accumulation_steps": 4, # Accumulate gradients over N steps before optimizer.step()
     "phase1_bce_window_hours": 3.0,
