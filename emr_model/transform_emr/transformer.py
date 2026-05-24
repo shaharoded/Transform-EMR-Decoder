@@ -839,26 +839,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
     luts = build_luts(model.embedder.tokenizer)
     luts = {k: v.to(device) if torch.is_tensor(v) else v for k,v in luts.items()}
 
-    # Bool [V] view of luts["forbid_mask_ids"], used both by CBM and by direction-A
-    # scheduled sampling to skip "skeleton" tokens (PAD, NULL, ADMISSION, OUTCOMES,
-    # TERMINALS, MEALS, START_*/END_*).
-    _vocab_size = model.embedder.decoder.out_features
-    _protected_bool = torch.zeros(_vocab_size, dtype=torch.bool, device=device)
-    _protected_bool[luts["forbid_mask_ids"]] = True
-
-    # Direction A (AA-scheduled-sampling): teacher-forcing replacement rate.
-    # Anneals from 0 to phase2_ss_max_rate (default 0.0 = disabled) linearly between
-    # bce_only_epochs and phase2_n_epochs. At each non-pad position, with probability
-    # ss_rate, replace the GT token in the model input with the model's own argmax
-    # prediction for that position (a no-grad pre-forward gives the predictions).
-    # Targets, abs_ts, context_vec are UNCHANGED — only the model input stream
-    # carries some self-predicted tokens. Closes the train/inference distribution
-    # gap: at inference the model has to handle its own past predictions, so train
-    # it the same way.
-    _ss_max_rate    = float(training_settings.get("phase2_ss_max_rate", 0.0))
-    _ss_start_epoch = int(training_settings.get("phase2_scheduler", {}).get("bce_only_epochs", 4))
-    _ss_end_epoch   = int(training_settings.get("phase2_n_epochs", 50))
-
     ckpt_path = Path(checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     ckpt_last = ckpt_path.parent / "ckpt_last.pt"
@@ -952,80 +932,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
-        # AA-scheduled-sampling: per-epoch rate (held constant across the epoch's batches).
-        if train_flag and _ss_max_rate > 0.0:
-            ss_rate = linear_schedule(epoch=epoch, start_epoch=_ss_start_epoch,
-                                       end_epoch=_ss_end_epoch, max_val=_ss_max_rate)
-        else:
-            ss_rate = 0.0
-
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
-
-                # === AA-scheduled-sampling: replace GT tokens with model's own predictions ===
-                # No-grad pre-forward → argmax over legality-masked LM logits → shift by 1
-                # → mix into position_ids (and downstream concept/value/parent_raw_ids)
-                # with probability ss_rate at each non-protected, non-pad position.
-                # Targets / abs_ts / context_vec stay GT.
-                if train_flag and ss_rate > 0.0:
-                    with torch.no_grad():
-                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                            _ss_logits, _, _, _ = model(
-                                parent_raw_ids=batch["parent_raw_ids"],
-                                concept_ids=batch["concept_ids"],
-                                value_ids=batch["value_ids"],
-                                position_ids=batch["position_ids"],
-                                abs_ts=batch["abs_ts"],
-                                context_vec=batch["context_vec"],
-                            )
-                        _ss_logits = _ss_logits.float()
-                        # Mask illegal next-tokens given the GT prefix state.
-                        _ss_illegal = compute_legality_masks_tf(
-                            batch["targets"],
-                            luts["is_start"], luts["is_end"], luts["base_id"],
-                            luts["start_ids_per_base"], luts["end_ids_per_base"],
-                            luts["meal_rank"], luts["meal_pred_rank"],
-                            luts["K_meals"], luts["conflict_mat"], luts["predict_block"],
-                        )
-                        _ss_logits = apply_masks_to_logits(_ss_logits, _ss_illegal)
-                        # logits[:, t, :] predicts position[t+1]; shift right so pred_pos[t]
-                        # is the model's prediction for the token AT position t.
-                        _pred_next   = _ss_logits.argmax(dim=-1)                       # [B, T]
-                        _pred_pos    = torch.cat(
-                            [batch["position_ids"][:, :1], _pred_next[:, :-1]], dim=1
-                        )                                                              # [B, T]
-
-                    _pad_id = model.embedder.padding_idx
-                    _rand   = torch.rand_like(batch["position_ids"], dtype=torch.float)
-                    _do_swap = _rand < ss_rate
-                    _safe_gt   = ~_protected_bool[batch["position_ids"]]
-                    _safe_pred = ~_protected_bool[_pred_pos.clamp(min=0)]
-                    _safe_pad  = (batch["position_ids"] != _pad_id) & (_pred_pos != _pad_id)
-                    _mix_mask  = _do_swap & _safe_gt & _safe_pred & _safe_pad           # [B, T]
-
-                    if _mix_mask.any():
-                        _mixed_pos = torch.where(_mix_mask, _pred_pos, batch["position_ids"])
-                        _mask_id   = model.embedder.tokenizer.mask_token_id
-                        # tok2concept / tok2value can be -1 where no mapping; fall back to [MASK].
-                        _new_concept = luts["tok2concept"][_mixed_pos]
-                        _new_concept = torch.where(
-                            _new_concept < 0, torch.full_like(_new_concept, _mask_id), _new_concept,
-                        )
-                        _new_value = luts["tok2value"][_mixed_pos]
-                        _new_value = torch.where(
-                            _new_value < 0, torch.full_like(_new_value, _mask_id), _new_value,
-                        )
-                        _t2p = model.embedder.tokenizer.tokenid2parent_raw_ids.to(device)
-                        _new_parent_raw = _t2p[_mixed_pos]                              # [B, T, P]
-                        # Only update mixed positions; non-mixed positions keep their original
-                        # CBM-aware downstream IDs (CBM is applied below; SS feeds CBM, not vice versa).
-                        batch["position_ids"]    = _mixed_pos
-                        batch["concept_ids"]     = torch.where(_mix_mask, _new_concept, batch["concept_ids"])
-                        batch["value_ids"]       = torch.where(_mix_mask, _new_value,   batch["value_ids"])
-                        batch["parent_raw_ids"]  = torch.where(
-                            _mix_mask.unsqueeze(-1), _new_parent_raw, batch["parent_raw_ids"],
-                        )
 
                 # === Apply CBM on training batchs ===
                 if train_flag:
@@ -1263,13 +1172,10 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        _ss_rate_logged = (linear_schedule(epoch=epoch, start_epoch=_ss_start_epoch,
-                                            end_epoch=_ss_end_epoch, max_val=_ss_max_rate)
-                            if _ss_max_rate > 0 else 0.0)
         print(f"""[Phase-2]: Epoch {epoch:02d}
         --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f})
         --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f}  ss_rate={_ss_rate_logged:.4f}""")
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
