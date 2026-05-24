@@ -22,7 +22,7 @@ TRAINING_SETTINGS = {
     "phase1_n_epochs": 50,
     "phase2_n_epochs": 50,
     "phase3_n_epochs": 50,
-    "sample": None,  # set to int (e.g. 50) for a quick smoke-test
+    "sample": 10000,  # 10k is the primary screening loop per program.md
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
@@ -74,12 +74,14 @@ TRAINING_SETTINGS = {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
+            "rollout": 0.20,    # B-rollout length-loss cap (only fires when phase2_rollout_k_max > 0)
         },
-        "order": [["ce", "dt"], ["ranking"]],
+        "order": [["ce", "dt", "rollout"], ["ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
             "ranking": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
+            "rollout": 2,  # Short ramp on the length loss so the Gumbel gradient enters smoothly
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
@@ -92,4 +94,23 @@ TRAINING_SETTINGS = {
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
     "outcome_horizon_hours": 48.0,
+
+    # Direction B-rollout — single-step autoregressive Gumbel-softmax rollout.
+    # When phase2_rollout_k_max > 0, after bce_only_epochs the model:
+    #   1. Does the normal TF forward to compute standard BCE/CE/dt/ranking.
+    #   2. Then computes a separate KV-cache prefill on positions [0, T-2].
+    #   3. Gumbel-softmaxes the prefill's last logits (positions T-2) into a
+    #      one-hot at position T-1 — gradient flows from any downstream loss
+    #      back through this soft one-hot to the LM-head logit.
+    #   4. Runs one decode step with that soft one-hot as input.
+    #   5. Compares the new position's predicted Δt (in hours, log1p'd) to
+    #      the GT Δt at position T-1 — sequence-level "length" loss.
+    # This is the gradient path that the original X-style length loss
+    # lacked (X only constrained dt_head's per-position predictions during
+    # teacher forcing; the LM head was never touched). B-rollout's
+    # mechanism reaches the LM head's terminal-emission decision directly.
+    # phase2_rollout_k_max = 0 disables.
+    "phase2_rollout_k_max":     1,     # MVP — single-step rollout
+    "phase2_rollout_tau_start": 2.0,   # Gumbel temperature at first rollout epoch
+    "phase2_rollout_tau_end":   0.5,   # ... at last training epoch
 }

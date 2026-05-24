@@ -628,7 +628,10 @@ class GPT(nn.Module):
         return logits, abs_t_pred, outcome_logits, gate_logit
 
 
-    @torch.no_grad()
+    # NOTE: no @torch.no_grad() here — direction B-rollout needs gradient
+    # flow through KV-cache decode steps. Inference.generate() already wraps
+    # all its calls to forward_with_cache in its own @torch.no_grad decorator,
+    # so removing the decorator here doesn't track gradient at inference.
     def forward_with_cache(self, parent_raw_ids, concept_ids, value_ids, position_ids,
                            abs_ts, context_vec, past_kvs=None, cache_key_pad_mask=None):
         """
@@ -686,6 +689,96 @@ class GPT(nn.Module):
         x = self.ln_f(x)
 
         # 3. Heads
+        logits         = self.lm_head(x)
+        outcome_logits = self.outcome_head(x)
+
+        gate_logit = self.dt_gate(x).squeeze(-1)
+        mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
+        delta_pos  = torch.sigmoid(gate_logit) * mag_pos
+        abs_t_pred = abs_ts + delta_pos
+
+        return logits, abs_t_pred, outcome_logits, gate_logit, new_kvs
+
+
+    def rollout_step_gumbel(self, soft_pos_one_hot, concept_ids, value_ids,
+                            parent_raw_ids, abs_ts, context_vec, past_kvs,
+                            cache_key_pad_mask):
+        """
+        B-rollout — single autoregressive decode step with a Gumbel-softmax
+        position embedding. Gradient flows from downstream losses back through
+        the soft position one-hot to the LM-head logits at the previous
+        position (which produced the Gumbel input).
+
+        Args:
+            soft_pos_one_hot   : [B, V]  Gumbel-softmax output with hard=True.
+                                 Forward sees a one-hot vector; backward sees
+                                 the soft distribution via straight-through.
+            concept_ids        : [B, 1]  argmax-derived concept ids
+            value_ids          : [B, 1]  argmax-derived value ids
+            parent_raw_ids     : [B, 1, P] argmax-derived parent raw ids
+            abs_ts             : [B, 1]  new position's normalised abs_ts
+            context_vec        : [B, ctx_dim]
+            past_kvs           : List[Tuple(K, V)] one per layer, from a
+                                 forward_with_cache prefill on positions
+                                 [0, t-1]. K/V each [B, n_head, t, hd].
+            cache_key_pad_mask : [B, t+1] bool — True at non-pad positions
+                                 in the full cached+new key sequence.
+
+        Returns:
+            logits          [B, 1, V]
+            abs_t_pred      [B, 1]
+            outcome_logits  [B, 1, K_out]
+            gate_logit      [B, 1]
+            new_kvs         updated per-layer KV caches
+        """
+        # 1. Build the soft input embedding by manually replicating the
+        #    embedder forward, substituting the soft position embedding for
+        #    the standard hard lookup. The concept/value/parent_raw pathways
+        #    use the argmax token (non-differentiable through token choice,
+        #    but the position-embed pathway carries the LM-head gradient).
+        embedder = self.embedder
+
+        # parent_raw mean: [B, 1, P, D] → mean over P (PAD-masked) → [B, 1, D]
+        r_emb = embedder.raw_concept_embed(parent_raw_ids)              # [B, 1, P, D]
+        rmask = (parent_raw_ids != embedder.padding_idx).unsqueeze(-1)  # [B, 1, P, 1]
+        r_emb = r_emb * rmask
+        rden  = rmask.sum(dim=2).clamp_min(1.0)                          # [B, 1, 1]
+        r_emb = r_emb.sum(dim=2) / rden                                  # [B, 1, D]
+
+        c_emb = embedder.concept_embed(concept_ids)                      # [B, 1, D]
+        v_emb = embedder.value_embed(value_ids)                          # [B, 1, D]
+
+        # SOFT position embedding — the gradient backbone.
+        # soft_pos_one_hot: [B, V], position_embed.weight: [V, D].
+        p_emb = (soft_pos_one_hot @ embedder.position_embed.weight).unsqueeze(1)  # [B, 1, D]
+
+        # Time embedding (per-position, deterministic).
+        t_abs = embedder.time2vec_abs(abs_ts)                            # [B, 1, time2vec_dim]
+        t_emb = embedder.time_proj(t_abs)                                # [B, 1, D]
+
+        combined = torch.cat([r_emb, c_emb, v_emb, p_emb, t_emb], dim=-1)  # [B, 1, 5D]
+        ev_vec   = embedder.final_proj(combined)
+        ev_vec   = embedder.dropout(ev_vec) / embedder.scale
+        x        = embedder.layernorm(ev_vec)                            # [B, 1, D]
+
+        cond_emb = embedder.context_proj(context_vec)                    # [B, D]
+
+        x = self.drop(x)
+
+        # 2. Run transformer blocks with KV cache. past_kvs has len(blocks)
+        #    entries already; each blk appends its new (k, v) to it.
+        new_kvs = []
+        for i, blk in enumerate(self.blocks):
+            x, new_kv = blk(x, cond_emb,
+                            key_pad_mask=cache_key_pad_mask,
+                            abs_ts=abs_ts,
+                            past_kv=past_kvs[i],
+                            use_cache=True)
+            new_kvs.append(new_kv)
+
+        x = self.ln_f(x)
+
+        # 3. Heads.
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
 
@@ -927,8 +1020,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_dt = total_ranking = 0.0
-        total_ce_raw = total_dt_raw = total_ranking_raw = 0.0
+        total_loss = total_bce = total_ce = total_dt = total_ranking = total_rollout = 0.0
+        total_ce_raw = total_dt_raw = total_ranking_raw = total_rollout_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -1098,15 +1191,144 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 )
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
+                # === Loss: B-rollout sequence-level length loss (direction B-rollout) ===
+                # Single-step autoregressive rollout at the last valid position.
+                # Gradient flows from |log1p(pred_Δt_hrs) − log1p(GT_Δt_hrs)| back
+                # through the soft Gumbel-softmax one-hot to the LM-head logit at
+                # the previous position. This is the gradient path X-style TF
+                # length losses lacked.
+                #
+                # Computed only during training, and only after bce_only_epochs
+                # (so the LM head has a basic next-token distribution first).
+                # Disabled by setting phase2_rollout_k_max=0 in training_settings.
+                _rollout_k_max = int(training_settings.get("phase2_rollout_k_max", 0))
+                if train_flag and _rollout_k_max > 0 and epoch >= cbm_ramp_epochs:
+                    # Schedule Gumbel temperature τ from tau_start → tau_end across
+                    # post-warmup epochs.
+                    _tau_start = float(training_settings.get("phase2_rollout_tau_start", 2.0))
+                    _tau_end   = float(training_settings.get("phase2_rollout_tau_end",   0.5))
+                    _p2_epochs = int(training_settings.get("phase2_n_epochs", 50))
+                    _rollout_progress = (epoch - cbm_ramp_epochs) / max(1, _p2_epochs - cbm_ramp_epochs)
+                    _rollout_progress = max(0.0, min(1.0, _rollout_progress))
+                    _tau = _tau_start + (_tau_end - _tau_start) * _rollout_progress
+
+                    # Per-patient last-valid index (in full_targets, length T).
+                    # We need at least position 1 (so a "previous" position exists)
+                    # AND a position-after-that with a GT target to compare against.
+                    _B, _T = full_targets.shape
+                    _nonpad_full = (full_targets != model.embedder.padding_idx)  # [B, T]
+                    _last_valid_idx = (_nonpad_full.sum(dim=1) - 1).clamp(min=1)  # [B], ≥ 1
+                    # Prefill positions: [0, last_valid - 1] inclusive — we'll roll
+                    # out at last_valid using the prefill's logits at last_valid-1
+                    # as the input distribution.
+                    # For simplicity, find the max prefill length across the batch and
+                    # right-pad the prefill inputs to that length. Per-patient last
+                    # positions are then picked via gather.
+                    _prefill_len = _last_valid_idx  # [B], shape of valid prefix [0, _last_valid_idx - 1] is _last_valid_idx positions
+                    _max_prefix = int(_prefill_len.max().item())
+                    if _max_prefix >= 1:
+                        # Build prefill batch: positions [0, _max_prefix - 1].
+                        _pre_parent  = batch["parent_raw_ids"][:, :_max_prefix]
+                        _pre_concept = batch["concept_ids"][:, :_max_prefix]
+                        _pre_value   = batch["value_ids"][:, :_max_prefix]
+                        _pre_pos     = batch["position_ids"][:, :_max_prefix]
+                        _pre_abs_ts  = batch["abs_ts"][:, :_max_prefix]
+
+                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                            (_pre_logits, _pre_abs_t, _pre_outcome,
+                             _pre_gate, _pre_kvs) = model.forward_with_cache(
+                                parent_raw_ids=_pre_parent,
+                                concept_ids=_pre_concept,
+                                value_ids=_pre_value,
+                                position_ids=_pre_pos,
+                                abs_ts=_pre_abs_ts,
+                                context_vec=batch["context_vec"],
+                            )
+                        _pre_logits = _pre_logits.float()
+                        _pre_abs_t  = _pre_abs_t.float()
+
+                        # Per-patient logits at position (last_valid - 1).
+                        # These predict what the model would emit at last_valid.
+                        _gather_idx = (_prefill_len - 1).clamp(min=0)             # [B]
+                        _b_range   = torch.arange(_B, device=device)
+                        _last_pre_logits = _pre_logits[_b_range, _gather_idx, :]  # [B, V]
+
+                        # Gumbel-softmax with straight-through. Forward: one-hot
+                        # for the argmax token; backward: gradient via soft probs.
+                        _soft_one_hot = F.gumbel_softmax(_last_pre_logits, tau=_tau, hard=True)
+                        _sampled_tok  = _soft_one_hot.argmax(dim=-1)              # [B]
+
+                        # Hard-token lookups for non-position embedder components.
+                        _new_concept = luts["tok2concept"][_sampled_tok]
+                        _mask_id = model.embedder.tokenizer.mask_token_id
+                        _new_concept = torch.where(_new_concept < 0,
+                                                   torch.full_like(_new_concept, _mask_id),
+                                                   _new_concept).unsqueeze(1)     # [B, 1]
+                        _new_value = luts["tok2value"][_sampled_tok]
+                        _new_value = torch.where(_new_value < 0,
+                                                 torch.full_like(_new_value, _mask_id),
+                                                 _new_value).unsqueeze(1)         # [B, 1]
+                        _t2p = model.embedder.tokenizer.tokenid2parent_raw_ids.to(device)
+                        _new_parent = _t2p[_sampled_tok].unsqueeze(1)              # [B, 1, P]
+
+                        # New position's abs_ts: take the prefill's predicted next-
+                        # event time at the corresponding query position. Detach to
+                        # avoid gradient flowing back through the dt head twice (once
+                        # from the standard dt loss, once from here).
+                        _new_abs_ts = _pre_abs_t[_b_range, _gather_idx].detach().unsqueeze(1)  # [B, 1]
+
+                        # Build cache pad mask: the full cached+new sequence is
+                        # [_max_prefix + 1] long. The cache covers positions [0,
+                        # _max_prefix - 1]; we mark per-patient pads via the
+                        # prefix-length comparison, and the new position is always
+                        # valid for the rollout patient.
+                        _cache_idx = torch.arange(_max_prefix, device=device).unsqueeze(0)   # [1, _max_prefix]
+                        _cache_valid = _cache_idx < _prefill_len.unsqueeze(1)                # [B, _max_prefix]
+                        _new_valid = torch.ones(_B, 1, dtype=torch.bool, device=device)
+                        _cache_pad_mask = torch.cat([_cache_valid, _new_valid], dim=1)       # [B, _max_prefix + 1]
+
+                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                            (_roll_logits, _roll_abs_t, _roll_outcome,
+                             _roll_gate, _roll_kvs) = model.rollout_step_gumbel(
+                                soft_pos_one_hot=_soft_one_hot,
+                                concept_ids=_new_concept,
+                                value_ids=_new_value,
+                                parent_raw_ids=_new_parent,
+                                abs_ts=_new_abs_ts,
+                                context_vec=batch["context_vec"],
+                                past_kvs=_pre_kvs,
+                                cache_key_pad_mask=_cache_pad_mask,
+                            )
+                        _roll_abs_t = _roll_abs_t.float().squeeze(1)  # [B], in normalised units
+
+                        # GT Δt at the rolled-out position vs the predicted Δt.
+                        # Δt = abs_ts at the position AFTER the prefill - abs_ts at
+                        # the last prefill position. Both in normalised units.
+                        _gt_next_abs = batch["abs_ts"][_b_range, _last_valid_idx]  # [B]
+                        _gt_prev_abs = batch["abs_ts"][_b_range, _gather_idx]      # [B]
+                        _gt_dt_hrs   = ((_gt_next_abs - _gt_prev_abs).clamp(min=0.0) * _ABS_TS_SCALE)
+                        _pred_dt_hrs = ((_roll_abs_t  - _gt_prev_abs).clamp(min=0.0) * _ABS_TS_SCALE)
+
+                        # Length loss in log1p hours — keeps the raw value bounded
+                        # in O(0–6) regardless of patient horizon.
+                        loss_rollout_raw = (torch.log1p(_pred_dt_hrs) - torch.log1p(_gt_dt_hrs)).abs().mean()
+                        loss_rollout = lambdas.get("rollout", 0.0) * loss_rollout_raw
+                    else:
+                        loss_rollout_raw = logits.new_tensor(0.0)
+                        loss_rollout = logits.new_tensor(0.0)
+                else:
+                    loss_rollout_raw = logits.new_tensor(0.0)
+                    loss_rollout = logits.new_tensor(0.0)
+
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + loss_rollout
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "rollout": loss_rollout, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1138,9 +1360,11 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce      += loss_ce.item()
                 total_dt      += abs_t_loss.item()
                 total_ranking += loss_ranking.item()
+                total_rollout += loss_rollout.item()
                 total_ce_raw      += loss_ce_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
+                total_rollout_raw += loss_rollout_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1160,22 +1384,24 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_dt      / n_batches,
             total_ranking / n_batches,
+            total_rollout / n_batches,
             total_ce_raw      / n_batches,
             total_dt_raw      / n_batches,
             total_ranking_raw / n_batches,
+            total_rollout_raw / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ce_raw, tr_dt_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_rollout, tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_rollout_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_rollout, _, _, _, _                                          = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f}, Roll={tr_rollout:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f}, Roll={vl_rollout:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f} rollout={tr_rollout_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1184,6 +1410,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             ranking=tr_ranking_raw,
+            rollout=tr_rollout_raw,
         )
         for msg in schedule_events:
             print(msg)
