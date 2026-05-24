@@ -79,7 +79,7 @@ TRAINING_SETTINGS = {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
-            "ttt":     0.10,    # Time-to-terminal regression cap (C-soft: tightened 0.30 → 0.10 to control overshoot)
+            "ttt":     0.30,    # Time-to-terminal regression cap (direction C)
         },
         "order": [["ce", "dt", "ttt"], ["ranking"]],
         "ramp_epochs": {
