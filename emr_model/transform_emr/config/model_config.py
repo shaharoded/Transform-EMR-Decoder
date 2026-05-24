@@ -22,7 +22,7 @@ TRAINING_SETTINGS = {
     "phase1_n_epochs": 50,
     "phase2_n_epochs": 50,
     "phase3_n_epochs": 50,
-    "sample": None,  # set to int (e.g. 50) for a quick smoke-test
+    "sample": 10000,  # 10k is the primary screening loop per program.md; set to None only for end-of-block full-data confirms
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
@@ -63,23 +63,30 @@ TRAINING_SETTINGS = {
 
     # Phase-2 auxiliary scheduler.
     # Multi-stage curriculum: stages unlock sequentially based on plateau detection.
-    #   Stage 0: [ce, dt]  — active after bce_only_epochs, ramp immediately
-    #   Stage 1: [outcome] — unlocked when stage-0 objectives plateau (after ramp)
+    #   Stage 0: [ce, dt, ttt] — active after bce_only_epochs, ramp immediately
+    #     'ttt' (direction C — time-to-terminal regression): joined to stage 0
+    #     alongside dt because it's a foundational time-prediction signal
+    #     (MSE on log1p hours-to-next-terminal, computed at every non-terminal,
+    #     non-pad query position). fraction_cap 0.30 sits between dt's 0.50 and
+    #     ranking's 0.20 — meaningful share of BCE without dominating.
+    #   Stage 1: [ranking] — unlocked when stage-0 objectives plateau (after ramp)
     # Plateau is measured on vl_total (total weighted validation loss) and only checked
     # once the current stage's ramp has completed.
-    # Warmup ends after the outcome ramp completes (dynamic, set by scheduler).
+    # Warmup ends after the ranking ramp completes (dynamic, set by scheduler).
     "phase2_scheduler": {
         "bce_only_epochs": 4,
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
+            "ttt":     0.30,    # Time-to-terminal regression cap (direction C)
         },
-        "order": [["ce", "dt"], ["ranking"]],
+        "order": [["ce", "dt", "ttt"], ["ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
             "ranking": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
+            "ttt":     0,
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]

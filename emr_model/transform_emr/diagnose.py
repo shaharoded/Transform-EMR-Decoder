@@ -140,7 +140,7 @@ def _vocab_health_report(model, val_dl, tokenizer, pad_idx, device, max_batches:
             if b_idx >= max_batches:
                 break
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            logits, _, _, _ = model(
+            logits, _, _, _, _ = model(
                 parent_raw_ids=batch["parent_raw_ids"],
                 concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"],
@@ -296,7 +296,7 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     with torch.no_grad():
         for n_batches, batch in enumerate(val_dl):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            logits, _, outcome_pred, _ = model(
+            logits, _, outcome_pred, _, _ = model(
                 parent_raw_ids=batch["parent_raw_ids"],
                 concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"],
@@ -351,7 +351,7 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
 
             if ctx_batches < 3:
                 def _fwd_bce(ctx):
-                    lg, _, _, _ = model(
+                    lg, _, _, _, _ = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
@@ -536,7 +536,7 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
         if i >= 3:
             break
         batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-        logits, _, _, _ = model(
+        logits, _, _, _, _ = model(
             parent_raw_ids=batch["parent_raw_ids"],
             concept_ids=batch["concept_ids"],
             value_ids=batch["value_ids"],
@@ -724,7 +724,7 @@ def probe_dt_components(model, val_dl, n_batches: int = 1):
         for i, batch in enumerate(val_dl):
             if i >= n_batches: break
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            _, _, _, gate_logit = model(
+            _, _, _, gate_logit, _ = model(
                 parent_raw_ids=batch["parent_raw_ids"], concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"], position_ids=batch["position_ids"],
                 abs_ts=batch["abs_ts"], context_vec=batch["context_vec"],
@@ -758,7 +758,7 @@ def _collect_val_batches(model, val_dl, n_batches: int = 1):
             if i >= n_batches:
                 break
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            logits, abs_t_pred, outcome_logits, _ = model(
+            logits, abs_t_pred, outcome_logits, _, _ = model(
                 parent_raw_ids=batch["parent_raw_ids"],
                 concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"],

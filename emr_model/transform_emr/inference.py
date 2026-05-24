@@ -208,7 +208,7 @@ def generate(model,
             # ── single prefill: next-token logits + KV cache (+ input risk scores) ──
             # One pass supplies both the KV cache needed for autoregressive decoding
             # and (when collect_risk_scores=True) the outcome probs for input tokens.
-            logits_pre, abs_t_pre, input_outcome_logits, _, past_kvs = model.forward_with_cache(
+            logits_pre, abs_t_pre, input_outcome_logits, _, _, past_kvs = model.forward_with_cache(
                 parent_raw_ids=parent_raw_ids,
                 concept_ids=concept_ids,
                 value_ids=value_ids,
@@ -352,7 +352,7 @@ def generate(model,
                 new_valid  = torch.ones(B, 1, dtype=torch.bool, device=device)
                 cache_mask = torch.cat([cache_mask, new_valid], dim=1)
 
-                logits_dec, abs_t_dec, outcome_logits_dec, _, past_kvs = model.forward_with_cache(
+                logits_dec, abs_t_dec, outcome_logits_dec, _, _, past_kvs = model.forward_with_cache(
                     parent_raw_ids=par_new.unsqueeze(1),
                     concept_ids=c_ids_new.unsqueeze(1),
                     value_ids=v_ids_new.unsqueeze(1),

@@ -496,6 +496,24 @@ class GPT(nn.Module):
             # Output: raw magnitude (softplus applied later)
         )
 
+        # Direction C — Time-to-terminal regression head.
+        # Predicts log1p(t_terminal − t_now) in hours at every position.
+        # Trained with MSE only at non-terminal, non-pad positions where a
+        # future terminal exists in the patient's sequence. Shares the
+        # backbone with lm_head / outcome_head: gradient flows from this
+        # head's MSE through the transformer blocks, forcing them to encode
+        # distance-to-terminal in the hidden state — a representation the
+        # LM head can then use to time its terminal-token emissions.
+        # At inference: unused (forward returns the prediction but it
+        # doesn't gate generation in any way). Architecturally identical
+        # to dt_magnitude (same hidden dim mapping back to a scalar).
+        self.ttt_head = nn.Sequential(
+            nn.Linear(cfg["embed_dim"], cfg["time2vec_dim"]),
+            nn.ReLU(),
+            nn.Linear(cfg["time2vec_dim"], 1)
+            # Output: scalar log1p(t_terminal_hrs − t_now_hrs).
+        )
+
         self.apply(self._init_weights)
         # Slightly smaller init for residual projections as in GPT-2:
         # scale down the output projection of each residual branch by 1/√(2*n_layers)
@@ -625,7 +643,13 @@ class GPT(nn.Module):
         delta_pos = gate_prob * mag_pos
         abs_t_pred = abs_ts + delta_pos                # [B, T]
 
-        return logits, abs_t_pred, outcome_logits, gate_logit
+        # 6. Time-to-terminal prediction (direction C). Output is interpreted
+        #    as predicted log1p(t_terminal_hrs − t_now_hrs); the MSE loss in
+        #    pretrain_transformer compares this to log1p of the actual GT
+        #    distance to the next terminal at each non-terminal position.
+        ttt_pred = self.ttt_head(x).squeeze(-1)        # [B, T]
+
+        return logits, abs_t_pred, outcome_logits, gate_logit, ttt_pred
 
 
     @torch.no_grad()
@@ -649,6 +673,7 @@ class GPT(nn.Module):
             abs_t_pred      [B, T_out]        predicted time for the *next* event
             outcome_logits  [B, T_out, K]
             gate_logit      [B, T_out]
+            ttt_pred        [B, T_out]        predicted log1p(t_terminal − t_now) hrs (direction C; unused at inference)
             new_kvs         List[Tuple[Tensor, Tensor]]  — one (k, v) per transformer layer
                             k/v shape [B, n_head, T_past+T_out, hd]
 
@@ -694,7 +719,12 @@ class GPT(nn.Module):
         delta_pos  = torch.sigmoid(gate_logit) * mag_pos
         abs_t_pred = abs_ts + delta_pos
 
-        return logits, abs_t_pred, outcome_logits, gate_logit, new_kvs
+        # TTT head (direction C). Returned for signature symmetry with forward(); the
+        # generation loop does not use it (a 'past terminal' prediction is irrelevant
+        # at inference where the model emits a real terminal token via lm_head).
+        ttt_pred = self.ttt_head(x).squeeze(-1)
+
+        return logits, abs_t_pred, outcome_logits, gate_logit, ttt_pred, new_kvs
 
 
     def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None,
@@ -771,6 +801,19 @@ class GPT(nn.Module):
         ckpt_keys  = set(state_dict.keys())
         missing    = model_keys - ckpt_keys
         unexpected = ckpt_keys - model_keys
+
+        # The ttt_head was added in direction C. Pre-C checkpoints (canonical
+        # bak_originals, Y, Z) don't carry these keys. Allow them to load with
+        # ttt_head left at random init — the head's output is unused at eval
+        # and the per-experiment loop's re-eval of the running best is
+        # explicitly inference-only.
+        _ttt_keys_missing = {k for k in missing if k.startswith("ttt_head.")}
+        if _ttt_keys_missing:
+            print(f"[GPT.load] ttt_head not in ckpt — keeping random init "
+                  f"({len(_ttt_keys_missing)} keys). This is expected when "
+                  f"loading a pre-direction-C checkpoint.")
+            missing = missing - _ttt_keys_missing
+
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
         if unexpected:
@@ -927,8 +970,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_dt = total_ranking = 0.0
-        total_ce_raw = total_dt_raw = total_ranking_raw = 0.0
+        total_loss = total_bce = total_ce = total_dt = total_ranking = total_ttt = 0.0
+        total_ce_raw = total_dt_raw = total_ranking_raw = total_ttt_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -951,7 +994,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
                 # === Original logits from Model ===
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
+                    logits, abs_t_pred, outcome_logits, dt_gate_logit, ttt_pred = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
@@ -963,6 +1006,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 abs_t_pred = abs_t_pred.float()
                 outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
                 dt_gate_logit = dt_gate_logit.float()
+                ttt_pred = ttt_pred.float()
 
                 # logits is [B, T, V]
                 # abs_t_pred: [B, T]
@@ -1085,6 +1129,58 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     horizon=_HORIZON,
                 )  # [B, T-1, K]
 
+                # === Loss: Time-to-terminal regression (direction C) ===
+                # MSE between ttt_pred (log1p hrs) and log1p(t_next_terminal − t_now)
+                # in hours, at every non-terminal, non-pad position that has a future
+                # terminal in the same patient's sequence. The head shares the
+                # backbone with lm_head / outcome_head, so its MSE gradient forces
+                # the backbone hidden state to encode distance-to-terminal — a
+                # representation the LM head can use to time its DEATH/RELEASE
+                # emissions.
+                #
+                # Target construction (per query position t = 0..T-2):
+                #   term_flag[b, s]    = True iff target_ids[b, s] ∈ {DEATH, RELEASE}
+                #   future_term_ts[b,t]= min_{s≥t, term_flag[b,s]} abs_ts[b, s]
+                #   delta_hrs[b,t]     = (future_term_ts[b,t] − query_abs_ts[b,t])
+                #                        * _ABS_TS_SCALE   (hours, clamped ≥ 0)
+                #   target_log1p[b,t]  = log1p(delta_hrs[b,t])
+                # Valid mask: non-pad query position, has a future terminal, and the
+                # query position itself is not the terminal.
+                _terminal_ids_tensor = model._terminal_ids                 # [num_terminals]
+                _term_flag_full      = torch.isin(full_targets, _terminal_ids_tensor)  # [B, T]
+                # +inf at non-terminal positions so cummin can pick the next terminal time.
+                _LARGE_TS = torch.full_like(batch["abs_ts"], 1e6)
+                _terminal_ts = torch.where(_term_flag_full, batch["abs_ts"], _LARGE_TS)
+                # Reverse cumulative min: future_term_ts[b, t] = min over s≥t.
+                _future_term_ts = torch.flip(
+                    torch.cummin(torch.flip(_terminal_ts, dims=[1]), dim=1).values,
+                    dims=[1],
+                )                                                          # [B, T]
+                # Use ALL positions where we predict (positions 0..T-2 fed into the
+                # LM head produce ttt_pred[:, :-1]). The query timestamp at position
+                # t is abs_ts[t] (not the prediction itself — we measure distance
+                # from the *current* event).
+                _query_abs = batch["abs_ts"][:, :-1]                       # [B, T-1]
+                _future_term_q = _future_term_ts[:, :-1]                   # [B, T-1]
+                _delta_norm = (_future_term_q - _query_abs).clamp(min=0.0)
+                _delta_hrs = _delta_norm * _ABS_TS_SCALE
+                _ttt_target_log1p = torch.log1p(_delta_hrs)                # [B, T-1]
+                # Valid: non-pad at the QUERY position (nonpad already excludes that),
+                # AND a future terminal exists (_future_term_q finite),
+                # AND the query position itself is not a terminal (so the head doesn't
+                # try to predict "0 hours to terminal" at the terminal token itself).
+                _has_future_term = _future_term_q < (1e6 * 0.5)
+                _query_is_term   = _term_flag_full[:, :-1]
+                _ttt_valid = nonpad & _has_future_term & (~_query_is_term)  # [B, T-1]
+                _ttt_pred_q = ttt_pred[:, :-1]                              # [B, T-1]
+                if _ttt_valid.any():
+                    _diff = (_ttt_pred_q - _ttt_target_log1p)
+                    loss_ttt_raw = ((_diff ** 2) * _ttt_valid.float()).sum() \
+                                   / _ttt_valid.float().sum().clamp(min=1.0)
+                else:
+                    loss_ttt_raw = ttt_pred.sum() * 0.0
+                loss_ttt = lambdas.get("ttt", 0.0) * loss_ttt_raw
+
                 # === Loss: Pairwise ranking (direct AUROC proxy on the outcome head) ===
                 # Positive positions: outcome_targets > 0 (outcome occurs within horizon).
                 # Negative positions: outcome_targets == 0 (no outcome within horizon).
@@ -1099,14 +1195,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + loss_ttt
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "ttt": loss_ttt, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1138,9 +1234,11 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce      += loss_ce.item()
                 total_dt      += abs_t_loss.item()
                 total_ranking += loss_ranking.item()
+                total_ttt     += loss_ttt.item()
                 total_ce_raw      += loss_ce_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
+                total_ttt_raw     += loss_ttt_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1160,22 +1258,24 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_dt      / n_batches,
             total_ranking / n_batches,
+            total_ttt     / n_batches,
             total_ce_raw      / n_batches,
             total_dt_raw      / n_batches,
             total_ranking_raw / n_batches,
+            total_ttt_raw     / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ce_raw, tr_dt_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ttt, tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_ttt_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_ttt, _, _, _, _                                      = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f}, TTT={tr_ttt:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f}, TTT={vl_ttt:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f} ttt={tr_ttt_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1184,6 +1284,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             ranking=tr_ranking_raw,
+            ttt=tr_ttt_raw,
         )
         for msg in schedule_events:
             print(msg)
@@ -1364,7 +1465,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 # inside GPT.forward also re-enters autocast for backward). Matches
                 # Phase-2 precision regime and cuts activation memory roughly in half.
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    logits, _, outcome_logits, _ = model(
+                    logits, _, outcome_logits, _, _ = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
