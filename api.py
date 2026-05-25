@@ -14,9 +14,20 @@ this script to train and evaluate. The summary block (after the "---" separator)
 is the ground-truth result for each run.
 
 Optimization target (all from the held-out test set, not the val split):
-    outcome_auroc  — primary,   higher is better (0.5 = random, 1.0 = perfect)
-    outcome_auprc  — secondary, higher is better
-    onset_mae_hrs  — tertiary,  lower is better
+    patient_auroc_weighted  — PRIMARY headline. Support-weighted mean of per-
+                              outcome patient-level peak-detector AUROC. Each
+                              (patient, outcome) contributes one (max_P, label)
+                              pair; AUC pooled per outcome, mean weighted by
+                              n_pos. Stable on rare outcomes — replaces the
+                              per-window pooling that the previous loop used.
+    patient_auprc_weighted  — same, AUPRC.
+    peak_mae_hrs:<outcome>  — onset MAE per outcome (positives only), to the
+                              NEAREST GT occurrence (not just first).
+    composite_auroc /
+        patient_auroc_simple — simple (unweighted) mean across outcomes.
+
+    outcome_auroc / auprc / onset_mae_hrs — LEGACY per-window framing, kept
+    for back-compat and supplementary reporting (not headline).
 """
 
 import gc
@@ -479,6 +490,31 @@ phase3_best   = _ts.get("phase3_best_val", min(p3_val_losses) if p3_val_losses e
 phase3_epochs = _ts.get("phase3_epochs",   len(p3_val_losses))
 
 print("---")
+# === HEADLINE — patient-level peak-detector framing (NEW) ===========
+print(f"patient_auroc_weighted: {eval_results['patient_auroc_weighted']:.6f}")
+print(f"patient_auprc_weighted: {eval_results['patient_auprc_weighted']:.6f}")
+print(f"patient_auroc_simple:   {eval_results['patient_auroc_simple']:.6f}")
+print(f"patient_auprc_simple:   {eval_results['patient_auprc_simple']:.6f}")
+print(f"n_outcomes_used:        {eval_results['n_outcomes_used']}")
+
+# Per-outcome patient AUC + peak-MAE — grep-friendly TSV.
+print("patient_per_outcome\toutcome\tauroc\tauprc\tn_pos\tn_neg\tprevalence")
+_pat_tbl = eval_results.get("patient_auc_table")
+if _pat_tbl is not None:
+    for _outcome, _row in _pat_tbl.iterrows():
+        _auroc = f"{_row['auroc']:.6f}" if not pd.isna(_row['auroc']) else "nan"
+        _auprc = f"{_row['auprc']:.6f}" if not pd.isna(_row['auprc']) else "nan"
+        print(f"patient_per_outcome\t{_outcome}\t{_auroc}\t{_auprc}\t"
+              f"{int(_row['n_pos'])}\t{int(_row['n_neg'])}\t{_row['prevalence']:.6f}")
+
+print("peak_mae_hrs\toutcome\tmae_hours\tn_patients")
+_mae_tbl = eval_results.get("peak_mae_table")
+if _mae_tbl is not None and len(_mae_tbl) > 0:
+    for _outcome, _row in _mae_tbl.iterrows():
+        _mae = f"{_row['mae_hours']:.4f}" if not pd.isna(_row['mae_hours']) else "nan"
+        print(f"peak_mae_hrs\t{_outcome}\t{_mae}\t{int(_row['n_patients'])}")
+
+# === LEGACY per-window framing (back-compat / supplementary) ========
 print(f"outcome_auroc:    {eval_results['mean_auroc']:.6f}")
 print(f"outcome_auprc:    {eval_results['mean_auprc']:.6f}")
 print(f"onset_mae_hrs:    {eval_results['mean_mae_hours']:.2f}")

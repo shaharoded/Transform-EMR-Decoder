@@ -39,7 +39,7 @@ if EMR_MODEL_DIR not in sys.path:
     sys.path.insert(0, EMR_MODEL_DIR)
 
 from transform_emr.dataset import DataProcessor, EMRDataset
-from transform_emr.config.dataset_config import TAK_REPO_PATH
+from transform_emr.config.dataset_config import TAK_REPO_PATH, OUTCOME_RARE_THRESHOLD_PCT
 from transform_emr.inference import generate
 
 # ---------------------------------------------------------------------------
@@ -51,8 +51,20 @@ EVAL_WINDOW_HOURS = 24.0  # non-overlapping prediction window size
 EVAL_GRACE_HOURS  = 24.0  # tolerance added to each window edge for positive labelling
 EVAL_MAX_LEN      = 500   # max generated steps per patient
 EVAL_TEMPERATURE  = 1.0   # sampling temperature (no top-k filtering)
-EVAL_MIN_POSITIVES = 3    # skip an outcome if fewer than this many positive windows exist
 EVAL_FULL_HORIZON_HOURS = 336.0  # cap per-patient eval horizon at 14 days (matches training/inference)
+
+# Eval-time outcome support threshold = same 1% used at data-load time
+# (OUTCOME_RARE_THRESHOLD_PCT in dataset_config). Outcomes that already passed
+# train-set filtering can still be rarer in the held-out test set, so we
+# re-check at eval time. Below this share of positive patients an outcome's
+# AUROC/AUPRC is reported as NaN (still printed in per-outcome) and excluded
+# from headline means.
+EVAL_PREVALENCE_THRESHOLD = OUTCOME_RARE_THRESHOLD_PCT / 100.0  # fraction (0.01)
+
+
+def _min_positives(n_patients, threshold=EVAL_PREVALENCE_THRESHOLD):
+    """Minimum positive count for an outcome's AUC to be emitted (≥1)."""
+    return max(1, int(round(threshold * n_patients)))
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +233,7 @@ def extract_ground_truth_episodes(eval_ds, outcome_names):
 def pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
                         window_hours=EVAL_WINDOW_HOURS,
                         grace_hours=EVAL_GRACE_HOURS,
-                        min_positives=EVAL_MIN_POSITIVES,
+                        min_positives=None,
                         patient_horizons=None):
     """
     Purpose: Compute episode-level AUROC and AUPRC pooled across all (patient, window) pairs.
@@ -256,6 +268,9 @@ def pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
     p_cols = [f"P_{n}" for n in outcome_names]
     if len(gen_df) == 0:
         return pd.DataFrame()
+
+    if min_positives is None:
+        min_positives = _min_positives(risk_df["PatientId"].nunique())
 
     t_start = float(gen_df["TimePoint"].min())
 
@@ -333,7 +348,7 @@ def pooled_auc_across_horizons(risk_df, gt_labels_episodes, outcome_names,
                                 horizon_caps_hrs=tuple(range(24, 337, 24)),
                                 window_hours=EVAL_WINDOW_HOURS,
                                 grace_hours=EVAL_GRACE_HOURS,
-                                min_positives=EVAL_MIN_POSITIVES):
+                                min_positives=None):
     """
     Purpose: Compute pooled_episode_auc at multiple per-patient horizon caps so
              the agent can read off a horizon curve in a single eval pass —
@@ -377,7 +392,7 @@ def time_accuracy(risk_df, gt_labels, outcome_names):
     """
     Purpose: Compute mean absolute error between predicted and actual complication onset time.
     Method: For each patient where a complication occurred, finds the generated step with peak
-            outcome-head probability and measures its distance from the ground-truth time.
+            outcome-head probability and measures its distance from the ground-truth FIRST time.
 
     Args:
         risk_df (pd.DataFrame): Output of generate() with collect_risk_scores=True.
@@ -410,6 +425,155 @@ def time_accuracy(risk_df, gt_labels, outcome_names):
         })
 
     return pd.DataFrame(rows).set_index("outcome").sort_values("mae_hours")
+
+
+def time_accuracy_nearest(risk_df, gt_episodes, outcome_names):
+    """
+    Purpose: MAE between the model's peak-risk moment and the NEAREST ground-truth
+             occurrence (not just the first). Fairer when complications recur:
+             argmax may catch the more prominent of two correct hits.
+    Method:  For each (patient, outcome), find t_peak = argmax_t P_outcome(t) in the
+             generated portion, then mae = min_{t_gt in episodes} |t_peak − t_gt|.
+             Patients with no GT occurrence of that outcome are skipped.
+
+    Args:
+        risk_df (pd.DataFrame): Output of generate() with collect_risk_scores=True.
+        gt_episodes (dict): {pid: {outcome: [t1, t2, ...]}} all occurrence times.
+        outcome_names (list[str]): Outcome names to evaluate.
+
+    Returns:
+        pd.DataFrame: Indexed by outcome, columns: mae_hours, n_patients.
+    """
+    gen_df = risk_df[risk_df["IsInput"] == 0].copy()
+    if len(gen_df) == 0:
+        return pd.DataFrame()
+    p_cols = [f"P_{n}" for n in outcome_names]
+    idxmax = gen_df.groupby("PatientId")[p_cols].idxmax()
+
+    rows = []
+    for name in outcome_names:
+        pcol   = f"P_{name}"
+        pred_t = gen_df.loc[idxmax[pcol].dropna().astype(int), ["PatientId", "TimePoint"]]
+        pred_t = pred_t.set_index("PatientId")["TimePoint"]
+
+        errors = []
+        for pid, pt in pred_t.items():
+            episodes = gt_episodes.get(pid, {}).get(name, [])
+            if not episodes:
+                continue
+            # Distance to nearest GT occurrence.
+            errors.append(min(abs(pt - t_gt) for t_gt in episodes))
+
+        rows.append({
+            "outcome":    name,
+            "mae_hours":  float(np.mean(errors)) if errors else np.nan,
+            "n_patients": len(errors),
+        })
+
+    return pd.DataFrame(rows).set_index("outcome").sort_values("mae_hours")
+
+
+def per_patient_max_auc(risk_df, gt_episodes, outcome_names, min_positives=None):
+    """
+    Purpose: Patient-level peak-detector AUC (new headline framing).
+    Method:  For each (patient, outcome):
+               score = max P_outcome(t) over all generated positions (IsInput==0).
+                       Patients that generated no tokens contribute score = 0.
+               label = 1 iff the outcome occurred at any point in the GT trajectory.
+             AUROC/AUPRC computed once per outcome over all patients.
+
+             This replaces the per-(patient, window) pooling used by
+             pooled_episode_auc: rare-outcome AUCs are far more stable here
+             because each outcome reduces to a single binary classification
+             with n_patient positives vs negatives — no window-count noise
+             amplification.
+
+    Args:
+        risk_df (pd.DataFrame): generate() output with collect_risk_scores=True.
+        gt_episodes (dict): {pid: {outcome: [t1, t2, ...]}}.
+        outcome_names (list[str]): outcomes to score.
+        min_positives (int, optional): minimum positive patients to emit an AUC.
+            Defaults to round(EVAL_PREVALENCE_THRESHOLD * n_patients), so the
+            same 1 % support rule the data pipeline uses applies here too.
+
+    Returns:
+        pd.DataFrame: indexed by outcome, columns:
+            auroc, auprc, n_pos, n_neg, prevalence
+    """
+    gen_df = risk_df[risk_df["IsInput"] == 0]
+    p_cols = [f"P_{n}" for n in outcome_names]
+    all_pids = list(risk_df["PatientId"].unique())
+    n_patients = len(all_pids)
+    if min_positives is None:
+        min_positives = _min_positives(n_patients)
+
+    # Per-patient max score per outcome. Patients with no generated rows → 0.
+    max_per_patient = {pid: {c: 0.0 for c in p_cols} for pid in all_pids}
+    if len(gen_df):
+        grouped = gen_df.groupby("PatientId")[p_cols].max()
+        for pid, row in grouped.iterrows():
+            for c in p_cols:
+                max_per_patient[pid][c] = float(row[c])
+
+    rows = []
+    for name in outcome_names:
+        pcol = f"P_{name}"
+        scores, labels = [], []
+        for pid in all_pids:
+            scores.append(max_per_patient[pid][pcol])
+            labels.append(int(len(gt_episodes.get(pid, {}).get(name, [])) > 0))
+        labels = np.array(labels)
+        scores = np.array(scores)
+        n_pos = int(labels.sum())
+        n_neg = int((1 - labels).sum())
+        prevalence = n_pos / max(1, n_pos + n_neg)
+
+        if n_pos < min_positives or n_neg < min_positives:
+            rows.append({"outcome": name, "auroc": np.nan, "auprc": np.nan,
+                         "n_pos": n_pos, "n_neg": n_neg, "prevalence": prevalence})
+            continue
+
+        rows.append({
+            "outcome":    name,
+            "auroc":      float(roc_auc_score(labels, scores)),
+            "auprc":      float(average_precision_score(labels, scores)),
+            "n_pos":      n_pos,
+            "n_neg":      n_neg,
+            "prevalence": prevalence,
+        })
+
+    return pd.DataFrame(rows).set_index("outcome").sort_values("auroc", ascending=False)
+
+
+def weighted_mean_auc(auc_table, by="n_pos"):
+    """
+    Purpose: Support-weighted mean AUROC/AUPRC across outcomes.
+    Method:  Σ(w_o · AUC_o) / Σ(w_o) over outcomes with non-NaN AUC.
+             Weight defaults to n_pos so rare outcomes contribute less.
+
+    Args:
+        auc_table (pd.DataFrame): per-outcome table with columns
+            auroc, auprc, n_pos (e.g. from per_patient_max_auc).
+        by (str): weight column ("n_pos" or "prevalence").
+
+    Returns:
+        dict: {"auroc_weighted", "auprc_weighted", "auroc_simple",
+               "auprc_simple", "n_outcomes_used"}.
+    """
+    tbl = auc_table.dropna(subset=["auroc"])
+    if len(tbl) == 0:
+        return {"auroc_weighted": float("nan"), "auprc_weighted": float("nan"),
+                "auroc_simple":   float("nan"), "auprc_simple":   float("nan"),
+                "n_outcomes_used": 0}
+    w = tbl[by].astype(float).values
+    w = w / w.sum() if w.sum() > 0 else np.ones_like(w) / len(w)
+    return {
+        "auroc_weighted":  float((tbl["auroc"].values * w).sum()),
+        "auprc_weighted":  float((tbl["auprc"].values * w).sum()),
+        "auroc_simple":    float(tbl["auroc"].mean()),
+        "auprc_simple":    float(tbl["auprc"].mean()),
+        "n_outcomes_used": int(len(tbl)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -487,13 +651,19 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
           f"max={horizons_arr.max():.1f}")
 
     # -- Compute metrics --
-    print("[Eval] Computing episode-level AUC and time accuracy...")
-    # Primary AUC table uses each patient's true horizon (horizon-extended eval).
+    print("[Eval] Computing patient-level AUC, episode-level AUC, time accuracy...")
+    # NEW HEADLINE — per-patient peak-detector AUC. Each (patient, outcome)
+    # contributes one (max_P, label) pair; far more stable than per-window.
+    patient_auc_table = per_patient_max_auc(risk_df, gt_episodes, outcome_names)
+    patient_mean      = weighted_mean_auc(patient_auc_table, by="n_pos")
+    # Nearest-GT MAE — fair when complications recur (argmax may catch the
+    # second occurrence and still be a correct hit).
+    peak_mae_table    = time_accuracy_nearest(risk_df, gt_episodes, outcome_names)
+
+    # Legacy per-window AUC table kept for back-compat and supplementary
+    # reporting; no longer the headline.
     auc_table = pooled_episode_auc(risk_df, gt_episodes, outcome_names,
                                     patient_horizons=patient_horizons)
-    # Multi-horizon view: same generated trajectories, scored against three
-    # progressively-longer windows so the agent can read off a horizon curve
-    # (next-48h, first-week, full 14-day) without re-generating.
     multi_horizon_table = pooled_auc_across_horizons(
         risk_df, gt_episodes, outcome_names, eval_ds_full,
         horizon_caps_hrs=(48, 168, 336),
@@ -506,7 +676,15 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
     mean_mae_hours = float(mae_table["mae_hours"].mean(skipna=True))
 
     # Summarise per-outcome for the log
-    print("[Eval] Per-outcome AUROC (horizon-extended):")
+    print("[Eval] Per-patient AUC (new headline framing):")
+    for outcome, row in patient_auc_table.iterrows():
+        if not np.isnan(row["auroc"]):
+            print(f"  {outcome:<45} AUROC={row['auroc']:.3f}  AUPRC={row['auprc']:.3f}  "
+                  f"n_pos={int(row['n_pos'])}  prev={row['prevalence']:.3f}")
+    print(f"[Eval] Patient-level mean (support-weighted): AUROC={patient_mean['auroc_weighted']:.3f}  "
+          f"AUPRC={patient_mean['auprc_weighted']:.3f}  (simple: {patient_mean['auroc_simple']:.3f} / "
+          f"{patient_mean['auprc_simple']:.3f}, n_outcomes={patient_mean['n_outcomes_used']})")
+    print("[Eval] Per-outcome AUROC (legacy horizon-extended window pooling):")
     for outcome, row in auc_table.iterrows():
         if not np.isnan(row["auroc"]):
             print(f"  {outcome:<45} AUROC={row['auroc']:.3f}  AUPRC={row['auprc']:.3f}")
@@ -522,6 +700,15 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
         print(f"  cap={cap:>3d}h   AUROC={m_auroc:.3f}   AUPRC={m_auprc:.3f}")
 
     return dict(
+        # New headline (patient-level peak-detector).
+        patient_auc_table=patient_auc_table,
+        patient_auroc_weighted=patient_mean["auroc_weighted"],
+        patient_auprc_weighted=patient_mean["auprc_weighted"],
+        patient_auroc_simple=patient_mean["auroc_simple"],
+        patient_auprc_simple=patient_mean["auprc_simple"],
+        n_outcomes_used=patient_mean["n_outcomes_used"],
+        peak_mae_table=peak_mae_table,
+        # Legacy per-window framing (kept for back-compat / supplementary).
         mean_auroc=mean_auroc,
         mean_auprc=mean_auprc,
         mean_mae_hours=mean_mae_hours,

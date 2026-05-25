@@ -1,321 +1,298 @@
-# autoresearch — Trajectory-Generation Fix
+# autoresearch — Patient-Level Eval Reframing
 
-## The problem
+## The reframing
 
-Deployed M-256 collapses generation: median trajectory = 3 tokens / ~1 hour;
-100 % of patients emit a terminal (DEATH/RELEASE) within 24 h of seed end.
-Truncated eval looks great (AUROC 0.918 / AUPRC 0.630). The honest
-**horizon-extended eval** (windows extend to each patient's true admission
-horizon, score = 0 past generation end) collapses to AUROC 0.452 / AUPRC
-0.107. Model is a strong **next-48 h scorer**; it does **not** produce
-multi-day trajectories.
+Prior loop used per-(patient, window) AUC. It was dragged by rare
+outcomes and double-punished partial wins. New eval is per-patient
+peak-detector: for each (patient, outcome), score = `max P_outcome` over
+the generated portion, label = outcome occurred in GT. MAE = distance
+between `argmax_t P` and the **nearest** GT occurrence.
 
-Fix that without sacrificing the near-term capability. M-256 architecture
-locked. VRAM ≤ 24 GB. `api.py`, `evaluation.py`, data, and
-`emr_model/checkpoints.bak_originals/` are read-only.
+### Headline keys (in `api.py` summary block)
 
-## Tools at your disposal
+| Key | Meaning |
+|---|---|
+| `patient_auroc_weighted:` | Support-weighted mean per-outcome AUROC. **Primary**. |
+| `patient_auprc_weighted:` | Support-weighted mean AUPRC. |
+| `patient_auroc_simple:`   | Unweighted mean (sanity). |
+| `n_outcomes_used:`        | Outcomes passing the 1 % prevalence threshold. |
+| `patient_per_outcome\t…`  | Per-outcome AUROC/AUPRC/n_pos/n_neg/prevalence. |
+| `peak_mae_hrs\t…`         | Per-outcome MAE to nearest GT occurrence. |
 
-Every `python api.py > run.log` or `python api.py --eval-only > run.log`
-emits a grep-friendly summary block:
+Legacy keys (`outcome_auroc`, `multi_horizon\t…`, etc.) still emit for
+back-compat. Outcomes below 1 % test-set prevalence get `auroc=nan` and
+are excluded from the weighted mean.
 
-| Key prefix              | What |
-|-------------------------|------|
-| `outcome_auroc:` / `outcome_auprc:` | Horizon-extended headlines |
-| `onset_mae_hrs:` / `mae_release_hrs:` / `mae_death_hrs:` | Onset & terminal timing |
-| `gen_median_hours:`, `gen_p90_hours:`, `gen_max_hours:` | Generated trajectory length (time) |
-| `gen_median_steps:`, `gen_n_with_terminal:`, `gen_frac_terminal_first24h:` | Generation behaviour |
-| `gen_length_mae_hrs:`, `gt_median_hours:`, `gen_to_gt_ratio_median:` | Trajectory length vs GT (1.0 = full coverage) |
-| `multi_horizon\t<cap_h>\t<outcome>\t...` | Per-outcome AUROC/AUPRC at every 24 h cap, 24…336 h |
-| `per_outcome\t<outcome>\t...`              | Per-outcome AUROC/AUPRC at the horizon-extended cap |
-| `phase{2,3}_best_val:` | Training loss curves' best val per phase |
+VRAM ≤ 24 GB. Data and `bak_originals` are read-only.
 
-Plus persisted CSVs in `results/`: `per_outcome_<commit>.tsv`,
-`multi_horizon_<commit>.tsv`. Use `--eval-only` for inference-side
-experiments (no training cost; reads the deployed checkpoints).
+## What's already on this branch
 
-`api.py` already does the right thing: Phase 2/3 are wiped and retrained
-from scratch every run (with current code); Phase 1 cache-hits on
-`(embed_dim, time2vec_dim, ctx_dim)`; `processed_datasets.pt` is invariant
-across model experiments. **No mid-training resume ever happens.** Don't
-use `phase2_warm_start_path` / `phase3_warm_start_path` — that pattern is
-banned (the previous session's failure mode).
+You inherit a clean project. **Do not touch `api.py` or `evaluation.py`.**
+Edit only `emr_model/transform_emr/**` and its `config/**`.
 
-## Goal — three coupled objectives, not one
-
-Closing the gap is **simultaneously** about:
-
-1. **Trajectory collapse** — generation length and termination timing
-   (`gen_to_gt_ratio_median`, `gen_frac_terminal_first24h`, `gen_length_mae_hrs`).
-2. **Full-trajectory AUC** — horizon-extended ranking & precision-recall
-   (`outcome_auroc`, `outcome_auprc`, multi_horizon cap=336h).
-3. **Short-term AUC** — preserve the strong next-48h capability
-   (`multi_horizon` cap=48h ≥ canonical −0.07).
-
-A fix that solves (1) at the cost of (2) or (3) isn't a fix — it's a
-trade. The expectation is that **several different strategies will be
-needed**, each addressing one or two of the three. No single experiment
-has to solve everything; the goal is for the running-best stack to
-collectively close all three.
-
-| Metric (current)                     | Direction | Tied to |
-|--------------------------------------|-----------|---------|
-| `outcome_auroc` 0.452                | ↑         | (2) full AUC |
-| `outcome_auprc` 0.107                | ↑         | (2) full AUC |
-| `gen_length_mae_hrs` ~140            | ↓         | (1) collapse |
-| `gen_to_gt_ratio_median` ~0          | → 1.0     | (1) collapse |
-| `gen_frac_terminal_first24h` 1.0     | ↓         | (1) collapse |
-| multi_horizon cap=48h AUROC mean     | preserve  | (3) short-term |
+- `evaluation.py` already has `per_patient_max_auc`,
+  `weighted_mean_auc`, `time_accuracy_nearest`, and the legacy
+  per-window functions.
+- `api.py` summary block emits all keys above.
+- Z architecture (narrow + frozen `log_tau_lm[terminal]`) is the
+  starting point — code on HEAD, no checkpoint on disk (pod is fresh).
+- Ledger: `results/results-trajectory-fix.tsv`.
 
 ## The loop
 
-**10k-sample loop is the primary workspace.** Trajectory collapse, full-
-horizon AUC, and short-horizon (cap=48h) AUC are three coupled
-objectives — closing the gap likely needs many different architectural
-attempts, not one silver bullet. Burning a full-data run on every idea
-wastes hours per experiment. Instead:
-
-- **All experiments run at `sample=10000`** (~25 min on GPU per training
-  experiment) — this is the running iteration loop. KEEP/DISCARD
-  verdicts and the running best are tracked at 10k scale.
-- **Full-data confirm runs are reserved for the end of an architectural
-  block** — when the agent has run through the primary directions, the
-  running best has settled, and further 10k experiments are not yielding
-  meaningful gains. Only then do we re-run the running best (and
-  optionally the second/third candidates) at `sample=None` to produce
-  publishable numbers.
-- The full-data run is a **validation step**, not a verdict step. If
-  the 10k running best fails to replicate at full scale, that's a
-  signal we have a sample-size artifact and need more 10k probing —
-  not an automatic DISCARD.
+10k-sample is the primary workspace (~25–30 min per training run).
+Full-data confirm only at end of a block or when running best is stable.
 
 ```
-1. Read `program.md`. Check `git log --oneline -5`, last rows of
-   `results/results-trajectory-fix.tsv`.
+1. Read program.md. Check git log + last rows of
+   results/results-trajectory-fix.tsv.
 2. Propose ONE change with a falsifiable hypothesis.
-3. SMOKE TEST  (sample=50, phase{1,2,3}_n_epochs=1):
+3. SMOKE (sample=50, phase{1,2,3}_n_epochs=1):
       python api.py > smoke.log 2>&1
    Gate-A: no NaN/inf in any tr_* loss term.
-   Gate-B: every aux's raw magnitude within ~1–2 orders of magnitude of
-           BCE — otherwise `λ_aux ≈ 1e-6` and the loss isn't actually
-           being trained (looks "calibrated", but gradient is dead).
-   Gate-C: calibrated λ from LambdaScheduleController in [1e-3, 10].
-   Gate-D: summary block + `multi_horizon` block + `per_outcome` block
-           all print. No silent exceptions.
-   If any gate fails → fix formulation, do NOT pay for any longer run.
-4. Commit code only:
-      git add <code files> && git commit -m "<tag>: change / why / expected"
-      git push
-   Note <CODE_SHA>.
-5. EXPERIMENT RUN  (sample=10000, full epochs):
-      # set sample=10000 in model_config.py
+   Gate-B: every aux's raw magnitude within ~1–2 OOM of BCE.
+   Gate-C: calibrated λ in [1e-3, 10].
+   Gate-D: summary block prints, all headline keys present.
+   (P3-specific gates listed in P3 section.)
+4. git add <files> && git commit -m "<tag>: change / why / expected" && git push
+5. EXPERIMENT (sample=10000):
       python api.py > run.log 2>&1
-   ~25-30 min on GPU. Gates T1-T3 apply.
-   (Inference-side experiments: --eval-only against current
-   checkpoints — already cheap, no sample knob needed.)
-
-   POST-TRAIN VALIDATION (mandatory before logging a verdict):
-   Gate-T1: Read run.log epoch-by-epoch. Every aux's RAW loss term
-            must show a real decrease across its active phase (no
-            flat aux, no NaNs, no oscillation).
-   Gate-T2: Early stop / warmup gate did not trigger before all aux
-            losses finished ramping (scheduler prints `warmup ends at
-            epoch N` — early stop must not have fired before N).
-   Gate-T3: Run diagnose.py and read it. The model must show real
-            discrimination:
-              cd emr_model && python -m transform_emr.diagnose > ../diag.log 2>&1
-            Reports 1/2/4/5 + Δt probe per program.md rules. If any
-            regresses materially vs the running best, treat as DISCARD
-            candidate even if headlines look OK.
-   Only when Gates T1–T3 all pass: write the verdict.
-
-   KEEP iff (at 10k scale, comparing against the running best
-   re-evaluated at sample=10000 — see step 11):
-     - All T1-T3 gates passed.
-     - At least one headline metric clearly moves in the right
-       direction beyond the 10k noise floor:
-         AUROC ≥ +0.010, AUPRC ≥ +0.010, MAE ≤ −10 h, OR
-         gen_to_gt_ratio_median up by ≥ 0.05, OR
-         gen_frac_terminal_first24h down by ≥ 0.10.
-     - No headline metric regresses by the same threshold.
-     - Truncated AUROC (multi_horizon cap=48h mean) doesn't drop
-       more than 0.07 vs running best.
-
-6. Append one row to results/results-trajectory-fix.tsv with the
-   summary-block headlines (multi_horizon caps 24/48/168/336 and
-   gen_* / mae_* / outcome_*). Mark sample size in description
-   (e.g. "10k" or "FULL").
-7. Write a `### <tag>` block in status.md ending with
-   `Verdict: KEEP|DISCARD — <reason>`.
-8. Journal commit:
-      git add status.md results/ && git commit -m "journal: <tag> <VERDICT> — <summary>"
-      git push
-9. If DISCARD:  git revert --no-edit <CODE_SHA>  &&  git push
-   (Never `git reset --hard` — that erases the journal entry.)
-10. If KEEP: new running best. Back up checkpoints:
-      cp -r emr_model/checkpoints emr_model/checkpoints.bak_keep_<tag>
-    KEEP'd code stays in HEAD; next experiment builds on top.
-
-11. AFTER each new KEEP, re-eval the running best at sample=10000 once
-    to refresh the baseline for the next screen. Inference-only
-    re-evals (`python api.py --eval-only` on the new checkpoints)
-    are fine here — no need to retrain.
-
-12. FULL-DATA CONFIRM (sample=None) is NOT part of the per-experiment
-    loop. Trigger it only when:
-      a) the running best has been stable across at least 2–3
-         consecutive DISCARD experiments (i.e. you've exhausted the
-         most promising primary directions and aren't finding more
-         10k gains), OR
-      b) all primary directions (C, B-rollout, G, D) have been
-         honestly attempted, OR
-      c) the user explicitly asks.
-    Then re-run the running best (and optionally the runner-up) at
-    `sample=None` for publishable numbers. Mark these rows "FULL" in
-    the ledger. If full-scale numbers don't replicate the 10k story,
-    that's a sample-size artifact to investigate — not an automatic
-    DISCARD.
+   POST-TRAIN:
+   T1: every aux's raw loss decreases across its active phase.
+   T2: early stop didn't fire before auxes finished ramping.
+   T3: diagnose.py shows real discrimination on key probes.
+6. Append row to results/results-trajectory-fix.tsv (new headline keys).
+7. Write `### <tag>` block in status.md → `Verdict: KEEP|DISCARD — …`.
+8. Journal commit + push.
+9. DISCARD → git revert --no-edit <CODE_SHA> && git push.
+10. KEEP → cp -r emr_model/checkpoints emr_model/checkpoints.bak_keep_<tag>.
+11. After each KEEP, re-eval running best at 10k (--eval-only) to refresh.
+12. FULL-DATA CONFIRM (sample=None) when running best stable across
+    2–3 DISCARDs, OR a block ends, OR user asks.
 ```
 
-## Research directions
+### KEEP rule (vs running best at 10k)
 
-Ordered by **whether the gradient actually reaches the failure mode**.
-Generation length at inference is set by **when the LM head emits a
-terminal token** (DEATH/RELEASE). A direction is high-priority iff its
-loss / mechanism has a credible gradient path to that terminal-token
-decision (directly or via the shared backbone). Loss-scale matters
-too: any aux whose raw magnitude differs from BCE by 4+ orders gets
-`λ ≈ 1e-6` after calibration and isn't trained.
+- All smoke gates A–D + post-train T1–T3 passed.
+- ≥ 1 headline lifts past noise: AUROC ≥ +0.010, AUPRC ≥ +0.010, MAE ≤ −5 h.
+- No headline regresses by the same threshold.
+- `gen_to_gt_ratio_median` doesn't drop below 0.4.
 
-### Primary — credible gradient path to terminal-token decision
+Otherwise DISCARD → revert.
 
-- **C. Time-to-terminal regression head** (cheapest of the primaries —
-  try first). Add an auxiliary head predicting
-  `log1p(t_terminal − t_now)` at every non-terminal position; MSE
-  against the GT time. The head shares the backbone with the LM head,
-  so the gradient forces the backbone representation to encode
-  distance-to-terminal — which the LM head can then use to decide *when*
-  to emit DEATH/RELEASE. Direct attack on the failure mode; one extra
-  head + one MSE term — minimal engineering surface.
-  *Falsifiable*: head R² > 0.3; `mae_release_hrs` / `mae_death_hrs` drop;
-  `gen_median_hours` rises; LM head's terminal logits shift across
-  positions accordingly.
+## Research directions (in order)
 
-- **B-rollout. Scheduled multi-step rollout with sequence-level length
-  loss** (reformulated B; the dead TF-only B is ruled out below). Try
-  if C doesn't move the needle — it's the more expensive but more
-  direct attack. Phase 2 starts with pure teacher forcing (existing
-  BCE / CE / dt losses). After `bce_only_epochs`, anneal a rollout
-  depth `k` from 1 upward across epochs — at the last `k` positions of
-  each sequence the model emits its own token (Gumbel-softmax with
-  annealed temperature τ: 2.0 → 0.5) and uses its own Δt prediction.
-  Per-position BCE / CE / dt losses still apply at rolled-out positions,
-  but they're now measured on the model's *own* output distribution.
-  Additionally, a **sequence-level length loss** on the rollout:
-  `|log1p(Σ_rollout pred_Δt_hrs) − log1p(target_rollout_horizon_hrs)|`.
-  This is the gradient path X lacked: emitting terminal early in rollout
-  → tiny Σ → high length loss → backprop pushes the LM-head terminal
-  logit down. Naturally combines A (scheduled sampling) + B (length
-  loss); as `k` grows the model's effective training distribution
-  shifts smoothly from TF to autoregressive.
-  *Falsifiable*: at end of training (k_max ~ 16–32), rolled-out
-  `gen_median_hours` matches GT within ±25 % on the smoke checkpoint;
-  `gen_frac_terminal_first24h` drops; 48 h `multi_horizon` AUROC
-  doesn't drop more than 0.07 below baseline.
-  *Engineering risks*: memory (k extra forward passes retained for
-  backward — likely halve batch + double grad-accum); gradient noise
-  (anneal both k AND τ slowly); Gumbel-softmax stability (start τ=2,
-  anneal to 0.5 not 0). Watch raw length-loss magnitude vs BCE for the
-  Gate-B check — keep both within 1–2 orders of magnitude.
+### P0 — Baselines under the new headline
 
-- **G. Short → long horizon curriculum.** Phase-2 loss = weighted mix of
-  next-48 h BCE (preserves 0.918) + multi-day cumulative signal,
-  multi-day weight ramped up across epochs. Anchored on what the model
-  already does well; the curriculum forces the LM head to extend its
-  prediction horizon without abandoning near-term.
-  *Falsifiable*: end of training, 48 h `multi_horizon` AUROC ≥ 0.91 AND
-  336 h clearly above 0.45.
+Two baselines must exist before any new direction is judged. Both are
+straight 10k runs; the better one becomes the running best for P1.
 
-- **D. Discrete-time hazard for terminals.** Replace BCE on DEATH/RELEASE
-  with a hazard head predicting `P(terminal in [t, t+Δ])` over log-spaced
-  Δ bins; structured time-to-terminal supervision. Direct attack on the
-  LM head's terminal output.
-  *Falsifiable*: terminal MAE drops; calibrated hazard CDF matches GT
-  terminal-time distribution within ~24 h.
+**B0-Z** — Z is already on HEAD. No code change required, just run.
+Z = direction E (narrow + frozen terminal `log_tau_lm`). Marker block
+is in `emr_model/transform_emr/transformer.py` ~line 463 — search for
+the comment `# Direction E: freeze the terminal entries of log_tau_lm`.
+Terminal-init value is set in
+`emr_model/transform_emr/config/model_config.py` (`_log_tau_terminal`,
+currently `math.log(12.0 / 336.0)`).
 
-### Secondary — addresses adjacent issues, not the terminal decision directly
+**B0-C-ttt** — re-apply commit **`dd3fc1b`** ("C-ttt-head: time-to-
+terminal regression aux (direction C) on Z") on top of HEAD. Adds an
+auxiliary head predicting `log1p(t_terminal − t_now)` per non-terminal
+position with MSE loss; shares the backbone. Touches four files:
+```
+emr_model/transform_emr/config/model_config.py
+emr_model/transform_emr/diagnose.py
+emr_model/transform_emr/inference.py
+emr_model/transform_emr/transformer.py
+```
+Recipe:
+```
+git show dd3fc1b --stat                 # inspect scope
+git cherry-pick --no-commit dd3fc1b     # apply diff, keep staged
+# resolve conflicts if any (HEAD is post-Z, dd3fc1b was on top of Z)
+# then commit as your own B0-C-ttt tag
+```
+Was DISCARDed under the old per-window eval (rare-7 flipped), but
+produced DEATH window-AUC 0.79 — expected to dominate on patient-level
+DEATH AUC.
 
-- **A. Scheduled sampling.** Anneal teacher-forcing replacement
-  `p: 0 → ~0.3` across Phase 2. Closes the train/inference distribution
-  gap — important if the failure mode partly reflects exposure bias.
-  Doesn't directly target the terminal-token decision; pairs naturally
-  with C or G.
-  *Falsifiable*: median generation length rises monotonically with `p`
-  on an in-training probe.
+### P1 — MIL patient-level max-BCE aux loss (Phase 3)
 
-### Symptom-attacking — last resort, not root cause
+```
+score_patient = softmax_t(logit_outcome(t) / T) · logit_outcome(t)
+loss_mil = BCE(σ(score_patient), patient_binary_label)
+```
 
-- **E. Narrow terminal `tau_lm`** (frozen). Tries to make the LM head's
-  terminal soft-kernel narrower so terminal BCE targets aren't positive
-  at distant positions. Attacks the kernel-widening symptom, not the
-  upstream "model doesn't know when terminal should come" cause. Y
-  (current run) is the freeze-via-gradient-hook version. A prior
-  initialise-only attempt landed flat; if Y is flat too, the direction
-  is exhausted.
+Soft max (temperature ~1.0, learnable per-outcome). Schedule via
+`LambdaScheduleController` with `aux_fraction_cap` ~ 0.20. Existing
+per-position BCE stays as the 48-h calibration anchor.
 
-### Ruled out
+**Falsifiable**: patient AUROC ≥ +0.03 vs best of {B0-Z, B0-C-ttt};
+per-window AUROC drop < 0.10.
 
-- **B (original — TF-only trajectory-length loss).** X DISCARDed;
-  post-hoc analysis showed the loss formulation has **no gradient path
-  to the LM head's terminal-token decision** — it only constrains the
-  dt head's per-step Δt predictions during teacher forcing (which the
-  per-step dt MSE already covers), and the dt head is decoupled from
-  token choice at inference. The `log_tau_lm` drift in X is a downstream
-  symptom, not the cause. The legitimate reformulation is **B-rollout**
-  above — same length-loss intuition, but applied to autoregressive
-  rollout output where the gradient actually reaches the LM head.
+### P2 — Soft-argmax time loss, positives only (Phase 3)
 
-### Inference-side — only after the backbone is honest
+```
+weights = softmax(logit_outcome(t) / T_time)
+predicted_t = sum_t(weights · t)
+loss_time = smooth_l1(predicted_t, nearest_t_in_gt(outcome, patient))
+```
 
-(`python api.py --eval-only` — no retraining cost.)
+Per-outcome learnable `T_time` (~13 scalars). Only for patients with the
+outcome.
 
-- **F1. Beam search** with length-normalised score (score / length^α).
-- **F2. Temperature schedule** — higher temperature in first N steps to
-  escape the immediate-terminal local minimum, anneal back.
-- **F3. Hazard-driven terminal sampling** at inference using the existing
-  outcome head.
+**Falsifiable**: `peak_mae_hrs` for {DEATH, RELEASE} drops ≥ 5 h;
+patient AUROC doesn't regress.
 
-## KEEP vs DISCARD
+### P3 — Risk-aware LM head (architectural coupling)
 
-Comparison reference = **the most recent KEEP** (= running best). First
-experiment compares to `bak_originals` (canonical M-256, AUROC 0.452 /
-AUPRC 0.107).
+Currently the LM and outcome heads only share a backbone. P3 makes the
+outcome-head's prediction influence which tokens the LM emits.
 
-**KEEP** iff *all*:
-- Smoke gates A–D all passed.
-- Peak VRAM ≤ 24 GB.
-- ≥ 1 horizon-extended headline improves past noise floor
-  (AUROC ≥ +0.005, AUPRC ≥ +0.005, MAE ≥ −5 h).
-- No headline regresses past noise floor.
-- Truncated AUROC (`multi_horizon` cap=48 h) drops by < 0.07.
-- `gen_median_hours` strictly above running best (or already ≥ 50 % of
-  median patient horizon).
-- `gen_frac_terminal_first24h` strictly below running best (or already
-  < 0.10).
+**The change.** Linear projection `bias_proj: n_outcomes → vocab_size`.
+Per position:
+```python
+# B=batch, T=seq, D=hidden, V=vocab, K=n_outcomes
+h           # (B,T,D)
+lm_logits = LM_head(h)                  # (B,T,V)
+o_logits  = outcome_head(h)             # (B,T,K)  ← must be 3D
+P         = torch.sigmoid(o_logits)     # (B,T,K)
 
-**Otherwise DISCARD** → `git revert <CODE_SHA>`.
+assert P.shape == (B,T,K)
+assert lm_logits.shape == (B,T,V)
+
+bias = bias_proj(P)                     # (B,T,V)
+assert bias.shape == lm_logits.shape
+
+combined_logits = lm_logits + bias      # (B,T,V)
+```
+No shift — `P[t]` and `lm_logits[t]` both predict from `h_t`. (Prior
+attempts died on: silent broadcast from missing T axis on P; off-by-one
+shift; bias_proj weight not zero-initialised so step-0 disrupted CE.)
+
+**Init must be no-op**: `nn.init.zeros_(bias_proj.weight)`. Step 0
+combined_logits == lm_logits exactly.
+
+**Phase 3 unfreezing**: LM head must have `requires_grad=True`, LR
+multiplier ~0.1×base. `bias_proj` and outcome head get full base LR.
+
+**Smoke gates** (additions on top of A–D):
+- **P3a**: zero-init no-op — CE on first batch matches non-coupled
+  baseline to 1e-6.
+- **P3b**: after first backward, all three grads non-zero:
+  `bias_proj.weight.grad.norm()`, `outcome_head[-1].weight.grad.norm()`,
+  `LM_head.weight.grad.norm()`, each > 1e-8.
+- **P3c**: shape asserts pass.
+
+**Per-epoch print** (Phase 3 and `diagnose.py`):
+```
+P3 coupling stats epoch <e>:
+  ||bias|| / ||lm_logits||  mean: <r>  max: <r>
+  bias_proj.weight row norms (per outcome): [DEATH=.., RELEASE=.., ...]
+  per-outcome contribution to terminal logits: [DEATH→TERM=<>, ...]
+```
+Healthy ratio band: **0.05–0.3**. Below → no coupling formed.
+Above → bias dominates, LM atrophies.
+
+**Behavioural probe** (`diagnose.py`, held-out batch):
+```
+Pearson(P_DEATH[t], terminal_token_logit[t]):  <ρ>  (> 0.3 healthy)
+gen_to_terminal_hrs on positives vs negatives, Δ in hours (>0 healthy)
+```
+Δ ≤ 0 → coupling didn't form behaviourally → DISCARD even if AUC moved.
+
+**Falsifiable**: patient DEATH/RELEASE AUROC ≥ +0.03 vs P1+P2;
+behavioural Δ > 12 h; coupling ratio in [0.05, 0.3].
+
+The `bias_proj` row weights — which outcomes bias which tokens — are
+publication-worthy figure material.
+
+### P4 — Patient-level pooling head
+
+Learned attention pool over generated hidden states, queried by
+per-outcome embeddings → per-patient score replaces "max P_outcome" in
+eval. Per-position outcome head stays for 48-h calibration. ~150 LOC.
+
+Defer unless P1+P2+P3 plateau.
+
+**Falsifiable**: patient AUROC ≥ +0.05 vs P1+P2+P3.
+
+### P5 — Architecture scale-up
+
+**Trigger**: P0–P4 honestly attempted, running best clearly beats
+`bak_originals` (≥ +0.03 patient AUROC, trajectory honesty preserved),
+recent 10k experiments DISCARDing.
+
+Lift M-256 lock. Scan grid with running-best loss recipe:
+
+| Tag | embed_dim | n_layer | n_head | Approx params |
+|---|---|---|---|---|
+| M-128 | 128 | 4 | 4 | ~2 M |
+| M-256 | 256 | 4 | 4 | ~6 M (baseline) |
+| M-384 | 384 | 6 | 6 | ~15 M |
+| M-512 | 512 | 6 | 8 | ~25 M |
+| M-768 | 768 | 8 | 12 | ~55 M |
+
+OOM at full-data confirm → halve batch + double grad-accum; if still
+OOM, that's the size ceiling.
+
+**Decision**: smallest variant within ~0.005 of best (prefer smaller).
+Confirm at full data.
+
+### P6 — M0 ablation: per-position outcome BCE redundancy
+
+After P5, down-weight / disable per-position BCE (`aux_fraction_cap`
+→ 0.02 or off). Structural diagnostic, not a KEEP/DISCARD candidate:
+- Patient AUROC holds + cap=48h doesn't collapse → per-position BCE
+  was redundant for ranking; keep small for calibration only.
+- cap=48h collapses → per-position BCE is the calibration anchor; keep.
+
+### P7 — Final: toggle `USE_QA_DATA` on the very best model
+
+**Trigger**: P5 chose architecture, P6 settled the loss recipe,
+running best is the genuine end-of-loop candidate.
+
+Toggle `USE_QA_DATA = True` in
+`emr_model/transform_emr/config/dataset_config.py`. This adds context
+features AND new tokens — the cached vocab/scaler/datasets are stale.
+
+**Pre-flight (mandatory before `python api.py`)**:
+```bash
+rm -f emr_model/checkpoints/tokenizer.pt
+rm -f emr_model/checkpoints/scaler.pkl
+rm -f emr_model/checkpoints/processed_datasets.pt
+rm -rf emr_model/checkpoints/phase1
+```
+
+Phase 1 retrains from scratch (only experiment in the whole loop that
+does). Verify after rebuild: `len(tokenizer.token2id)` must be strictly
+greater than the non-QA value — if equal, QA tokens weren't picked up.
+
+Smoke (sample=50) before full data; this final run is at sample=None
+since the result is publishable, not a 10k probe.
+
+**Falsifiable**: full-data `patient_auroc_weighted` lifts ≥ +0.005 OR
+QA-introduced tokens visibly emitted in generated trajectories. If
+neither, the non-QA running best stands as the final result.
+
+## Inference-side directions (no retraining)
+
+`python api.py --eval-only`:
+- **F1**. Beam search with length-normalised scoring.
+- **F2**. Temperature schedule to escape immediate-terminal local minimum.
+
+Try after backbone work plateaus.
 
 ## Stop criterion
 
-When the horizon-extended `outcome_auroc` is clearly above the 0.452
-baseline, AUPRC clearly above prevalence (lifts ≥ 2× for most outcomes),
-`gen_median_hours` a meaningful fraction of the median patient horizon,
-and terminal MAE clinically informative — that is a publishable
-multi-day predictor. Stop and write a final session report in `status.md`.
+No quality target — push as high as the model honestly allows. Stop when:
+- All P0–P7 honestly attempted,
+- Last 2–3 10k experiments DISCARDed,
+- Full-data confirm of running best done.
 
-If after honest attempts the gap can't be closed, document the trade-off
-honestly. The deployed M-256 remains publishable under the "next-48 h
-event-window scorer" framing.
+Write final report in `status.md`: running-best numbers (weighted
+AUROC, per-outcome AUROC for DEATH/RELEASE/each complication, peak-MAE,
+trajectory honesty stats), and what was tried.
 
 ## Reproducibility
 
@@ -323,4 +300,5 @@ event-window scorer" framing.
 - Ledger: `results/results-trajectory-fix.tsv`.
 - Canonical baseline: `emr_model/checkpoints.bak_originals/` (read-only).
 - Running-best backups: `emr_model/checkpoints.bak_keep_<tag>/`.
-- Journal: `status.md` (Sections 1 / 1b from prior branch stay intact).
+- Journal: `status.md` (Sections 1 / 1b stay intact).
+
