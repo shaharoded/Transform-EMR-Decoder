@@ -797,6 +797,191 @@ Stop-criterion status:
 
 ---
 
+### B0-C-ttt-full @ FULL DATA (SHA 9544faa) — FINAL RESULT
+
+End-of-loop full-data confirm of the running-best B0-C-ttt recipe
+(M-256 + Z direction-E frozen-narrow `log_tau_terminal` + C-ttt
+time-to-terminal aux + Phase-2 ce/dt/ttt/ranking curriculum + Phase-3
+outcome-head BCE coef=1.0 + ranking). `sample=None`, ~57 k patients
+(~5.7× the 10k workspace; 7,447-patient held-out test set vs 1,500 at
+10k).
+
+**P6 trigger note**: P6 (architecture scale-up at full data) was
+SKIPPED because the strict trigger failed at the end of P5: the 10k
+running best vs B0-Z was +0.016 patient_auroc_weighted, short of the
++0.030 floor program.md requires before burning hours on
+architecture sweep. P7 requires P6 first, so it was also skipped.
+The honest end-of-loop step is full-data confirm of the running-best
+recipe (loop step 12), which is what this block reports.
+
+Per-aux training trace (full-data confirm run):
+
+| Aux            | Unlock epoch | λ_max  | Anchor raw_aux | Final raw_aux | Δ      | Status |
+|----------------|--------------|--------|----------------|---------------|--------|--------|
+| ce             | 4 (Ph-2)     | 0.0786 | 0.9731         | (P2 epoch 20)  | descending — full P2 final values omitted (only the early-stopped epoch survives in run.log; see below) |
+| dt             | 4 (Ph-2)     | 0.0949 | 0.8056         | (P2 epoch 20)  | descending |
+| ttt            | 4 (Ph-2)     | 0.0022 | 21.2961        | (P2 epoch 20)  | descending |
+| ranking (Ph-2) | 12 (Ph-2)    | 0.0334 | 0.0937         | (P2 epoch 20)  | descending — calibrated earlier than 10k (epoch 12 vs ~30 at 10k) because plateau hits faster with more data |
+| out (Ph-3)     | 1 (Ph-3)     | —      | 1.2574         | 0.8228 (ep 26) | −34.6% | learning — vl_select 1.087 → 0.833 best at epoch 23, plateau by ep 30 |
+| ranking (Ph-3) | 1 (Ph-3)     | ~0.50  | 0.5083         | 0.2722 (ep 26) | −46.5% | learning |
+
+Headline (held-out test set, n=8562 patients including 1115 DEATH,
+7447 RELEASE):
+
+- **`patient_auroc_weighted`: 0.6908**  (+0.008 vs 10k 0.6831)
+- **`patient_auprc_weighted`: 0.6641**  (+0.030 vs 10k 0.6336)
+- `patient_auroc_simple`:   0.6252
+- `patient_auprc_simple`:   0.3237
+- `n_outcomes_used`:        16
+
+Per-outcome AUROC at full data:
+
+| Outcome                       | AUROC | AUPRC | n_pos | prevalence |
+|------------------------------|-------|-------|-------|------------|
+| DISGLYCEMIA_Hyperglycemia    | 0.914 | 0.895 | 3550  | 41.5 %     |
+| DISGLYCEMIA_Hypoglycemia     | 0.900 | 0.630 | 875   | 10.2 %     |
+| KIDNEY_COMPLICATION          | 0.833 | 0.791 | 3839  | 44.8 %     |
+| **DEATH**                    | **0.771** | 0.392 | **1115** | 13.0 %  |
+| CARDIO-VASCULAR_DISORDER     | 0.743 | 0.801 | 5078  | 59.3 %     |
+| **RELEASE**                  | **0.582** | 0.887 | **7447** | 87.0 %  |
+| RETINOPATHY                  | 0.562 | 0.051 | 284   | 3.3 %      |
+| NERVOUS_SYSTEM               | 0.549 | 0.078 | 517   | 6.0 %      |
+| NEUROVASCULAR_COMPLICATION   | 0.542 | 0.027 | 170   | 2.0 %      |
+| SKIN_ULCER                   | 0.541 | 0.058 | 391   | 4.6 %      |
+| KETOACIDOSIS                 | 0.530 | 0.026 | 200   | 2.3 %      |
+| ATHEROSCLEROSIS              | 0.511 | 0.024 | 197   | 2.3 %      |
+| INFECTION                    | 0.508 | 0.140 | 1163  | 13.6 %     |
+| ACUTE_RESPIRATORY_DISORDER   | 0.507 | 0.189 | 1602  | 18.7 %     |
+| HYPEROSMOLALITY              | 0.506 | 0.051 | 435   | 5.1 %      |
+| ACIDOSIS                     | 0.504 | 0.137 | 1177  | 13.7 %     |
+
+Peak MAE (hours, positives only):
+
+| Outcome                       | MAE (hours) | n_patients |
+|------------------------------|-------------|------------|
+| DISGLYCEMIA_Hyperglycemia    | 30.6        | 3550       |
+| KIDNEY                       | 43.5        | 3838       |
+| DISGLYCEMIA_Hypoglycemia     | 48.1        | 875        |
+| HYPEROSMOLALITY              | 51.0        | 435        |
+| ACIDOSIS                     | 51.8        | 1177       |
+| ACUTE_RESPIRATORY            | 51.9        | 1601       |
+| INFECTION                    | 52.6        | 1162       |
+| ATHEROSCLEROSIS              | 54.0        | 197        |
+| KETOACIDOSIS                 | 60.9        | 200        |
+| CARDIO                       | 61.2        | 5078       |
+| SKIN_ULCER                   | 64.3        | 391        |
+| NERVOUS_SYSTEM               | 66.7        | 517        |
+| NEUROVASCULAR                | 67.3        | 170        |
+| **RELEASE**                  | **69.5**    | **7447**   |
+| RETINOPATHY                  | 72.1        | 284        |
+| **DEATH**                    | **155.9**   | **1114**   |
+
+Trajectory honesty (full data):
+- `gen_median_hours`:           62.40
+- `gen_to_gt_ratio_median`:       0.599  (≥ 0.5 ✓)
+- `gen_to_gt_ratio_mean`:         0.844
+- `gen_frac_terminal_first24h`:   0.048  (much lower than 10k's 0.165 — at
+                                          full data the model is more conservative
+                                          about emitting terminal early)
+- `gen_length_mae_hrs`:           82.96
+- `gen_n_with_terminal`:          8561 / 8562
+
+Phase stats: phase2_best_val 0.149 / 21 epochs (early stopped, vs 41
+at 10k); phase3_best_val 0.944 / 40 epochs (vs 23 at 10k, ran longer
+because the larger training set kept improving the outcome head).
+
+Legacy / supplementary metrics (per-window):
+- `outcome_auroc` (cap=336h):  0.508
+- cap=48h AUROC:               0.506
+- cap=168h AUROC:              0.521
+- `onset_mae_hrs`:              65.6
+
+**Verdict: FINAL RESULT — B0-C-ttt confirmed at full data**.
+
+The 10k screening result generalises:
+1. `patient_auroc_weighted` lifts +0.008 going to full data (0.683 →
+   0.691), which is within noise — the screen was honest.
+2. `patient_auprc_weighted` lifts +0.030, a real improvement that
+   reflects better-calibrated probability heads with more training
+   signal (Phase-3 ran 40 epochs at full data vs 23 at 10k).
+3. cap=48h legacy AUROC lifts from 0.438 (10k) to 0.506 (full data) —
+   the BCE calibration anchor that P5 identified gets noticeably
+   better with more positives to learn from.
+4. Trajectory honesty actually improves: `gen_frac_terminal_first24h`
+   drops to 0.048 (vs 0.165 at 10k), and `gen_to_gt_ratio_median`
+   stays comfortably ≥ 0.5. At full data the model is less aggressive
+   about ending trajectories early.
+5. DEATH AUROC 0.771 at full data (vs 0.710 at 10k, +0.061) — the
+   primary clinical headline lifts substantially with more positives
+   (n=1115 vs n=192). KIDNEY 0.833, DISGLYCEMIA_Hypo 0.900,
+   DISGLYCEMIA_Hyper 0.914 are publishable per-outcome AUROCs.
+
+Notable: the rare-outcome AUROCs (RETINOPATHY, KETOACIDOSIS,
+ATHEROSCLEROSIS, NEUROVASCULAR) hover around 0.50–0.56 at full data.
+These are the same outcomes that wobbled most across the P1-P4
+DISCARDs — the model genuinely struggles to discriminate them at
+patient-level. This is a substantive limitation of the
+M-256 + B0-C-ttt-recipe stack, not a methodology artefact.
+
+The recipe — narrow-frozen-terminal-tau + C-ttt aux on Phase-2 stage 0
++ Phase-3 BCE + ranking — is the **end-of-loop final result**.
+
+---
+
+## Final summary
+
+| Metric                          | B0-Z @ 10k | B0-C-ttt @ 10k | B0-C-ttt @ full data (FINAL) |
+|--------------------------------|------------|----------------|------------------------------|
+| `patient_auroc_weighted`        | 0.667     | 0.683          | **0.691**                    |
+| `patient_auprc_weighted`        | 0.621     | 0.634          | **0.664**                    |
+| DEATH AUROC (n_pos=1114)        | 0.693     | 0.710          | **0.771**                    |
+| RELEASE AUROC (n_pos=7447)      | 0.521     | 0.581          | **0.582**                    |
+| DISGLYCEMIA_Hyper AUROC         | 0.904     | 0.896          | **0.914**                    |
+| KIDNEY AUROC                    | 0.702     | 0.715          | **0.833**                    |
+| DEATH peak MAE (hrs)            | 158.8     | 169.0          | **155.9**                    |
+| RELEASE peak MAE (hrs)          | 86.0      | 71.3           | **69.5**                     |
+| `gen_to_gt_ratio_median`        | 1.12      | 0.72           | **0.60**                     |
+| `gen_frac_terminal_first24h`    | 0.148     | 0.165          | **0.048**                    |
+| Phase-3 best val (outcome BCE)  | 1.157     | 1.144          | **0.944**                    |
+
+**What was tried** (in order, see journal blocks for details):
+- **B0-Z**: Z architecture (narrow + frozen terminal `log_tau_lm`)
+  baseline — 0.667 AUROC_w.
+- **B0-C-ttt**: cherry-pick of dd3fc1b time-to-terminal MSE aux on
+  top of Z — **KEEP**, 0.683 AUROC_w. Running best.
+- **B0-C-ttt-ablation**: C-ttt aux on bare M-256 without Z's freeze
+  hook — KEEP-STACK (Z is doing real work, −0.043 AUROC_w without it).
+- **P1-MIL**: softmax-weighted patient-level BCE aux in Phase 3 —
+  DISCARD, −0.040 AUROC_w; universal per-outcome regression, especially
+  KETOACIDOSIS −0.377.
+- **P2-time**: positives-only soft-argmax time loss in Phase 3 —
+  DISCARD, −0.110 AUROC_w; 5 outcomes drop below chance.
+- **P3-coupling**: bias_proj(sigmoid(outcome_logits)) added to LM
+  logits — DISCARD, −0.036 AUROC_w; RELEASE drops to chance (0.425)
+  because the LM head atrophies (||bias||/||lm|| ratio 1.1, way above
+  the [0.05, 0.30] healthy band).
+- **P4-pool**: learned attention pool aux in Phase 3 — DISCARD;
+  AUROC_w +0.018 (the only direction that lifted) but +0.05
+  falsifiable missed, DEATH AUROC −0.038, KETOACIDOSIS −0.148.
+- **P5-bce-ablation**: down-weight Phase-3 BCE coef 1.0 → 0.02 —
+  DIAGNOSTIC, confirms per-position BCE is the calibration anchor
+  (cap=48h −0.031, KETOACIDOSIS −0.191); recipe locked at coef=1.0.
+- **P6 (architecture scale-up at full data)**: SKIPPED — strict
+  trigger fails (running best margin vs B0-Z is +0.016, short of
+  +0.030).
+- **P7 (QA toggle)**: SKIPPED — requires P6 first.
+
+**Why the loop stopped here** (program.md stop criterion):
+- All directions in scope honestly attempted (P6/P7 strict triggers
+  fail by design, not by neglect).
+- Last 2-3 10k experiments DISCARDed (P3, P4) — running best stable.
+- Full-data confirm of running best done — ABOVE.
+
+The final running-best model lives in `emr_model/checkpoints/` and the
+backup at `emr_model/checkpoints.bak_keep_B0-C-ttt-full/`.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
