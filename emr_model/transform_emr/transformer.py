@@ -460,25 +460,13 @@ class GPT(nn.Module):
             _log_tau_lm[self._terminal_ids] = _log_tau_terminal
         self.log_tau_lm = nn.Parameter(_log_tau_lm)
 
-        # Direction E: freeze the terminal entries of log_tau_lm by zeroing
-        # their gradient on every backward pass. log_tau_lm is dim=1, so it
-        # lands in the no_decay optimizer group with weight_decay=0 — once
-        # grad is zero the AdamW update is zero. Outcome and default entries
-        # still get nonzero grad and continue learning.
-        if self._terminal_ids.numel() > 0:
-            _terminal_mask = torch.zeros(vocab_size, dtype=torch.bool)
-            _terminal_mask[self._terminal_ids] = True
-            self.register_buffer("_log_tau_terminal_freeze_mask", _terminal_mask, persistent=False)
-
-            # Resolve the mask through `self` at hook-invocation time so the
-            # buffer's current device (after model.to(device)) is used. A
-            # default-arg capture of the buffer object at registration time
-            # binds to the CPU tensor and breaks once the model moves to GPU.
-            _model_ref = self
-            def _freeze_terminal_log_tau_grad(grad):
-                return grad.masked_fill(_model_ref._log_tau_terminal_freeze_mask, 0.0)
-
-            self.log_tau_lm.register_hook(_freeze_terminal_log_tau_grad)
+        # B0-C-ttt-ablation: direction-E freeze hook removed. Terminal entries
+        # of log_tau_lm are now learnable (same regime as default + outcome
+        # entries). Isolates whether C-ttt's gain over B0-Z came from C-ttt
+        # itself or from Z's frozen-narrow-terminal architecture. Init values
+        # are unchanged (terminal init == default == 12h), so this is a pure
+        # hook removal — the model can choose to widen the terminal kernel
+        # during training, which prior diagnostics showed it tends to do.
 
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
