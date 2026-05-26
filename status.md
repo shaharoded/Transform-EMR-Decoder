@@ -486,6 +486,117 @@ Reverting (loop step 9) and proceeding to P4.
 
 ---
 
+### B0-C-ttt-ablation @ 10k (SHA 49be091) — KEEP-STACK
+
+Mandatory ablation per program.md's new discipline. Strips Z's
+direction-E frozen-terminal-tau hook from B0-C-ttt's recipe; keeps the
+C-ttt aux head. Tests whether B0-C-ttt's gain over B0-Z came from
+C-ttt alone or from the Z+C-ttt stack.
+
+Per-aux training trace (Phase-2 + Phase-3, this ablation run):
+
+| Aux       | Unlock epoch | λ_max   | Anchor raw_aux | Final raw_aux | Δ      | Status |
+|-----------|--------------|---------|----------------|---------------|--------|--------|
+| ce        | 4 (Ph-2)     | 0.0900  | 1.5183         | 0.0082        | −99.5% | learning |
+| dt        | 4 (Ph-2)     | 0.1688  | 0.8096         | 0.1062        | −86.9% | learning |
+| ttt       | 4 (Ph-2)     | 0.0038  | 21.4508        | 0.1663        | −99.2% | learning |
+| ranking   | 31 (Ph-2)    | 0.0316  | 0.1224         | 0.1312        | +7.2%  | **STALE** — no descent across the 9 active Ph-2 epochs; raw_ranking actually rose slightly |
+| out (P3)  | 1 (Ph-3)     | —       | 1.9035         | 0.9364        | −50.8% | learning |
+| ranking(P3)| 1 (Ph-3)    | 0.1962  | 0.5683         | 0.3424        | −39.7% | learning |
+
+The Phase-2 ranking aux fired at the very end of Phase 2 (calibrated
+epoch 30, ramp 31→33, only 6 fully-active epochs before early stop at
+40), and across those 9 active epochs raw_ranking did NOT descend.
+Flag: **stale**. Either (a) the model is already at ranking optimum
+by the time the aux unlocks (logits already separate pos / neg
+positions enough that the pairwise loss is at floor for the current
+backbone), or (b) the late-stage activation hits when other auxes
+already drove the backbone into a state where ranking improvements
+are gradient-flat.
+
+Per-aux training trace (B0-C-ttt running best, recoverable values
+only; final raw_aux at end of Phase 2 was overwritten when run.log
+was reused for P1/P2/P3/M-384/ablation):
+
+| Aux       | Unlock epoch | λ_max   | Anchor raw_aux | Final raw_aux | Δ      | Status |
+|-----------|--------------|---------|----------------|---------------|--------|--------|
+| ce        | 4 (Ph-2)     | 0.0872  | 1.5708         | ?             | ?      | unrecoverable |
+| dt        | 4 (Ph-2)     | 0.1715  | 0.8027         | ?             | ?      | unrecoverable |
+| ttt       | 4 (Ph-2)     | 0.0040  | 20.86          | ?             | ?      | unrecoverable |
+| ranking   | 32 (Ph-2)    | 0.0329  | 0.1904         | ?             | ?      | unrecoverable |
+| out (P3)  | 1 (Ph-3)     | —       | 2.11           | 1.01          | −52%   | learning (from prior journal) |
+| ranking(P3)| 1 (Ph-3)    | ~0.7    | 0.66           | 0.38          | −42%   | learning (from prior journal) |
+
+Future runs will record these from the start (the schema is now
+program.md-mandated).
+
+Smoke (sample=50, phase{1,2,3}_n_epochs=1):
+- Total params: 6.42 M (same as B0-C-ttt — pure hook removal).
+- Gates A–D pass — raw_out=8.50, raw_rank=0.70, λ_ranking=2.45.
+
+Headline (Δ vs B0-C-ttt running best):
+- `patient_auroc_weighted`: **0.6401** (−0.0430)
+- `patient_auprc_weighted`: 0.6079 (−0.0257)
+- `patient_auroc_simple`:   0.6553 (−0.0405)
+- `patient_auprc_simple`:   0.2865 (−0.0374)
+- `n_outcomes_used`:        16
+
+Per-outcome AUROC vs B0-C-ttt:
+- DISGLYCEMIA_Hyper:  0.890  (−0.006)
+- RETINOPATHY:        0.737  (−0.048)
+- NEUROVASCULAR:      0.730  (+0.044)
+- NERVOUS_SYSTEM:     0.718  (−0.078)
+- CARDIO:             0.717  (+0.008)
+- DISGLYCEMIA_Hypo:   0.678  (−0.093)
+- **DEATH**:          0.670  (−0.040)
+- SKIN_ULCER:         0.663  (−0.016)
+- KETOACIDOSIS:       0.659  (−0.256)  ← biggest drop
+- ATHEROSCLEROSIS:    0.657  (+0.062)
+- KIDNEY:             0.634  (−0.081)
+- HYPEROSMOLALITY:    0.593  (+0.008)
+- ACUTE_RESPIRATORY:  0.584  (−0.007)
+- ACIDOSIS:           0.545  (−0.025)
+- INFECTION:          0.510  (−0.041)
+- **RELEASE**:        0.501  (−0.080)  ← drops to chance
+
+Peak MAE vs B0-C-ttt:
+- DEATH:    146.49 (−22.48)
+- RELEASE:   73.73 (+2.44)
+- CARDIO:    73.20 (−5.88)
+- KIDNEY:    92.95 (+13.84)
+
+Trajectory honesty (Δ vs B0-C-ttt):
+- `gen_median_hours`:           215.51  (+140.46 — much longer)
+- `gen_to_gt_ratio_median`:       2.112  (vs 0.720; over-generates 2× —
+  the unfrozen terminal tau lets the LM widen the terminal kernel,
+  which prior diagnostics showed it tends to do)
+- `gen_frac_terminal_first24h`:   0.037  (vs 0.165; rarely terminates
+  early — same mechanism, wide terminal kernel pushes terminal
+  emission far out)
+
+Phase stats: phase2_best_val 0.184 / 40 epochs; phase3_best_val 1.112
+/ 29 epochs.
+
+Verdict: **ABLATION-KEEP-STACK** — Z's frozen-narrow-terminal-tau
+hook is doing real work. Stripping it costs the recipe 0.043
+patient_auroc_weighted, drops RELEASE to chance (0.501), collapses
+KETOACIDOSIS (−0.256), and degrades trajectory honesty
+(`gen_to_gt_ratio_median` doubles from 0.72 to 2.11). The C-ttt aux
+alone, on bare M-256, does not match B0-C-ttt's eval lift. B0-C-ttt
+remains the running best.
+
+T1 note: Phase-2 ranking aux was **stale** in this run (Δ=+7.2 %
+across 9 active epochs). This is also expected behaviour for ranking
+when it unlocks late in Phase 2 — the backbone has already settled.
+Stale-ness was not caused by the ablation. Logging the staleness now
+that the schema requires it; not actionable for this experiment.
+
+This ablation does not become the running best. Proceeding to P4
+(patient-level pooling head — note: eval is read-only, so the pool
+output can only be a training-time aux, similar in spirit to P1 MIL).
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
