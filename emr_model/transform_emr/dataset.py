@@ -946,22 +946,6 @@ class EMRDataset(Dataset):
             self.__encode_parent_list
         )
 
-        # --- I4 sub-trajectory view metadata (Phase-2 augmentation) ---
-        # Lab = any token whose concept is a TAK 'Measurements' concept; every such
-        # concept name contains '_MEASURE' (GLUCOSE_MEASURE_STATE_High, PH_MEASURE_TREND_…).
-        # Protected = outcome + terminal + admission tokens; never dropped from a view
-        # (clinical-reality events). Precomputed once so __getitem__ filtering is cheap.
-        _protected = set(OUTCOMES) | set(TERMINAL_OUTCOMES) | {ADMISSION_TOKEN}
-        self.tokens_df["_IsLab"]       = self.tokens_df["PositionToken"].str.contains("_MEASURE", regex=False)
-        self.tokens_df["_IsProtected"] = self.tokens_df["PositionToken"].isin(_protected)
-
-        # Phase-2-only sub-trajectory augmentation, toggled by pretrain_transformer.
-        # Off by default so Phase-1 / Phase-3 / val see the full trajectory.
-        self.augment_views = False
-        self._view_types   = ["A", "B", "C", "D"]
-        self._min_view_len = 8
-        self._view_gap_hours = 12.0
-
         self.patient_ids = self.tokens_df['PatientId'].unique()
         # Group once via pandas groupby (O(N), uses pandas' internal C-level
         # grouping) instead of the previous O(N²) dict-of-boolean-filters,
@@ -1003,54 +987,12 @@ class EMRDataset(Dataset):
         return len(self.patient_ids)
 
 
-    def _apply_view(self, df):
-        """
-        I4 sub-trajectory augmentation (Phase-2 only). Returns a coherent
-        row-subset of the patient's token DataFrame, drawn from one of:
-          A: full sequence (no-op)
-          B: drop a random `_view_gap_hours` contiguous time window
-          C: keep only labs (+ protected) — drop interventions / meals / clinical markers
-          D: drop labs — keep clinical events / interventions / meals (+ protected)
-        Protected tokens (outcomes, terminals, admission) are NEVER dropped.
-        Falls back to the full sequence if a view would leave < `_min_view_len`
-        rows. Row order (and thus abs-time sortedness) is preserved.
-        """
-        n = len(df)
-        if n <= self._min_view_len:
-            return df
-        view = random.choice(self._view_types)
-        if view == "A":
-            return df
-
-        protected = df["_IsProtected"].values
-        if view == "B":
-            t = df["TimePoint"].values
-            tmin, tmax = float(t.min()), float(t.max())
-            if tmax - tmin <= self._view_gap_hours:
-                return df
-            start = random.uniform(tmin, tmax - self._view_gap_hours)
-            in_gap = (t >= start) & (t < start + self._view_gap_hours)
-            keep = (~in_gap) | protected
-        elif view == "C":
-            keep = df["_IsLab"].values | protected
-        elif view == "D":
-            keep = (~df["_IsLab"].values) | protected
-        else:
-            return df
-
-        if int(keep.sum()) < self._min_view_len:
-            return df
-        return df.iloc[np.nonzero(keep)[0]]
-
     def __getitem__(self, idx, allow_debug=False):
         """
         Returns the subset of records for 1 patient.
         """
         pid = self.patient_ids[idx]
         df = self.patient_groups[pid]
-
-        if self.augment_views:
-            df = self._apply_view(df)
 
         # ---------------------------
         # Build padded parent_raw_ids: [T, P]

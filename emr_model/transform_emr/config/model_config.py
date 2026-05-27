@@ -112,12 +112,4 @@ TRAINING_SETTINGS = {
     # backbone_lr_factor=0.01, protecting the outcome head from patient-level
     # coarseness.
     "phase3_pool_fraction_cap": 0.05,   # I2 P4-tight: lowered 0.20 -> 0.05
-
-    # I4 — Phase-2 sub-trajectory view augmentation. When True, the Phase-2 train
-    # loader draws a random coherent view per patient access (A full / B drop a
-    # random 12h window / C labs-only / D drop-labs); outcome+terminal+admission
-    # tokens are never dropped. Implemented in EMRDataset.__getitem__, toggled only
-    # during pretrain_transformer (Phase 1/3 and val see full trajectories). The
-    # existing Phase-2 oversampling supplies multiple views per patient per epoch.
-    "phase2_subtraj_aug": True,
 }

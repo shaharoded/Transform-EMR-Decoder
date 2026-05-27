@@ -1336,14 +1336,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ttt_raw     / n_batches,
         )
 
-    # I4 — enable Phase-2 sub-trajectory view augmentation on the TRAIN dataset only.
-    # Phase 1 ran before this (flag default False); Phase 3 runs after with the flag
-    # restored to False below; the val loader uses a separate dataset instance.
-    _subtraj_aug = bool(training_settings.get("phase2_subtraj_aug", False))
-    if _subtraj_aug and hasattr(train_dl.dataset, "augment_views"):
-        train_dl.dataset.augment_views = True
-        print(f"[Phase-2]: sub-trajectory view augmentation ENABLED (views={train_dl.dataset._view_types})")
-
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
         tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ttt, tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_ttt_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
         vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_ttt, _, _, _, _                                      = run_epoch(val_dl,   epoch=epoch, train_flag=False)
@@ -1394,11 +1386,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             # If warmup isn't complete - do nothing.
             continue
-
-    # Restore the train dataset to the full-trajectory view so Phase 3 (which
-    # reuses the same underlying dataset via a different loader) is unaffected.
-    if _subtraj_aug and hasattr(train_dl.dataset, "augment_views"):
-        train_dl.dataset.augment_views = False
 
     plot_losses(train_losses, val_losses)
     return model, train_losses, val_losses
