@@ -982,6 +982,68 @@ backup at `emr_model/checkpoints.bak_keep_B0-C-ttt-full/`.
 
 ---
 
+## Post-P5 iteration (I1–I7)
+
+### I1 — P3-v2 (lm_head + backbone FROZEN in Phase 3) @ 10k (SHA 7b23067) — DISCARD
+
+Re-applied the original P3 `bias_proj` coupling (K→V on
+sigmoid(outcome_logits), zero-init, added to lm_logits), but in
+Phase 3: `lm_head.weight.requires_grad=False`, backbone optimizer LR
+forced 0.0; only outcome_head trains. Hypothesis: original P3 died
+from LM-head atrophy during the coupling; freezing the LM head in
+Phase 3 removes that drift path.
+
+Per-aux training trace:
+
+| Aux            | Unlock | λ_max  | Anchor raw_aux | Final raw_aux | Δ      | Status |
+|----------------|--------|--------|----------------|---------------|--------|--------|
+| ce (Ph-2)      | 4      | 0.0817 | 1.4857         | 0.0022        | −99.8% | learning |
+| dt (Ph-2)      | 4      | 0.1493 | 0.8134         | 0.0313        | −96.2% | learning |
+| ttt (Ph-2)     | 4      | 0.0034 | 21.395         | 0.0442        | −99.8% | learning |
+| ranking (Ph-2) | 31     | 0.0120 | 0.3173         | 0.1111        | −65.0% | learning |
+| out (Ph-3)     | 1      | —      | 1.21 (ep2)*    | 1.137         | ≈ −6%  | shallow — frozen backbone caps refinement |
+| ranking (Ph-3) | 1      | ~5.7   | 0.510 (ep2)    | 0.419         | −18%   | learning |
+
+\* Phase-3 epoch-1 raw_out was 28.70 (the Phase-2 coupling leaves the
+outcome logits extreme); it drops to ~1.21 by epoch 2 once λ_ranking
+calibrates. Best `vl_select` only reached **1.0805** (epoch 21) vs
+B0-C-ttt's 0.996 — with the backbone frozen, the outcome head cannot
+recover from the Phase-2 coupling distortion.
+
+Smoke gates A–D + P3a/P3b/P3c all passed (P3b confirmed lm_head
+grad=0.0 — the I1 freeze worked; original P3 showed 0.45 via the tied
+input embedding).
+
+Headline (Δ vs B0-C-ttt running best):
+- `patient_auroc_weighted`: **0.6061** (−0.0770 — worse than original
+  P3's −0.036)
+- `patient_auprc_weighted`: 0.5841 (−0.0495)
+- cap=48h AUROC: 0.394 (−0.044)
+- DEATH AUROC: 0.601 (−0.109); RELEASE AUROC: 0.452 (−0.129, below chance)
+- KETOACIDOSIS: 0.675 (−0.240); NERVOUS_SYSTEM 0.663 (−0.133)
+- DEATH MAE 175.9 (+7); RELEASE MAE 102.6 (+31)
+- gen_to_gt_ratio_median 2.468 (over-generates 2.5×); gen_frac_terminal_first24h 0.364
+- p3_ratio_mean settled ~0.057 (in band) but Phase-3-start was 0.393 (over-coupled)
+
+bias_proj routing (falsifiable interpretability check): bias-to-terminal
+magnitudes were roughly uniform across outcomes (0.082–0.139; DEATH
+0.119, not dominant) — no interpretable DEATH→TERMINAL routing.
+
+Verdict: **DISCARD**. Falsifiable failed on both prongs (AUROC
+regressed; routing uninterpretable). Freezing the LM head in Phase 3
+made things *worse* than the original P3, not better: the coupling
+distortion is created in Phase 2 (where lm_head + bias_proj co-train),
+and freezing the backbone in Phase 3 only removes the model's ability
+to partially recover. The original P3 verdict's mechanism — that the
+damage is done in Phase 2 — is confirmed. The risk-aware-LM-head
+direction is exhausted; no Phase-3-side freeze fixes a Phase-2-formed
+coupling.
+
+Reverting (loop step 9). B0-C-ttt remains the running best.
+Proceeding to I2 (P4-tight, pool aux at cap=0.05).
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
