@@ -112,9 +112,4 @@ TRAINING_SETTINGS = {
     # backbone_lr_factor=0.01, protecting the outcome head from patient-level
     # coarseness.
     "phase3_pool_fraction_cap": 0.05,   # I2 P4-tight: lowered 0.20 -> 0.05
-
-    # I7 — exclude outcomes with train patient-prevalence below this threshold
-    # from the Phase-3 pool BCE (they're collapsed by the pool's patient-level
-    # signal; e.g. KETOACIDOSIS). 0.0 disables. 0.05 excludes the ~5 rarest.
-    "phase3_pool_rare_prev_threshold": 0.05,
 }

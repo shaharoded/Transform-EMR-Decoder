@@ -1438,24 +1438,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     pos_weights       = tok.outcome_weights[outcome_token_ids].to(device)
     OutcomeCriterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction="none")
 
-    # I7 — pool rare-outcome exclusion. The patient-level pool aux corrupts the
-    # per-position discrimination of RARE outcomes (e.g. KETOACIDOSIS 0.915->0.722
-    # in I2, the running best — cited in the I2 journal). Exclude outcomes whose
-    # train patient-prevalence < threshold from the pool BCE only; the per-position
-    # outcome head still learns them. 0.0 disables (pool trains all outcomes).
-    _pool_rare_thr  = float(training_settings.get("phase3_pool_rare_prev_threshold", 0.0))
-    _pool_keep_mask = None
-    if _pool_rare_thr > 0.0:
-        _df_tok = train_dl.dataset.tokens_df
-        _npat   = max(_df_tok["PatientId"].nunique(), 1)
-        _prev   = [_df_tok[_df_tok["PositionToken"] == n]["PatientId"].nunique() / _npat
-                   for n in valid_outcomes]
-        _pool_keep_mask = torch.tensor([1.0 if p >= _pool_rare_thr else 0.0 for p in _prev],
-                                       dtype=torch.float32, device=device)
-        _excl = [valid_outcomes[i] for i, p in enumerate(_prev) if p < _pool_rare_thr]
-        print(f"[I7]: pool BCE excludes {len(_excl)} rare outcomes "
-              f"(train prevalence < {_pool_rare_thr}): {_excl}")
-
     backbone_lr_factor = training_settings.get("phase3_backbone_lr_factor", 0.0)
     p3_lr = training_settings["phase3_learning_rate"]
     p3_wd = training_settings.get("phase3_weight_decay", training_settings["weight_decay"])
@@ -1621,18 +1603,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 _nonpad_full = (full_targets != pad_idx_p3).unsqueeze(-1)  # [B, T, 1]
                 patient_label_p4 = ((_ft_e == _oid) & _nonpad_full).any(dim=1).float()  # [B, K]
                 # Use the same per-outcome pos_weight tensor the per-position
-                # BCE uses, so rare outcomes carry comparable weight. I7: when a
-                # pool keep-mask is set, zero rare-outcome columns and average over
-                # the kept ones (reduction="none" -> mask -> mean).
-                _pool_bce = nn.functional.binary_cross_entropy_with_logits(
+                # BCE uses, so rare outcomes carry comparable weight.
+                loss_pool_raw = nn.functional.binary_cross_entropy_with_logits(
                     pool_logit, patient_label_p4,
-                    pos_weight=pos_weights, reduction="none",
-                )  # [B, K]
-                if _pool_keep_mask is not None:
-                    loss_pool_raw = (_pool_bce * _pool_keep_mask).sum() \
-                                    / (_pool_keep_mask.sum() * pool_logit.size(0)).clamp(min=1.0)
-                else:
-                    loss_pool_raw = _pool_bce.mean()
+                    pos_weight=pos_weights, reduction="mean",
+                )
                 _lam_pool = lambda_pool if lambda_pool is not None else 0.0
                 loss_pool = _lam_pool * loss_pool_raw
 
