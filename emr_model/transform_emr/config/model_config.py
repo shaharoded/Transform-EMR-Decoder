@@ -22,7 +22,7 @@ TRAINING_SETTINGS = {
     "phase1_n_epochs": 50,
     "phase2_n_epochs": 50,
     "phase3_n_epochs": 50,
-    "sample": None,    # FULL-DATA CONFIRM of running best B0-C-ttt — program.md step 12
+    "sample": 10000,  # 10k is the primary screening loop per program.md; set to None only for end-of-block full-data confirms
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.

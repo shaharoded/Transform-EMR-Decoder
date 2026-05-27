@@ -393,6 +393,22 @@ class GPT(nn.Module):
             nn.Linear(cfg["embed_dim"], self.num_outcomes)
         )
 
+        # P3 — Risk-aware LM head (architectural coupling).
+        # Linear projection K → V applied to sigmoid(outcome_logits) and
+        # added to lm_logits at each position. Zero-init so the freshly
+        # constructed model is a no-op (combined_logits == lm_logits
+        # exactly at step 0 — gate P3a). Training (Phase 2 + Phase 3)
+        # grows the projection so the LM emission distribution becomes
+        # aware of the per-position outcome probability. Bias term is
+        # disabled — an additive offset on every token would just shift
+        # the LM softmax and not encode outcome-conditional structure.
+        self.bias_proj = nn.Linear(self.num_outcomes, vocab_size, bias=False)
+        nn.init.zeros_(self.bias_proj.weight)
+        # P3a constructor-time gate (one-shot, cheap): verify the zero-init.
+        with torch.no_grad():
+            assert float(self.bias_proj.weight.abs().max().item()) < 1e-9, (
+                "[P3a fail] bias_proj.weight is not zero at construction time")
+
         # Vocab positions for ALL OUTCOMES+TERMINAL_OUTCOMES that exist in vocab.
         # Broader than outcome_names (includes outcomes filtered by rarity); used
         # for the 1-hot override in multi-hot BCE targets during phase-2 training.
@@ -634,6 +650,13 @@ class GPT(nn.Module):
         # 4. Outcome Prediction Head (Auxiliary Task)
         outcome_logits = self.outcome_head(x)           # [B, T, K]
 
+        # 5b. P3 risk-aware LM coupling: add sigmoid(outcome_logits) projected
+        #     to vocab space onto the LM logits at the SAME position. No shift,
+        #     no lookahead — P[t] and lm_logits[t] both predict from h_t.
+        # Zero-init means at step 0 logits == lm_logits exactly (smoke gate P3a).
+        bias = self.bias_proj(torch.sigmoid(outcome_logits))   # [B, T, V]
+        logits = logits + bias
+
         # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
         mag_raw = self.dt_magnitude(x).squeeze(-1)     # [B,T]
@@ -713,6 +736,11 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
+
+        # P3 risk-aware coupling: mirror the path in forward() so generation
+        # respects the same combined-logit emission distribution.
+        bias = self.bias_proj(torch.sigmoid(outcome_logits))
+        logits = logits + bias
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
@@ -813,6 +841,19 @@ class GPT(nn.Module):
                   f"({len(_ttt_keys_missing)} keys). This is expected when "
                   f"loading a pre-direction-C checkpoint.")
             missing = missing - _ttt_keys_missing
+
+        # P3 — bias_proj was added with the risk-aware LM coupling. Pre-P3
+        # checkpoints (Z, B0-C-ttt) don't carry it; the zero-init makes the
+        # combined LM head reduce to the plain lm_head, so this is a safe
+        # graceful load — the head only starts contributing once Phase-3
+        # fine-tuning grows the projection weights away from zero.
+        _bp_keys_missing = {k for k in missing if k.startswith("bias_proj.")}
+        if _bp_keys_missing:
+            print(f"[GPT.load] bias_proj not in ckpt — keeping zero init "
+                  f"({len(_bp_keys_missing)} keys). Expected when loading a "
+                  f"pre-P3 checkpoint; combined LM head equals lm_head until "
+                  f"P3 retrains.")
+            missing = missing - _bp_keys_missing
 
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
@@ -1373,28 +1414,47 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     def _freeze_backbone_only(m):
         """
-        Enable gradients on all params; the optimizer's per-group LRs control the
-        effective freeze (backbone LR is multiplied by phase3_backbone_lr_factor).
+        I1 (P3-v2): hard-freeze the backbone AND the LM head in Phase 3.
+        Only bias_proj + outcome_head train. Original P3 let lm_head adapt
+        at 0.1× LR and the LM head atrophied as bias_proj grew; I1 removes
+        that failure path by freezing lm_head explicitly.
 
-        outcome_log_tau is hard-frozen in Phase 3 — letting it drift here destroys
-        the RELEASE signal Phase 2 built. The soft-label decay constants are a
-        Phase-2 decision; Phase 3 only refines the classifier weights.
+        lm_head.weight is the SAME tensor as embedder.position_embed.weight
+        (weight tying), so freezing it also freezes the input embedding —
+        consistent with the fully-frozen-backbone regime.
+
+        outcome_log_tau stays hard-frozen as in the baseline (the soft-label
+        decay constants are a Phase-2 decision).
         """
         for param in m.parameters():
             param.requires_grad_(True)
         m.outcome_log_tau.requires_grad_(False)
+        # I1: freeze the LM head (and, via tying, the input embedding).
+        m.lm_head.weight.requires_grad_(False)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head"}
-        backbone_params = [p for n, p in m.named_parameters()
-                           if not any(h in n for h in head_names)]
-        head_params = list(m.outcome_head.parameters())
+        # I1 (P3-v2) optimizer: ONLY outcome_head + bias_proj train.
+        #   - backbone group LR forced to 0.0 (full freeze; overrides
+        #     phase3_backbone_lr_factor for this experiment).
+        #   - lm_head.weight (= embedder.position_embed.weight) is frozen
+        #     in _freeze_backbone_only and excluded here.
+        #   - outcome_head + bias_proj at full p3_lr.
+        lm_w = m.lm_head.weight   # frozen, tied with embedder.position_embed
+        head_outcome = list(m.outcome_head.parameters())
+        head_bias    = list(m.bias_proj.parameters())
+        all_head_ids = {id(p) for p in head_outcome + head_bias + [lm_w]}
+        # Backbone params that still require grad (everything not a head and
+        # not the frozen lm_head/embed tensor). They get LR 0 → no update.
+        backbone_params = [p for _, p in m.named_parameters()
+                           if id(p) not in all_head_ids and p.requires_grad]
         return torch.optim.AdamW(
             [
-                {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
+                {"params": backbone_params, "lr": 0.0,
                  "weight_decay": training_settings["weight_decay"]},
-                {"params": head_params,     "lr": p3_lr,
+                {"params": head_outcome,    "lr": p3_lr,
                  "weight_decay": p3_wd},
+                {"params": head_bias,       "lr": p3_lr,
+                 "weight_decay": 0.0},
             ],
         )
 
@@ -1448,6 +1508,42 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                                      .get("ranking", 0.20))
     lambda_ranking: float | None = None  # set after epoch 1
 
+    # P3 — risk-aware LM head coupling state. Stats accumulated per epoch:
+    # the ratio ||bias|| / ||lm_only_logits|| (healthy band 0.05–0.30 per
+    # program.md) and the per-outcome row norm of bias_proj.weight, which
+    # is how each outcome "votes" on token logits.
+    _gate_check_done = {"flag": False}   # one-time P3a/P3b/P3c sanity block
+
+    def _coupling_epoch_stats():
+        """Per-epoch dump of bias_proj row norms and selected terminal-token
+        contributions. Cheap — runs once at end of each Phase-3 epoch."""
+        with torch.no_grad():
+            W = model.bias_proj.weight.detach().float()    # [V, K]
+            row_norms_per_outcome = W.norm(dim=0).cpu().tolist()   # [K]
+            term_ids = (model._terminal_ids.tolist()
+                        if hasattr(model, "_terminal_ids") else [])
+            term_contrib = {}
+            if term_ids:
+                # Mean magnitude of bias_proj.weight[term_id, :] over the
+                # terminal tokens — i.e., how strongly all outcomes nudge
+                # terminal-token logits combined.
+                term_W = W[term_ids]                         # [n_term, K]
+                term_contrib = {n: float(term_W[:, k].abs().mean().item())
+                                for k, n in enumerate(model.outcome_names)}
+            out_lines = [
+                "[P3 coupling stats]",
+                "  bias_proj row norms (per outcome): "
+                + ", ".join(f"{n}={row_norms_per_outcome[k]:.4f}"
+                            for k, n in enumerate(model.outcome_names)),
+            ]
+            if term_contrib:
+                out_lines.append(
+                    "  bias-to-terminal magnitude (per outcome): "
+                    + ", ".join(f"{n}={v:.4f}"
+                                for n, v in term_contrib.items())
+                )
+            return "\n".join(out_lines)
+
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
         model.eval()
@@ -1456,6 +1552,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
         total_loss = total_outcome = 0.0
         total_outcome_raw = total_ranking_raw = 0.0
+        # P3 — accumulate ||bias|| / ||lm_only|| ratio statistics. lm_only is
+        # recovered as (combined - bias), where bias = bias_proj(sigmoid(o)).
+        _ratio_sum = 0.0
+        _ratio_max = 0.0
+        _ratio_n   = 0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
@@ -1475,6 +1576,50 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     )
                 logits         = logits.float()
                 outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
+
+                # P3 — recover the bias and lm_only_logits for the per-batch
+                # coupling-ratio stat. Cheap: one Linear + a sigmoid on the
+                # already-computed outcome_logits, no extra autograd path
+                # (we go through torch.no_grad).
+                with torch.no_grad():
+                    _p3_bias = model.bias_proj(torch.sigmoid(outcome_logits)).float()  # [B, T, V]
+                    _lm_only_logits = (logits - _p3_bias).float()
+                    _bias_norm = _p3_bias.norm(dim=-1)                  # [B, T]
+                    _lm_only_norm = _lm_only_logits.norm(dim=-1).clamp(min=1e-9)
+                    _ratio = (_bias_norm / _lm_only_norm)               # [B, T]
+                    _ratio_sum += float(_ratio.sum().item())
+                    _ratio_max = max(_ratio_max, float(_ratio.max().item()))
+                    _ratio_n   += int(_ratio.numel())
+
+                # P3 — one-time gate block (P3c shape contract + P3 health
+                # info). P3a (zero-init no-op) is verified at construction
+                # time in GPT.__init__. By Phase 3 the bias_proj has been
+                # trained during Phase 2, so the bias is no longer zero —
+                # we just print its magnitude for sanity.
+                if train_flag and not _gate_check_done["flag"]:
+                    B_, T_, K_ = outcome_logits.shape
+                    V_ = logits.shape[-1]
+                    assert outcome_logits.shape == (B_, T_, K_), (
+                        f"[P3c] outcome_logits shape {tuple(outcome_logits.shape)} "
+                        f"!= (B,T,K)=({B_},{T_},{K_})")
+                    assert logits.shape == (B_, T_, V_), (
+                        f"[P3c] logits shape {tuple(logits.shape)} "
+                        f"!= (B,T,V)=({B_},{T_},{V_})")
+                    assert _p3_bias.shape == logits.shape, (
+                        f"[P3c] bias shape {tuple(_p3_bias.shape)} "
+                        f"!= logits shape {tuple(logits.shape)}")
+                    bias_abs_max = float(_p3_bias.abs().max().item())
+                    lm_norm_mean = float(_lm_only_norm.mean().item())
+                    bias_norm_mean = float(_bias_norm.mean().item())
+                    print(f"[P3 smoke] P3c pass — shapes "
+                          f"outcome_logits={tuple(outcome_logits.shape)}, "
+                          f"logits={tuple(logits.shape)}, "
+                          f"bias={tuple(_p3_bias.shape)}.")
+                    print(f"[P3 smoke] phase-3 start: bias max abs = "
+                          f"{bias_abs_max:.3e}, "
+                          f"||bias|| mean = {bias_norm_mean:.4f}, "
+                          f"||lm_only|| mean = {lm_norm_mean:.4f}.")
+                    # P3b grad check is done AFTER backward, below.
 
                 full_targets = batch["position_ids"]      # [B, T]
                 target_ids   = full_targets[:, 1:]        # [B, T-1]
@@ -1511,6 +1656,36 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                         continue
                     optimizer.zero_grad()
                     loss.backward()
+
+                    # P3b — one-time gradient norm dump on first backward.
+                    # outcome_head's grad must be non-zero (gates the
+                    # direction's ability to refine the head). bias_proj
+                    # and lm_head grads in Phase 3 are EXPECTED to be near
+                    # zero: Phase 3's loss is outcome BCE + ranking (no
+                    # LM CE), and bias_proj sits downstream of outcome_head
+                    # on a path that only feeds LM logits — no LM-side
+                    # objective in Phase 3 means no gradient through the
+                    # coupling here. The coupling itself was trained during
+                    # Phase 2 (LM CE backprops through bias_proj). Reported
+                    # as info, not asserted.
+                    if not _gate_check_done["flag"]:
+                        _bp_grad = model.bias_proj.weight.grad
+                        _oh_last = model.outcome_head[-1].weight.grad
+                        _lm_grad = model.lm_head.weight.grad
+                        _bp_n = float(_bp_grad.norm().item()) if _bp_grad is not None else 0.0
+                        _oh_n = float(_oh_last.norm().item()) if _oh_last is not None else 0.0
+                        _lm_n = float(_lm_grad.norm().item()) if _lm_grad is not None else 0.0
+                        assert _oh_n > 1e-8, (
+                            f"[P3b fail] outcome_head[-1].weight.grad too small: "
+                            f"{_oh_n}")
+                        print(f"[P3 smoke] P3b grad norms: "
+                              f"bias_proj={_bp_n:.3e}, "
+                              f"outcome_head[-1]={_oh_n:.3e}, "
+                              f"lm_head={_lm_n:.3e}. "
+                              f"(bias_proj/lm_head ≈ 0 in P3 expected — "
+                              f"trained in Phase 2.)")
+                        _gate_check_done["flag"] = True
+
                     p3_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     if torch.isfinite(p3_norm):
                         optimizer.step()
@@ -1521,11 +1696,14 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 total_ranking_raw += loss_ranking_raw.item()
 
         n = max(len(loader), 1)
+        ratio_mean = (_ratio_sum / _ratio_n) if _ratio_n > 0 else 0.0
         return {
             "loss":        total_loss        / n,
             "outcome":     total_outcome     / n,
             "outcome_raw": total_outcome_raw / n,
             "ranking_raw": total_ranking_raw / n,
+            "p3_ratio_mean": ratio_mean,
+            "p3_ratio_max":  _ratio_max,
         }
 
     n_epochs = training_settings["phase3_n_epochs"]
@@ -1551,7 +1729,10 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
         print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}  "
               f"raw_out={tr['outcome_raw']:.7f}  raw_rank={tr['ranking_raw']:.7f}  "
-              f"vl_select={vl_select:.6f}")
+              f"vl_select={vl_select:.6f}  "
+              f"p3_ratio_mean={tr['p3_ratio_mean']:.4f}  p3_ratio_max={tr['p3_ratio_max']:.4f}")
+        # Per-epoch P3 coupling dump (bias_proj row norms + bias-to-terminal).
+        print(_coupling_epoch_stats())
 
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)
