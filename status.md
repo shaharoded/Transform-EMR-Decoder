@@ -1044,6 +1044,76 @@ Proceeding to I2 (P4-tight, pool aux at cap=0.05).
 
 ---
 
+### I2 — P4-tight (pool aux fraction_cap 0.20 → 0.05)
+
+**Code:** `d9a6174` (single config change: `phase3_pool_fraction_cap`
+0.20 → 0.05). All else identical to the P4-pool recipe on the
+B0-C-ttt running best (M-256 + Z frozen-narrow terminal log_tau_lm +
+C-ttt + Phase-2 curriculum + Phase-3 BCE coef 1.0 + ranking + pool head).
+
+**Hypothesis (falsifiable):** a smaller pool-aux cap preserves the
+patient-level AUROC lift while killing the per-position calibration
+disruption P4 caused. Pass = AUROC ≥ +0.010 vs running best AND RELEASE
+MAE no regress past 5 h AND no per-outcome AUROC drop past 0.020.
+
+**Result vs running best B0-C-ttt (10k, `ea65988`):**
+
+| Metric | B0-C-ttt | I2 | Δ |
+|---|---|---|---|
+| patient_auroc_weighted | 0.6831 | **0.7263** | **+0.0432** |
+| patient_auprc_weighted | 0.6336 | 0.6719 | +0.0383 |
+| cap=48h AUROC | 0.438 | 0.478 | +0.040 |
+| DEATH AUROC | 0.710 | 0.721 | +0.011 |
+| RELEASE AUROC | 0.581 | 0.604 | +0.023 |
+| DEATH MAE (h) | 169.0 | 161.9 | −7.1 |
+| RELEASE MAE (h) | 71.3 | 85.5 | **+14.2** |
+| KETOACIDOSIS AUROC | 0.915 | 0.722 | **−0.193** |
+| DISGLYCEMIA_Hyper AUROC | 0.896 | 0.856 | −0.040 |
+| gen_to_gt_ratio_median | 0.720 | 1.688 | +0.97 |
+| gen_frac_terminal_first24h | 0.165 | 0.050 | −0.115 |
+
+13 of 16 outcomes improved AUROC. The three falsifiable prongs: AUROC
++0.043 ✓; RELEASE MAE +14.2 h ✗ (>5 h); per-outcome drops KETOACIDOSIS
+−0.193 and DISGLYCEMIA_Hyper −0.040 ✗ (>0.020). **Strict rule → DISCARD
+(2 prongs failed).**
+
+**Per-aux training trace (every aux active in any phase):**
+
+| Aux | Phase | Unlock ep | λ_max | Anchor raw | Final raw | Δ% | Learning? |
+|---|---|---|---|---|---|---|---|
+| ce | P2 | 3 | 0.0890 | 1.5619 | 0.00289 | −99.8% | yes |
+| dt | P2 | 3 | 0.1719 | 0.8082 | 0.05132 | −93.7% | yes |
+| ttt | P2 | 3 | 0.0039 | 21.4656 | 0.07955 | −99.6% | yes |
+| ranking | P2 | 30 | 0.0323 | 0.1662 | 0.06249 | −62.4% | yes |
+| ranking | P3 | 1 | 0.6755 | 0.5640 | 0.32496 | −42.4% | yes |
+| pool | P3 | 1 | 0.0867 | 1.0985 | 0.08861 | −91.9% | yes |
+
+No stale loss — every aux descends well past the 5% floor. The new pool
+aux is the strongest learner (−91.9%). Critically, the pool aux learning
+*well* is exactly what hurts: its patient-level signal couples into the
+shared backbone and trades rare-outcome / peak-timing precision for
+aggregate ranking — the same per-position-discriminator corruption seen
+in P1/P2/P4. Lowering the cap to 0.05 did not kill that coupling; vs P4
+cap=0.20 it *amplified* both the lift (+0.043 vs +0.018) and the damage
+(KETOACIDOSIS −0.193 vs −0.148; RELEASE MAE +14.2 h vs +7.4 h). The
+RELEASE-MAE regression is mechanically downstream of over-generation:
+gen_to_gt_ratio_median 1.69 means trajectories run ~1.7× GT length, so
+the predicted RELEASE peak lands late.
+
+**Verdict: KEEP — NEW RUNNING BEST (user override of strict rule).**
+The +0.043 weighted-AUROC lift is the largest in the loop and broad
+across outcomes; the user elected to bank it and treat the
+rare-outcome / RELEASE-timing regressions as a follow-up to repair
+rather than a reason to revert. Running best is now **I2 = M-256 + Z +
+C-ttt + Phase-2 curriculum + Phase-3 BCE coef 1.0 + ranking + pool head
+@ cap 0.05** (`d9a6174`). Not reverted.
+
+**Next:** cap the over-generation (gen_to_gt 1.69) — recover RELEASE
+peak timing while holding the +0.043 lift, via a training-side lever
+(eval/generation code is off-limits). Then continue the I-sequence.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
