@@ -112,9 +112,4 @@ TRAINING_SETTINGS = {
     # backbone_lr_factor=0.01, protecting the outcome head from patient-level
     # coarseness.
     "phase3_pool_fraction_cap": 0.05,   # I2 P4-tight: lowered 0.20 -> 0.05
-
-    # I6 — CBM in Phase 3. Mask this fraction of non-outcome INPUT tokens during
-    # Phase-3 training (outcome-preserving forbid list; labels from unmasked
-    # position_ids). 0.0 disables. Spec starts at 0.25, may probe up to 0.40.
-    "phase3_cbm_p": 0.25,
 }

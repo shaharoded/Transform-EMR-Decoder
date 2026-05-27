@@ -1438,21 +1438,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     pos_weights       = tok.outcome_weights[outcome_token_ids].to(device)
     OutcomeCriterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction="none")
 
-    # I6 — Phase-3 CBM forbid list: outcome-PRESERVING. Outcomes, terminals,
-    # admission, and pad/null/mask are never masked; labs / interventions /
-    # meals / context are all eligible. More aggressive than Phase-2's list
-    # (which also protects meals + intervals for LM-head coherence) — Phase 3
-    # doesn't need LM coherence, the outcome head reads backbone features.
-    _p3_cbm_p = float(training_settings.get("phase3_cbm_p", 0.0))
-    _p3_cbm_forbid = None
-    if _p3_cbm_p > 0.0:
-        _fb = {tok.pad_token_id, tok.mask_token_id, tok.null_token_id,
-               tok.token2id.get(ADMISSION_TOKEN)}
-        _fb |= {int(t) for t in model._terminal_ids.tolist()}
-        _fb |= {int(i) for i in outcome_token_ids}
-        _p3_cbm_forbid = torch.tensor(sorted(i for i in _fb if i is not None),
-                                      dtype=torch.long, device=device)
-
     backbone_lr_factor = training_settings.get("phase3_backbone_lr_factor", 0.0)
     p3_lr = training_settings["phase3_learning_rate"]
     p3_wd = training_settings.get("phase3_weight_decay", training_settings["weight_decay"])
@@ -1563,18 +1548,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
-                # I6 — CBM in Phase 3 (train only): mask non-outcome input tokens
-                # so the outcome head learns to read corrupted/incomplete context.
-                # Labels come from the UNMASKED position_ids (label_pos); the
-                # forbid list keeps outcomes/terminals/admission unmasked, so the
-                # soft-kernel targets and pool labels are unaffected by masking.
-                if train_flag and _p3_cbm_p > 0.0:
-                    label_pos = batch["position_ids"].clone()
-                    batch = apply_cbm(batch, model.embedder.tokenizer,
-                                      forbid_ids=_p3_cbm_forbid, p=_p3_cbm_p)
-                else:
-                    label_pos = batch["position_ids"]
-
                 # BF16 autocast wraps the forward (and gradient-checkpointed recompute
                 # inside GPT.forward also re-enters autocast for backward). Matches
                 # Phase-2 precision regime and cuts activation memory roughly in half.
@@ -1590,7 +1563,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 logits         = logits.float()
                 outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
 
-                full_targets = label_pos                  # [B, T] unmasked (CBM masks input only)
+                full_targets = batch["position_ids"]      # [B, T]
                 target_ids   = full_targets[:, 1:]        # [B, T-1]
                 outcome_pred = outcome_logits[:, :-1, :]  # [B, T-1, K]
                 pred_logits  = logits[:, :-1, :]          # [B, T-1, V]
