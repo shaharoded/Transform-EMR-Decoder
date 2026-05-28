@@ -1506,35 +1506,48 @@ embedder **retrained on full data** (not the 10k cache).
 |---|---|---|
 | patient_auroc_weighted | 0.755 | **0.759** |
 | patient_auprc_weighted | 0.769 | 0.781 |
-| patient_auroc_simple | — | 0.694 |
+| patient_auroc_simple | 0.724 | 0.694 |
+| patient_maxF1_weighted | n/a † | 0.763 |
+| patient_F1@0.5_weighted | n/a † | 0.128 |
+| patient_maxF1_simple | n/a † | 0.453 |
+| patient_F1@0.5_simple | n/a † | 0.134 |
 | cap=48h AUROC | 0.478 | 0.523 |
 | RELEASE MAE (h) | 84.0 | 68.4 |
-| DEATH MAE (h) | 162 | 167.6 |
-| gen_to_gt_ratio_median | ~1.18 | 0.544 |
-| gen_frac_terminal_first24h | — | 0.051 |
-| phase2_best_val | 0.185 | 0.150 |
-| phase3_best_val | 1.10 | 0.930 |
+| DEATH MAE (h) | 162.2 | 167.6 |
+| gen_to_gt_ratio_median | 1.184 | 0.544 |
+| gen_frac_terminal_first24h | 0.070 | 0.051 |
+| phase2_best_val | 0.1845 | 0.1500 |
+| phase3_best_val | 1.103 | 0.930 |
+
+† F1 metrics were added to the eval *after* the 10k I2b run, so they
+were not logged for that row; the AUROC/AUPRC numbers above are the
+original 10k eval numbers (re-aggregated over the 11 kept outcomes).
 
 **Confirms the 10k screen** (0.755 → 0.759, +0.004 within noise) with
 *better* short-horizon calibration (cap=48h 0.478→0.523), RELEASE timing
 (84→68 h) and honesty (gen_to_gt 0.544). Full-data embedder + data drove
 both phase val losses down sharply (phase2 0.185→0.150, phase3 1.10→0.93).
 
-**Per-outcome AUROC (full data, the real picture):**
+**Per-outcome AUROC / AUPRC / F1 (full data, the real picture):**
 
-| Outcome | AUROC | n_pos | discrimination |
-|---|---|---|---|
-| DISGLYCEMIA_Hyper | 0.920 | 3550 | strong |
-| DISGLYCEMIA_Hypo | 0.901 | 875 | strong |
-| KIDNEY | 0.833 | 3839 | strong |
-| DEATH | 0.788 | 1115 | good |
-| CARDIO | 0.744 | 5078 | good |
-| RELEASE | 0.678 | 7447 | moderate |
-| NEUROVASCULAR | 0.565 | 170 | ~chance |
-| SKIN_ULCER | 0.565 | 391 | ~chance |
-| RETINOPATHY | 0.552 | 284 | ~chance |
-| KETOACIDOSIS | 0.546 | 200 | ~chance |
-| NERVOUS_SYSTEM | 0.536 | 517 | ~chance |
+| Outcome | AUROC | AUPRC | maxF1 (τ*) | F1@0.5 | n_pos | prev | discrimination |
+|---|---|---|---|---|---|---|---|
+| DISGLYCEMIA_Hyper | 0.920 | 0.909 | 0.816 (τ=0.064) | 0.461 | 3550 | 0.415 | strong |
+| DISGLYCEMIA_Hypo  | 0.901 | 0.648 | 0.613 (τ=0.234) | 0.497 | 875  | 0.102 | strong |
+| KIDNEY            | 0.833 | 0.799 | 0.746 (τ=0.027) | 0.127 | 3839 | 0.448 | strong |
+| DEATH             | 0.788 | 0.402 | 0.434 (τ=0.279) | 0.388 | 1115 | 0.130 | good |
+| CARDIO            | 0.744 | 0.797 | 0.780 (τ=0.000) | 0.000 | 5078 | 0.593 | good |
+| RELEASE           | 0.678 | 0.924 | 0.934 (τ=0.005) | 0.000 | 7447 | 0.870 | moderate |
+| NEUROVASCULAR     | 0.565 | 0.039 | 0.115 (τ=0.000) | 0.000 | 170  | 0.020 | ~chance |
+| SKIN_ULCER        | 0.565 | 0.083 | 0.181 (τ=0.000) | 0.000 | 391  | 0.046 | ~chance |
+| RETINOPATHY       | 0.552 | 0.048 | 0.132 (τ=0.000) | 0.000 | 284  | 0.033 | ~chance |
+| KETOACIDOSIS      | 0.546 | 0.030 | 0.101 (τ=0.000) | 0.000 | 200  | 0.023 | ~chance |
+| NERVOUS_SYSTEM    | 0.536 | 0.076 | 0.131 (τ=0.000) | 0.000 | 517  | 0.060 | ~chance |
+
+`maxF1` is at the optimal threshold τ* swept over the probability range;
+`F1@0.5` uses the default 0.5 cutoff. The very-low-prevalence outcomes
+have maxF1 thresholds at ~0 (any positive prediction is rare) and F1@0.5
+collapses to 0 — the optimal operating point sits far below 0.5.
 
 **Important full-data finding:** only **6 of the 11 kept outcomes show
 real discrimination**; the 5 rarest regress to ~0.55 on full data. Their
