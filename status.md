@@ -216,6 +216,57 @@ below — outside the 0.005 equivalence window, so M-256 currently leads. BUT th
 regression is a strike against M-256 as the deployable model. Sweep continues to
 M-384/512/768. Decision deferred until the full grid + honesty are weighed together.
 
+### P6-M-384-full — full-data sweep point 3/5 (AUROC peak passed)
+
+**What:** M-384 (embed_dim=384, n_head=6, n_layer=4; 14.88M params) full data,
+patience=15, Phase-3 plateau-stopped ep86. Config commit `3cafcca`.
+
+**Gates:** Smoke A–D pass. T1 (all auxes descend), T2 (ranking unlock ep11 < P2
+stop ep49), T3 (all 6 outcomes 0.733–0.926) — PASS.
+
+**Headline (held-out 8562 test):**
+- `patient_auroc_weighted` **0.876** — **BELOW both M-256 (0.891) and M-128 (0.883)**.
+  The sweep AUROC peak is M-256; M-384 turns down.
+- AUPRC_w 0.773, maxF1_w 0.707, F1@0.5_w 0.500, simple AUROC 0.866.
+- Per-outcome AUROC (all ≤ M-256): CARDIO 0.926 (−0.049), DISGLYCEMIA_Hyper 0.910 (flat),
+  KIDNEY 0.885 (−0.016), HYPEROSMOLALITY 0.883 (−0.007), DISGLYCEMIA_Hypo 0.858 (−0.019),
+  DEATH 0.733 (−0.061).
+- Length-of-stay MAE 77.5h. Multi-horizon: cap48 0.507, cap168 0.542, cap336 0.520.
+
+**KEY METHODOLOGICAL FINDING — AUROC↔calibration divergence with capacity:**
+M-384 posts the **best validation losses of the entire sweep** (phase2 0.144 vs M-256
+0.149 vs M-128 0.153; phase3 1.634 vs 1.672 vs 1.774) **yet the worst AUROC**. The
+bigger model fits the soft-label BCE (likelihood/calibration) better but *ranks*
+worse — and generates least honestly. This is the documented Pareto, now crisp across 3 sizes.
+
+**Trajectory honesty — worst of the sweep:** `gen_to_gt_ratio_median` **0.324**
+(M-256 0.407, M-128 0.606), `gen_frac_terminal_first24h` **0.373** (M-256 0.198,
+M-128 0.052). Monotone honesty decline with size.
+
+**Per-aux training trace table:**
+
+| Phase | Aux | Unlock/calib ep | λ_max | anchor raw | final raw | Δ% |
+|---|---|---|---|---|---|---|
+| 1 | dt | calib ep3 | — | 1.589 (ep1) | 0.745 (ep36) | −53.1% |
+| 2 | ce | calib ep3 | — | 0.790 | 0.0007 | −99.9% |
+| 2 | dt | calib ep3 | — | 0.823 | 0.030 | −96.4% |
+| 2 | ttt | calib ep3 | — | 21.249 | 0.031 | −99.9% |
+| 2 | ranking | unlock ep11 (calib ep10) | 0.0340 | 0.0625 (ep10) | 0.027 (ep49) | −57.1% |
+| 3 | outcome BCE | ep1 | — | 2.176 | 1.362 (ep86) | −37.4% |
+| 3 | ranking | calib ep1 | — | 0.451 | 0.213 (ep86) | −52.9% |
+| 3 | pool | calib ep1 | 0.1156 | 0.942 | ~0 (ep86) | −100% |
+
+**Sweep curve so far (AUROC_w / gen_to_gt / frac_term24h):**
+- M-128 (1.75M): 0.883 / 0.606 / 0.052
+- M-256 (6.71M): **0.891** / 0.407 / 0.198  ← AUROC peak
+- M-384 (14.88M): 0.876 / 0.324 / 0.373  ← turned down on both axes
+
+**Verdict: P6-SWEEP point 3/5 — AUROC PEAK PASSED at M-256.** M-384 is worse on
+AUROC and honesty → capacity past M-256 overfits on this dataset. M-512/768 are now
+confirmatory (expect continued decline). Running best remains **M-256 (0.891)**;
+**M-128 (0.883) is 0.008 back but by far the most honest** — the eventual winner
+decision will weigh AUROC vs honesty, not AUROC alone. Continue to M-512.
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
