@@ -16,7 +16,7 @@ SEED = 42
 
 MODEL_CONFIG = {
       "time2vec_dim": 32,
-      "embed_dim": 128,   # WINNER M-128 (head_dim=64, n_head=2) — SEEDED re-run @ patience 5 = inference/QA platform
+      "embed_dim": 128,   # WINNER M-128 (head_dim=64, n_head=2) — SEEDED @ patience 15 = inference/QA platform
       "n_head": 2,
       "n_layer": 4,
       "dropout": 0.1,
@@ -32,7 +32,7 @@ TRAINING_SETTINGS = {
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
     "lr_warmup_epochs": 5,
-    "early-stop-patience": 5,  # reverted 15->5 (original locked). patience=15 ablation (M-128-rerun-p15) gave WORSE AUROC+honesty (Phase-3 overtrained to cap) though confounded by unseeded init; 5 is the locked default + best-observed. Now reproducible via SEED.
+    "early-stop-patience": 15,  # patience=15 (user req 2026-05-31): now SEEDED, so M-128 seed42 p15 vs seed42 p5 (0.824) is a CLEAN patience ablation. Platform for F1/F2 + QA + k-ablation.
     "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,
