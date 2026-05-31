@@ -267,6 +267,41 @@ confirmatory (expect continued decline). Running best remains **M-256 (0.891)**;
 **M-128 (0.883) is 0.008 back but by far the most honest** — the eventual winner
 decision will weigh AUROC vs honesty, not AUROC alone. Continue to M-512.
 
+### M-128-rerun-p15 — PATIENCE ABLATION (unexpected: patience=15 hurts)
+
+**What:** Re-ran the winner M-128 (full data) at **patience=15** to regenerate
+checkpoints + refresh headline. Inadvertently a clean controlled **patience ablation**
+vs original M-128-full (`b8c7095`, patience=5) — same arch/data/recipe, only patience differs.
+Config commit `72108c7`.
+
+**RESULT — patience=15 is WORSE on headline AND honesty:**
+
+| M-128 | Phase-3 epochs | AUROC_w | gen_to_gt | frac_term_24h | phase3_val | cap48 AUROC |
+|---|---|---|---|---|---|---|
+| patience=5 (orig) | 49 (plateau) | **0.883** | **0.606** | **0.052** | 1.774 | 0.533 |
+| patience=15 (rerun) | **100 (cap)** | 0.872 | 0.366 | 0.235 | **1.709** | **0.652** |
+
+**Mechanism — AUROC↔calibration divergence at the optimization-horizon level:**
+longer Phase-3 drove val-BCE *down* (1.709 < 1.774) but full-trajectory peak-detector
+AUROC *down* (−0.011) and trajectory honesty *off a cliff* (0.606→0.366). The outcome
+head sharpens **near-term** discrimination (cap48 AUROC 0.652 vs 0.533) while the LM
+over-emits early terminals — collapsing generation length, so the full-horizon
+peak-detector misses later-occurring outcomes. Same Pareto we saw across *capacity*
+(M-128→256→384), now reproduced across *training duration*. Strong methods finding.
+
+**Per-outcome AUROC:** CARDIO 0.971, DISGLYCEMIA_Hyper 0.910, HYPEROSMOLALITY 0.868,
+DISGLYCEMIA_Hypo 0.865, KIDNEY 0.864, DEATH 0.759.
+
+**Per-aux trace:** P1 dt −41%; P2 ce −99.7/dt −93/ttt −99.6/ranking −12 (unlock ep18);
+P3 outcome −39/ranking −58/pool −99.97 (ep100 cap). All descend (T1✓), T2✓, T3✓.
+
+**Verdict: PATIENCE ABLATION — patience=15 inferior to patience=5 for the deployable
+model.** Implications: (1) revert to **patience=5** (original locked) for the M-128
+platform feeding F1/F2 + QA + k-ablation; the patience-5 M-128 (0.883, honest 0.606)
+is the model to carry forward. (2) The P6 sweep was patience-confounded (M-128 p5 vs
+M-256/384 p15) — noted for the report; the *honest* comparison favours smaller+shorter.
+**DECISION PENDING USER:** revert to p5 and re-run M-128 platform.
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
