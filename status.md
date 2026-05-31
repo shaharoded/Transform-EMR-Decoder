@@ -302,6 +302,48 @@ is the model to carry forward. (2) The P6 sweep was patience-confounded (M-128 p
 M-256/384 p15) — noted for the report; the *honest* comparison favours smaller+shorter.
 **DECISION PENDING USER:** revert to p5 and re-run M-128 platform.
 
+### M-128-seeded-s42 — SEED VARIANCE FINDING (reframes the sweep)
+
+**What:** First reproducible run — M-128, patience=5, `SEED=42`. Intended as the
+clean platform for F1/F2/QA/k-ablation. Config commit `4ec82e4`.
+
+**Headline:** AUROC_w **0.824**, simple 0.838, AUPRC_w 0.682, maxF1_w 0.680,
+F1@0.5_w 0.593. gen_to_gt 0.566 (honest), frac_term 0.132. P3 plateau@49.
+All 6 outcomes real: CARDIO 0.977, KIDNEY 0.878, DISGLYCEMIA_Hyper 0.862,
+DISGLYCEMIA_Hypo 0.853, HYPEROSMOLALITY 0.753, DEATH 0.709. cap48 0.683.
+
+**THE FINDING — initialization variance dominates the sweep:**
+Same config as the original M-128-full (patience 5, Phase-3 plateau@49) — only the
+init differs (original was unseeded) — yet AUROC swung **0.883 → 0.824 (−0.059)**.
+Three M-128 draws now:
+
+| run | patience | AUROC_w | gen_to_gt |
+|---|---|---|---|
+| original (unseeded) | 5 | 0.883 | 0.606 |
+| p15 rerun (unseeded) | 15 | 0.872 | 0.366 |
+| seeded s42 | 5 | 0.824 | 0.566 |
+
+**Range 0.059 — ~4× the entire P6 sweep spread (0.015).** The whole sweep
+(M-128 0.883 / M-256 0.891 / M-384 0.876) sits *inside* single-seed noise.
+**Conclusion: no architecture is significantly best at single-seed; the sweep ranking
+is not statistically meaningful.** The run is sound (auxes descend, honest gen, all
+outcomes discriminate) — seed 42 is simply a low draw (HYPEROSMOLALITY 0.753 vs 0.868,
+high-prevalence so it drags the weighted mean).
+
+**Implications:**
+1. **Multi-seed confidence (Step 5) is now essential, not optional** — need ≥3 seeds per
+   config for any architecture/headline claim with error bars.
+2. The M-128-vs-M-256 "winner" question is moot at single-seed — M-128 (smallest, honest,
+   cheapest) is a fine principled choice regardless.
+3. **Downstream F1/F2/QA/k-ablation will be read as DELTAS on this fixed reproducible
+   seed-42 checkpoint** (within-checkpoint comparisons are clean and unaffected by the
+   absolute draw); the absolute headline AUROC is reserved for the multi-seed study.
+
+**Verdict: SEED-VARIANCE FINDING — reframes the benchmark.** Now have a reproducible
+platform. Proceeding to Step 3 (F1/F2) on seed-42, treating results as deltas; multi-seed
+confidence elevated in priority. (Methods-section gold: "single-seed EHR-transformer
+architecture comparisons at this scale are within init noise.")
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
