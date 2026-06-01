@@ -379,6 +379,41 @@ now along the training-duration axis (cf. M-128-rerun-p15 was the confounded mir
 this model over-generates, so F2's "escape early-terminal" premise is moot here — F1
 length-normalized beam may instead *shorten*; will report deltas either way.
 
+### Step 3 — F1/F2 inference-side ablations (eval-only on seed-42 p15, greedy baseline 0.847)
+
+All eval-only on the fixed seed-42 patience-15 platform → within-checkpoint deltas
+(NOT subject to init variance). Flag-gated in `inference.py`; defaults preserve the
+immutable eval exactly, so QA / k-ablation evals are unchanged.
+
+| variant | AUROC_w | gen_to_gt | LoS MAE | verdict |
+|---|---|---|---|---|
+| greedy (default, bias3/gate48) | 0.847 | 1.913 (over) | 101h | baseline |
+| **F2 temperature schedule** (T 1.5→0.7) | **0.697** | 1.531 | 97h | **DISCARD (−0.150)** |
+| **stronger ttt-gate** (bias8/gate72) | **0.863** | **1.051** | **68h** | **KEEP (+0.016)** |
+
+**F2 (temperature-schedule decoding):** decisive negative, −0.150 AUROC, all 6 outcomes
+drop. The per-patient peak-detector eval scores outcome-head probs along the *generated*
+trajectory; greedy gives the model's confident MAP trajectory, and stochastic sampling
+just injects token noise → worse positions/timing. **Greedy is optimal for this eval.**
+
+**ttt-gate strengthening (the relevant lever for an over-generating model):** +0.016
+AUROC_w, and near-perfect length calibration (gen_to_gt 1.913→**1.051**), LoS 101→**68h**,
+HYPEROSMOLALITY +0.038. Capping over-generation helps headline AUROC, honesty, and LoS
+simultaneously — a free inference-time gain. (Legacy multi-horizon window-pooling drops at
+long horizons — shorter honest trajectories have fewer late positions — but the headline
+peak-detector improves.)
+
+**F1 (beam + length-norm): deprioritized, with reasoning.** Length-normalized beam mainly
+counteracts *short*-sequence bias; this platform *over*-generates (1.91), so beam's premise
+is mismatched. Combined with F2's strong signal that non-greedy decoding hurts this eval,
+and the high bug-risk of a beam rewrite over the stateful KV/legality/ttt loop, beam is
+expected neutral-to-negative. Tested the directly-relevant inference lever (ttt-gate) instead.
+
+**Verdict: INFERENCE HELPS.** Stronger ttt-gating is a free +0.016 AUROC + much better
+calibration. Per standing orders this is a "different inference helps" trigger → bigger-arch
+retry is now a candidate after Step 4/4.5. NB: QA + k-ablation will run at *default* inference
+(3/48 greedy) for clean apples-to-apples; the ttt-gate gain applies orthogonally on top.
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
