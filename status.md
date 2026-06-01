@@ -344,6 +344,41 @@ platform. Proceeding to Step 3 (F1/F2) on seed-42, treating results as deltas; m
 confidence elevated in priority. (Methods-section gold: "single-seed EHR-transformer
 architecture comparisons at this scale are within init noise.")
 
+### M-128-s42-p15 — CLEAN patience ablation (reverses the confounded one) + platform
+
+**What:** M-128, SEED=42, patience=15. Same seed/init as the seed-42 patience-5 run
+(0.824) → patience effect now **isolated**. This is the platform for Step 3/4/4.5.
+Config commit `f0c16cf`. P3 cap-bound@100.
+
+**Clean patience ablation at fixed seed 42:**
+
+| patience | AUROC_w | simple | gen_to_gt | frac_term24h | LoS MAE | cap336 |
+|---|---|---|---|---|---|---|
+| 5 | 0.824 | 0.838 | 0.566 (under) | 0.132 | 70h | 0.567 |
+| **15** | **0.847** | 0.859 | **1.913 (over)** | 0.0013 | 101h | **0.691** |
+
+**patience=15 RAISES AUROC +0.023** (and cap336 +0.124) — *reversing* the earlier
+confounded "p15 hurts" (that was init noise). Per-outcome all ≥ p5: CARDIO 0.975,
+DISGLYCEMIA_Hyper 0.878, KIDNEY 0.877, DISGLYCEMIA_Hypo 0.873, HYPEROSMOLALITY 0.801
+(+0.048), DEATH 0.750 (+0.041).
+
+**But generation FLIPPED under→over:** p15 over-generates (`gen_to_gt_median` 1.913,
+median 199h vs GT 104h, `frac_terminal_first24h` 0.0013 — almost never early-terminal),
+vs p5's under-gen 0.566. LoS MAE worse (101h vs 70h). **Finding: trajectory length is
+highly sensitive to training duration** — more Phase-3 epochs push the LM from early-stop
+(under-gen) to run-on (over-gen), and the longer trajectories help the full-horizon
+peak-detector AUROC while hurting length calibration. Same AUROC↔calibration Pareto,
+now along the training-duration axis (cf. M-128-rerun-p15 was the confounded mirror).
+
+**Auxes:** P2 ce −99.8 (ranking unlock ep17); P3 outcome 2.387→1.508, pool 0.946→0.0001
+(λ_pool 0.126). All descend (T1✓), T2✓ (unlock<stop), T3✓ (all outcomes 0.750–0.975).
+
+**Verdict: CLEAN PATIENCE ABLATION — patience=15 > patience=5 on AUROC at fixed seed
+(+0.023), at the cost of over-generation.** This seed-42 patience-15 model (0.847) is the
+**reproducible platform** for F1/F2 + QA + k-ablation (deltas measured here). NB for Step 3:
+this model over-generates, so F2's "escape early-terminal" premise is moot here — F1
+length-normalized beam may instead *shorten*; will report deltas either way.
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
