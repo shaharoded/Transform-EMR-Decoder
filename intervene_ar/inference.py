@@ -7,9 +7,9 @@ import joblib
 from pathlib import Path
 
 # ───────── local code ─────────────────────────────────────────────────── #
-from transform_emr.config.dataset_config import *
-from transform_emr.config.model_config import CHECKPOINT_PATH
-from transform_emr.utils import (
+from intervene_ar.config.dataset_config import *
+from intervene_ar.config.model_config import CHECKPOINT_PATH
+from intervene_ar.utils import (
     build_luts,
     init_legality_state_batched,
     build_illegal_mask_batched,
@@ -148,7 +148,7 @@ def generate(model,
     clamped to ≤ max_duration_hours.
 
     Args:
-        model: Trained GPT model.
+        model: Trained InterveneGPT model.
         dataset: EMRDataset providing patient seeds.
         max_duration_hours (float): Primary stop condition — generation horizon
             in hours from admission. Should match the training horizon (336 h /
@@ -450,11 +450,11 @@ if __name__ == "__main__":
     import random
     import joblib
     from pathlib import Path
-    from transform_emr.embedder import EMREmbedding
-    from transform_emr.transformer import GPT
-    from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset
-    from transform_emr.config.model_config import *
-    from transform_emr.config.dataset_config import *
+    from intervene_ar.embedder import EMREmbedding
+    from intervene_ar.transformer import InterveneGPT
+    from intervene_ar.dataset import DataProcessor, EMRTokenizer, EMRDataset
+    from intervene_ar.config.model_config import *
+    from intervene_ar.config.dataset_config import *
 
 
     # Load test data
@@ -492,7 +492,7 @@ if __name__ == "__main__":
     # Load models
     print("Loading model and generating predictions...")
     embedder, _, _, _, _, _, _ = EMREmbedding.load(PHASE1_CHECKPOINT, tokenizer=tokenizer)
-    model, _, _, _, _, _ = GPT.load(PHASE3_CHECKPOINT, embedder=embedder)
+    model, _, _, _, _, _ = InterveneGPT.load(PHASE3_CHECKPOINT, embedder=embedder)
     model.eval()
 
     # Run inference

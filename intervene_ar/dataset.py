@@ -12,8 +12,8 @@ from collections import Counter
 from typing import List
 
 # ───────── local code ─────────────────────────────────────────────────── #
-from transform_emr.config.dataset_config import *
-from transform_emr.config.model_config import CHECKPOINT_PATH
+from intervene_ar.config.dataset_config import *
+from intervene_ar.config.model_config import CHECKPOINT_PATH
 
 
 class DataProcessor:
@@ -32,7 +32,7 @@ class DataProcessor:
 
     """
     def __init__(self, df, context_df, 
-                 tak_repo_path='transform_emr/config/tak_repo.pkl', 
+                 tak_repo_path='intervene_ar/config/tak_repo.pkl', 
                  max_input_days=None, 
                  scaler=None, 
                  checkpoint_path=CHECKPOINT_PATH,
@@ -562,9 +562,9 @@ class DataProcessor:
         #      for the model to learn meaningful temporal dependencies.
         #
         # If you need to change this sorting for any reason, you MUST also update:
-        #   - emr_model/transform_emr/utils.py::get_temporal_multi_hot_targets()
-        #   - emr_model/transform_emr/embedder.py::train_embedder() BCE loss computation
-        #   - emr_model/transform_emr/transformer.py::pretrain_transformer() BCE loss computation
+        #   - emr_model/intervene_ar/utils.py::get_temporal_multi_hot_targets()
+        #   - emr_model/intervene_ar/embedder.py::train_embedder() BCE loss computation
+        #   - emr_model/intervene_ar/transformer.py::pretrain_transformer() BCE loss computation
         #
         self.df = df.sort_values(['PatientId', 'TimePoint']).reset_index(drop=True)
     
@@ -763,7 +763,7 @@ class EMRTokenizer:
         patient_tokens = df.groupby("PatientId")["PositionToken"].apply(set)
 
         # outcome_patient_ratios: name → prevalence ratio for outcomes that meet the threshold.
-        # Keys of this dict are the canonical valid outcome list used by the GPT outcome head.
+        # Keys of this dict are the canonical valid outcome list used by the InterveneGPT outcome head.
         # Outcomes below the threshold are dropped here, printed, and excluded from the head.
         outcome_patient_ratios = {}
         dropped_outcomes = []

@@ -11,7 +11,7 @@ The results shown here (in `evaluation.ipynb`) are on random data, as my researc
 ```bash
 transform-emr/
 │
-├── transform_emr/                     # Core Python package
+├── intervene_ar/                     # Core Python package
 │   ├── config/                        # Configuration modules
 │   │   ├── __init__.py
 │   │   ├── tak-repo-portable.json     # TAKRepository object from Mediator (see related project)
@@ -20,7 +20,7 @@ transform-emr/
 │   ├── __init__.py                    
 │   ├── dataset.py                     # Dataset, DataPreprocess and Tokenizer
 │   ├── embedder.py                    # Embedding model (EMREmbedding) + training
-│   ├── transformer.py                 # Transformer architecture (GPT) + training
+│   ├── transformer.py                 # Transformer architecture (InterveneGPT) + training
 │   ├── train.py                       # Full training pipeline (3-phase)
 │   ├── inference.py                   # Inference pipeline
 │   ├── loss.py                        # Utility module for special loss criterias
@@ -66,9 +66,9 @@ pip install -e .
 
 ```python
 import pandas as pd
-from transform_emr.dataset import EMRDataset
-from transform_emr.config.dataset_config import *
-from transform_emr.config.model_config import *
+from intervene_ar.dataset import EMRDataset
+from intervene_ar.config.dataset_config import *
+from intervene_ar.config.model_config import *
 
 # Load data (verify you paths are properly defined)
 temporal_df = pd.read_csv(TRAIN_TEMPORAL_DATA_FILE, low_memory=False)
@@ -86,7 +86,7 @@ MODEL_CONFIG['ctx_dim'] = int(train_ds.context_df.shape[1]) # Dinamically updati
 ### 2. Train Model
 
 ```python
-from transform_emr.train import run_training
+from intervene_ar.train import run_training
 embedder, model_p2, model_p3, test_raw = run_training()
 ```
 
@@ -109,11 +109,11 @@ complication over time. Use `generate` with `collect_risk_scores=True` for this 
 ```python
 import joblib
 from pathlib import Path
-from transform_emr.embedder import EMREmbedding
-from transform_emr.transformer import GPT
-from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset
-from transform_emr.inference import generate
-from transform_emr.config.model_config import *
+from intervene_ar.embedder import EMREmbedding
+from intervene_ar.transformer import InterveneGPT
+from intervene_ar.dataset import DataProcessor, EMRTokenizer, EMRDataset
+from intervene_ar.inference import generate
+from intervene_ar.config.model_config import *
 
 # Load tokenizer and scaler
 tokenizer = EMRTokenizer.load(Path(CHECKPOINT_PATH) / "tokenizer.pt")
@@ -129,7 +129,7 @@ embedder_model, *_ = EMREmbedding.load(PHASE1_CHECKPOINT, tokenizer=tokenizer)
 p3_ckpt = Path(PHASE3_CHECKPOINT)
 p2_ckpt = Path(PHASE2_CHECKPOINT)
 ckpt_path = p3_ckpt if p3_ckpt.exists() else p2_ckpt
-model, *_ = GPT.load(ckpt_path, embedder=embedder_model)
+model, *_ = InterveneGPT.load(ckpt_path, embedder=embedder_model)
 model.eval()
 
 # Generate risk curves — one row per generated step, P_<outcome> columns per complication
@@ -154,11 +154,11 @@ You can perform local tests (not unit-tests) by activating the `.py` files, usin
 
 For example, run this from the root:
 ```bash
-python -m transform_emr.train
+python -m intervene_ar.train
 
 # Or
 
-python -m transform_emr.inference
+python -m intervene_ar.inference
 
 # Both modules have a __main__ activation to train / infer on a trained model
 ```
@@ -186,23 +186,23 @@ To package without data/checkpoints:
 
 ```powershell
 # Clean up any existing temp folder
-Remove-Item -Recurse -Force .\transform_emr_temp -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force .\intervene_ar_temp -ErrorAction SilentlyContinue
 
 # Recreate the temp folder
-New-Item -ItemType Directory -Path .\transform_emr_temp | Out-Null
+New-Item -ItemType Directory -Path .\intervene_ar_temp | Out-Null
 
 # Copy only what's needed
-Copy-Item -Path .\transform_emr -Destination .\transform_emr_temp -Recurse
-Copy-Item -Path .\setup.py, .\evaluation.ipynb, .\README.md, .\requirements.txt -Destination .\transform_emr_temp
+Copy-Item -Path .\intervene_ar -Destination .\intervene_ar_temp -Recurse
+Copy-Item -Path .\setup.py, .\evaluation.ipynb, .\README.md, .\requirements.txt -Destination .\intervene_ar_temp
 
 # Remove __pycache__ folders (platform-specific bytecode, not for distribution)
-Get-ChildItem -Path .\transform_emr_temp -Filter __pycache__ -Recurse -Directory | Remove-Item -Recurse -Force
+Get-ChildItem -Path .\intervene_ar_temp -Filter __pycache__ -Recurse -Directory | Remove-Item -Recurse -Force
 
 # Zip it
-Compress-Archive -Path .\transform_emr_temp\* -DestinationPath .\emr_model.zip -Force
+Compress-Archive -Path .\intervene_ar_temp\* -DestinationPath .\intervene_ar.zip -Force
 
 # Clean up
-Remove-Item -Recurse -Force .\transform_emr_temp
+Remove-Item -Recurse -Force .\intervene_ar_temp
 ```
 
 ---
@@ -282,12 +282,12 @@ The training uses next-token prediction loss (temporal-window BCE) + time-delta 
 
 | Component           | Role                                                                                              |
 |--------------------|---------------------------------------------------------------------------------------------------|
-| `GPT`               | Transformer decoder stack over learned embeddings for next token prediction, with an additional head for delta_t prediction. Model inputs a trained embedder.                                               |
+| `InterveneGPT`               | Transformer decoder stack over learned embeddings for next token prediction, with an additional head for delta_t prediction. Model inputs a trained embedder.                                               |
 | `CausalSelfAttention` | Multi-head attention using causal mask to enforce chronology. Uses temporal RoPE to inject absolute time into attention scores.|
 | `MLP` | SwiGLU MLP (SiLU Gating), based on common LLM optimizations.                                 |
 | `AdaLNBlock` | Transformer block with AdaLN-Zero conditioning (adaptive layer norm), to bias prediction based on the patient context.                                 |
 | `pretrain_transformer()` | Phase-2 training loop. Main loss: legality-masked temporal multi-hot BCE (next-token) with a **soft-kernel terminal extension** — terminal-token BCE uses a learnable per-class decay constant (`model.log_tau_lm`) over a wider hard horizon (`phase2_terminal_bce_window_hours`), giving DEATH/RELEASE positive gradient pre-event instead of only the immediate next step. Auxiliaries scheduled in two stages: stage-0 = `ce` (masked set-CE), `dt` (Δt MSE), `ttt` (time-to-terminal MSE on `log1p` hours, direction C); stage-1 unlocks `ranking` (pairwise AUROC-proxy on the outcome head) once stage-0 plateaus. Each λ is calibrated once from the loss ratio at activation and capped at its `aux_fraction_caps` share of BCE. Outcome head uses **time-decayed soft labels** with a per-outcome learnable τ (`outcome_log_tau`) and a hard horizon `outcome_horizon_hours`. |
-| `finetune_transformer()` | Phase-3 outcome head + pool head fine-tune. The backbone is held at a tiny LR (`phase3_backbone_lr_factor`, default 0.01) so head gradients can still nudge it; the outcome head trains at full `phase3_learning_rate`. Natural-distribution batches (`oversample=False`) so `pos_weight` in `BCEWithLogitsLoss` correctly compensates for class imbalance without double-counting. A **patient-level attention pool head** (per-outcome learnable queries cross-attending over backbone hidden states) is added as an auxiliary: BCE against patient-level "outcome k appears anywhere in the trajectory" labels, λ calibrated once at the end of epoch 1 and capped at `phase3_pool_fraction_cap` of raw outcome BCE. Saves full-model checkpoints loadable with `GPT.load()`. |
+| `finetune_transformer()` | Phase-3 outcome head + pool head fine-tune. The backbone is held at a tiny LR (`phase3_backbone_lr_factor`, default 0.01) so head gradients can still nudge it; the outcome head trains at full `phase3_learning_rate`. Natural-distribution batches (`oversample=False`) so `pos_weight` in `BCEWithLogitsLoss` correctly compensates for class imbalance without double-counting. A **patient-level attention pool head** (per-outcome learnable queries cross-attending over backbone hidden states) is added as an auxiliary: BCE against patient-level "outcome k appears anywhere in the trajectory" labels, λ calibrated once at the end of epoch 1 and capped at `phase3_pool_fraction_cap` of raw outcome BCE. Saves full-model checkpoints loadable with `InterveneGPT.load()`. |
 
 ⚙️ **Phase 2: Learning Sequence Dependencies**  
 Once the EMR structure is captured, the transformer learns to model sequential dependencies in event progression:  

@@ -27,16 +27,16 @@ import torch
 from joblib import load as joblib_load
 from sklearn.model_selection import train_test_split
 
-from transform_emr.dataset import (
+from intervene_ar.dataset import (
     DataProcessor, EMRTokenizer, EMRDataset, collate_emr, get_dataloader,
 )
-from transform_emr.embedder import EMREmbedding, train_embedder
-from transform_emr.transformer import GPT, pretrain_transformer, finetune_transformer
-from transform_emr.config.model_config import (
+from intervene_ar.embedder import EMREmbedding, train_embedder
+from intervene_ar.transformer import InterveneGPT, pretrain_transformer, finetune_transformer
+from intervene_ar.config.model_config import (
     MODEL_CONFIG, TRAINING_SETTINGS,
     CHECKPOINT_PATH, PHASE1_CHECKPOINT, PHASE2_CHECKPOINT, PHASE3_CHECKPOINT,
 )
-from transform_emr.config.dataset_config import (
+from intervene_ar.config.dataset_config import (
     TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE, TAK_REPO_PATH,
 )
 
@@ -239,7 +239,7 @@ def run_training(reset_phase23=True):
         )
 
     # Phase 2 — backbone (oversampled batches for rare-outcome balance)
-    model_p2 = GPT(cfg=MODEL_CONFIG, embedder=embedder)
+    model_p2 = InterveneGPT(cfg=MODEL_CONFIG, embedder=embedder)
     model_p2, _, _ = pretrain_transformer(
         model             = model_p2,
         train_dl          = oversampled_train_dl,
@@ -255,7 +255,7 @@ def run_training(reset_phase23=True):
     _p2_last = _p2_best.parent / "ckpt_last.pt"
     _p2_ckpt = _p2_best if _p2_best.exists() else (_p2_last if _p2_last.exists() else None)
     if _p2_ckpt is not None:
-        model_p3, *_ = GPT.load(str(_p2_ckpt), embedder=embedder)
+        model_p3, *_ = InterveneGPT.load(str(_p2_ckpt), embedder=embedder)
     else:
         model_p3 = model_p2
 

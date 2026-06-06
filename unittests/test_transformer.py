@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from transform_emr.transformer import GPT
-from transform_emr.embedder import EMREmbedding
-from transform_emr.dataset import EMRTokenizer
+from intervene_ar.transformer import InterveneGPT
+from intervene_ar.embedder import EMREmbedding
+from intervene_ar.dataset import EMRTokenizer
 
 @pytest.fixture(scope="module")
 def mini_tokenizer():
@@ -54,7 +54,7 @@ def mini_embedder(mini_tokenizer):
 
 @pytest.fixture(scope="module")
 def transformer_cfg():
-    # Minimal GPT configuration including time2vec_dim
+    # Minimal InterveneGPT configuration including time2vec_dim
     return {
         'embed_dim': 8,
         'time2vec_dim': 4,
@@ -68,19 +68,19 @@ def transformer_cfg():
 
 @pytest.fixture(scope="module")
 def mini_transformer(mini_embedder, transformer_cfg):
-    # Instantiate GPT decoder with fixed small configuration
-    return GPT(cfg=transformer_cfg, embedder=mini_embedder, use_checkpoint=False)
+    # Instantiate InterveneGPT decoder with fixed small configuration
+    return InterveneGPT(cfg=transformer_cfg, embedder=mini_embedder, use_checkpoint=False)
 
 
 def test_transformer_initialization(mini_transformer, transformer_cfg, mini_embedder):
     """
-    Verify GPT initialization:
-      - Model is instance of GPT
+    Verify InterveneGPT initialization:
+      - Model is instance of InterveneGPT
       - Config stored correctly
       - Embedder attached and dimensions match
     """
     model = mini_transformer
-    assert isinstance(model, GPT)
+    assert isinstance(model, InterveneGPT)
     # Config should be preserved
     for k, v in transformer_cfg.items():
         assert model.cfg[k] == v, f"Config mismatch for {k}: expected {v}, got {model.cfg[k]}"
@@ -145,12 +145,12 @@ def test_transformer_checkpoint_persists_configs(mini_transformer, mini_embedder
         bad_epochs=1,
     )
 
-    loaded_model, epoch, best_val, optim_state, scheduler_state, lambda_state = GPT.load(
+    loaded_model, epoch, best_val, optim_state, scheduler_state, lambda_state = InterveneGPT.load(
         ckpt_path,
         embedder=mini_embedder,
     )
 
-    assert isinstance(loaded_model, GPT)
+    assert isinstance(loaded_model, InterveneGPT)
     assert epoch == 2
     assert best_val == pytest.approx(0.11)
     assert optim_state is not None

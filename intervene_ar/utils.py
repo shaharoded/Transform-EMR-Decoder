@@ -16,10 +16,10 @@ import pandas as pd
 from typing import Optional
 
 # ───────── local code ─────────────────────────────────────────────────── #
-from transform_emr.config.dataset_config import (
+from intervene_ar.config.dataset_config import (
     ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, MEAL_TOKENS
 )
-from transform_emr.schedulers import linear_schedule
+from intervene_ar.schedulers import linear_schedule
 
 
 def set_seed(seed: int):
@@ -103,7 +103,7 @@ def logger(func):
             ts = None
 
         try:
-            from transform_emr.config.model_config import MODEL_CONFIG
+            from intervene_ar.config.model_config import MODEL_CONFIG
         except Exception:
             MODEL_CONFIG = None
 

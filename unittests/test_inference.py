@@ -3,7 +3,7 @@ test_inference.py
 =================
 
 Tests for:
-  • GPT.forward_with_cache  (prefill and decode modes, KV-cache consistency)
+  • InterveneGPT.forward_with_cache  (prefill and decode modes, KV-cache consistency)
   • Batched legality utils  (init_legality_state_batched, build_illegal_mask_batched,
                              update_legality_state_batched, build_rep_penalty_batched)
   • infer_event_stream      (batched, KV-cached generation end-to-end)
@@ -14,17 +14,17 @@ import pytest
 import torch
 import pandas as pd
 
-from transform_emr.dataset import EMRTokenizer
-from transform_emr.embedder import EMREmbedding
-from transform_emr.transformer import GPT
-from transform_emr.utils import (
+from intervene_ar.dataset import EMRTokenizer
+from intervene_ar.embedder import EMREmbedding
+from intervene_ar.transformer import InterveneGPT
+from intervene_ar.utils import (
     build_luts,
     init_legality_state_batched,
     build_illegal_mask_batched,
     update_legality_state_batched,
     build_rep_penalty_batched,
 )
-from transform_emr.inference import generate
+from intervene_ar.inference import generate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ def mini_cfg():
 
 @pytest.fixture(scope="module")
 def mini_model(mini_embedder, mini_cfg):
-    model = GPT(cfg=mini_cfg, embedder=mini_embedder, use_checkpoint=False)
+    model = InterveneGPT(cfg=mini_cfg, embedder=mini_embedder, use_checkpoint=False)
     model.eval()
     return model
 
@@ -128,7 +128,7 @@ def luts(mini_tokenizer):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_inputs(mini_tokenizer, B=2, T=4):
-    """Return a simple batch of dummy inputs for GPT.forward / forward_with_cache."""
+    """Return a simple batch of dummy inputs for InterveneGPT.forward / forward_with_cache."""
     V  = len(mini_tokenizer.token2id)
     pad = mini_tokenizer.pad_token_id
     parent_raw = torch.zeros(B, T, 1, dtype=torch.long)
@@ -174,7 +174,7 @@ class FakeDataset:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GPT.forward_with_cache — prefill
+# InterveneGPT.forward_with_cache — prefill
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_forward_with_cache_prefill_shape(mini_model, mini_tokenizer):
@@ -227,7 +227,7 @@ def test_forward_with_cache_matches_regular_forward(mini_model, mini_tokenizer):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GPT.forward_with_cache — decode step
+# InterveneGPT.forward_with_cache — decode step
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_forward_with_cache_decode_shape(mini_model, mini_tokenizer):

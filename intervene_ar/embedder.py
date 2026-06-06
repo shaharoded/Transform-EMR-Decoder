@@ -9,13 +9,13 @@ from pathlib import Path
 from tqdm.auto import tqdm
 
 # ───────── local code ─────────────────────────────────────────────────── #
-from transform_emr.dataset import EMRTokenizer
-from transform_emr.utils import set_seed
-from transform_emr.config.model_config import SEED
-from transform_emr.config.model_config import *
-from transform_emr.config.dataset_config import OUTCOMES, TERMINAL_OUTCOMES
-from transform_emr.utils import compute_legality_masks_tf, get_temporal_multi_hot_targets, plot_losses, build_luts, logger
-from transform_emr.schedulers import LambdaScheduleController
+from intervene_ar.dataset import EMRTokenizer
+from intervene_ar.utils import set_seed
+from intervene_ar.config.model_config import SEED
+from intervene_ar.config.model_config import *
+from intervene_ar.config.dataset_config import OUTCOMES, TERMINAL_OUTCOMES
+from intervene_ar.utils import compute_legality_masks_tf, get_temporal_multi_hot_targets, plot_losses, build_luts, logger
+from intervene_ar.schedulers import LambdaScheduleController
 
 torch.serialization.add_safe_globals([
     EMRTokenizer,
@@ -128,7 +128,7 @@ class EMREmbedding(nn.Module):
         super().__init__()
         set_seed(SEED)  # reproducible weight init (constructed in immutable api.py before train fns run)
 
-        # Public attributes consumed by GPT, training loops, inference and diagnose.
+        # Public attributes consumed by InterveneGPT, training loops, inference and diagnose.
         self.tokenizer = tokenizer
         self.padding_idx = tokenizer.pad_token_id
         self.output_dim = embed_dim

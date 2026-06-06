@@ -10,4 +10,4 @@ url: https://github.com/shaharoded/Transform-EMR
 repository-code: https://github.com/shaharoded/Transform-EMR
 license: CC-BY-NC-4.0
 type: thesis
-abstract: "This repository contains code and models for structured event prediction in EMR data using multi-phase training with a GPT architecture. Developed as part of a graduate thesis."
+abstract: "This repository contains code and models for structured event prediction in EMR data using multi-phase training with a InterveneGPT architecture. Developed as part of a graduate thesis."

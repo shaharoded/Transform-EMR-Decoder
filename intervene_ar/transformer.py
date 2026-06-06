@@ -2,7 +2,7 @@
 transformer.py
 ==============
 
-GPT wrapper that plugs into the project-wide Time2Vec + context
+InterveneGPT wrapper that plugs into the project-wide Time2Vec + context
 embedding defined in embedding.py and the batch structure produced
 by dataset.py.
 """
@@ -18,11 +18,11 @@ from pathlib import Path
 from tqdm.auto import tqdm
 
 # ───────── local code ─────────────────────────────────────────────────── #
-from transform_emr.embedder import EMREmbedding
-from transform_emr.config.model_config import *
-from transform_emr.utils import *
-from transform_emr.loss import MaskedFocalBCE, MaskedSetCE, pairwise_ranking_loss
-from transform_emr.schedulers import LambdaScheduleController, LRScheduleController
+from intervene_ar.embedder import EMREmbedding
+from intervene_ar.config.model_config import *
+from intervene_ar.utils import *
+from intervene_ar.loss import MaskedFocalBCE, MaskedSetCE, pairwise_ranking_loss
+from intervene_ar.schedulers import LambdaScheduleController, LRScheduleController
 
 # ───────── components  ───────────────────────────────────────────────── #
 class CausalSelfAttention(nn.Module):
@@ -214,7 +214,7 @@ class MLP(nn.Module):
     """
     def __init__(self, cfg):
         super().__init__()
-        # Standard GPT uses 4x expansion.
+        # Standard InterveneGPT uses 4x expansion.
         # For SwiGLU, we project to 2 * (4 * dim) so we can split it into two 4x vectors.
         hidden_dim = 4 * cfg["embed_dim"]
 
@@ -306,10 +306,10 @@ class AdaLNBlock(nn.Module):
         return x
 
 
-# ───────── the GPT wrapper that consumes EMREmbedding ─────────────────────── #
-class GPT(nn.Module):
+# ───────── the InterveneGPT wrapper that consumes EMREmbedding ─────────────────────── #
+class InterveneGPT(nn.Module):
     """
-    GPT-style decoder that takes an *external* EMREmbedding instead of its own
+    InterveneGPT-style decoder that takes an *external* EMREmbedding instead of its own
     token/positional embeddings.
 
     The model learns the contextual connections between events in the EMR, and generates a
@@ -337,12 +337,12 @@ class GPT(nn.Module):
         # ─── Sanity checks ─────────────────────────────────────────────────────────────
         vocab_size = self.embedder.decoder.out_features
 
-        assert hasattr(self.embedder.tokenizer, "id2token"), "[GPT] Embedder missing id2token map"
+        assert hasattr(self.embedder.tokenizer, "id2token"), "[InterveneGPT] Embedder missing id2token map"
         assert len(self.embedder.tokenizer.id2token) == vocab_size, (
-            f"[GPT] id2token size mismatch: got {len(self.embedder.tokenizer.id2token)}, expected {vocab_size}"
+            f"[InterveneGPT] id2token size mismatch: got {len(self.embedder.tokenizer.id2token)}, expected {vocab_size}"
         )
         assert len(self.embedder.tokenizer.token2id) == self.embedder.position_embed.num_embeddings, \
-            f"[GPT] Mismatch between tokenizer (len={len(self.embedder.tokenizer.token2id)}) and position_embed ({self.embedder.position_embed.num_embeddings})"
+            f"[InterveneGPT] Mismatch between tokenizer (len={len(self.embedder.tokenizer.token2id)}) and position_embed ({self.embedder.position_embed.num_embeddings})"
 
         # ─── Build layers ─────────────────────────────────────────────────────────────
         self.drop = nn.Dropout(cfg["dropout"])
@@ -353,7 +353,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(cfg["embed_dim"], vocab_size, bias=False)
         self.lm_head.weight = self.embedder.position_embed.weight  # weight tying
         assert self.lm_head.weight.shape[0] == vocab_size, (
-            f"[GPT] lm_head output dim ({self.lm_head.weight.shape[0]}) "
+            f"[InterveneGPT] lm_head output dim ({self.lm_head.weight.shape[0]}) "
             f"does not match embedder.position_embed ({vocab_size})"
         )
 
@@ -367,7 +367,7 @@ class GPT(nn.Module):
         in_vocab = [n for n in all_config_outcomes if n in tok.token2id]
         missing_outcomes = [n for n in all_config_outcomes if n not in tok.token2id]
         if missing_outcomes:
-            print(f"[GPT] Outcomes not in tokenizer vocab (ignored): {missing_outcomes}")
+            print(f"[InterveneGPT] Outcomes not in tokenizer vocab (ignored): {missing_outcomes}")
 
         # outcome_patient_ratios keys are the valid outcomes; empty dict = old tokenizer, use all
         if getattr(tok, 'outcome_patient_ratios', None):
@@ -379,7 +379,7 @@ class GPT(nn.Module):
         # Hard Error if nothing is left (Training cannot proceed)
         if not valid_outcomes:
             raise ValueError(
-                f"[GPT] No valid outcomes found! Configured outcomes: {all_config_outcomes}. "
+                f"[InterveneGPT] No valid outcomes found! Configured outcomes: {all_config_outcomes}. "
                 "None of these exist in the tokenizer vocabulary. Check your dataset configuration or tokenizer build."
             )
         self.outcome_names = valid_outcomes
@@ -544,7 +544,7 @@ class GPT(nn.Module):
         )
 
         self.apply(self._init_weights)
-        # Slightly smaller init for residual projections as in GPT-2:
+        # Slightly smaller init for residual projections as in InterveneGPT-2:
         # scale down the output projection of each residual branch by 1/√(2*n_layers)
         # to keep the residual stream variance bounded at init in deep networks.
         # Targets: att.proj (attention output) and mlp.w2 (MLP output).
@@ -552,7 +552,7 @@ class GPT(nn.Module):
             if n.endswith(("att.proj.weight", "mlp.w2.weight")):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg["n_layer"]))
 
-        print(f"[GPT]: Total params: {self.get_num_params()/1e6:.2f} M")
+        print(f"[InterveneGPT]: Total params: {self.get_num_params()/1e6:.2f} M")
 
 
     # -------------------------------------------------------- helpers ------- #
@@ -817,20 +817,20 @@ class GPT(nn.Module):
         ckpt = torch.load(path, map_location=map_location, weights_only=True)
 
         if "config" not in ckpt:
-            raise ValueError("[GPT.load] Invalid checkpoint: missing 'config'.")
+            raise ValueError("[InterveneGPT.load] Invalid checkpoint: missing 'config'.")
 
         # === Vocab safety check ===
         expected_vocab = ckpt["vocab_size"]
         actual_vocab = embedder.decoder.out_features
         if expected_vocab != actual_vocab:
             raise ValueError(
-                f"[GPT.load] Embedder vocab size mismatch: checkpoint={expected_vocab}, embedder={actual_vocab}"
+                f"[InterveneGPT.load] Embedder vocab size mismatch: checkpoint={expected_vocab}, embedder={actual_vocab}"
             )
 
         # === Outcome configuration check ===
         if "outcome_names" not in ckpt or "num_outcomes" not in ckpt:
             raise ValueError(
-                "[GPT.load] Invalid checkpoint: missing 'outcome_names' or 'num_outcomes'. "
+                "[InterveneGPT.load] Invalid checkpoint: missing 'outcome_names' or 'num_outcomes'. "
                 "Checkpoint was saved with an older version of the code."
             )
 
@@ -841,7 +841,7 @@ class GPT(nn.Module):
         current_outcomes = set(OUTCOMES + TERMINAL_OUTCOMES)
         if not expected_outcome_names.issubset(current_outcomes):
             raise ValueError(
-                f"[GPT.load] Outcome configuration mismatch!\n"
+                f"[InterveneGPT.load] Outcome configuration mismatch!\n"
                 f"  Checkpoint outcomes: {sorted(expected_outcome_names)}\n"
                 f"  Current config outcomes: {sorted(current_outcomes)}\n"
                 f"  Please use the same OUTCOMES and TERMINAL_OUTCOMES config that was used during training."
@@ -853,7 +853,7 @@ class GPT(nn.Module):
         # Final sanity check
         if model.num_outcomes != expected_num_outcomes:
             raise ValueError(
-                f"[GPT.load] Architecture mismatch: checkpoint has {expected_num_outcomes} outcomes, "
+                f"[InterveneGPT.load] Architecture mismatch: checkpoint has {expected_num_outcomes} outcomes, "
                 f"but reconstructed model has {model.num_outcomes}."
             )
 
@@ -870,7 +870,7 @@ class GPT(nn.Module):
         # explicitly inference-only.
         _ttt_keys_missing = {k for k in missing if k.startswith("ttt_head.")}
         if _ttt_keys_missing:
-            print(f"[GPT.load] ttt_head not in ckpt — keeping random init "
+            print(f"[InterveneGPT.load] ttt_head not in ckpt — keeping random init "
                   f"({len(_ttt_keys_missing)} keys). This is expected when "
                   f"loading a pre-direction-C checkpoint.")
             missing = missing - _ttt_keys_missing
@@ -881,15 +881,15 @@ class GPT(nn.Module):
         # touch it, so random init is safe at inference.
         _pool_keys_missing = {k for k in missing if k.startswith("_pool_")}
         if _pool_keys_missing:
-            print(f"[GPT.load] pool head not in ckpt — keeping random init "
+            print(f"[InterveneGPT.load] pool head not in ckpt — keeping random init "
                   f"({len(_pool_keys_missing)} keys). Expected when loading "
                   f"a pre-P4 checkpoint; pool head is a Phase-3 aux only.")
             missing = missing - _pool_keys_missing
 
         if missing:
-            raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
+            raise RuntimeError(f"[InterveneGPT.load] Missing required keys in checkpoint: {sorted(missing)}")
         if unexpected:
-            raise RuntimeError(f"[GPT.load] Unexpected keys in checkpoint: {sorted(unexpected)}")
+            raise RuntimeError(f"[InterveneGPT.load] Unexpected keys in checkpoint: {sorted(unexpected)}")
         model.load_state_dict(state_dict, strict=False)
 
         # Align device: the caller's embedder may already be on GPU while the checkpoint
@@ -933,7 +933,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
     and penalties are applied to encourage valid event sequences.
 
     Args:
-        model (nn.Module): GPT decoder with attached EMREmbedding.
+        model (nn.Module): InterveneGPT decoder with attached EMREmbedding.
         train_dl (DataLoader): Training data loader.
         val_dl (DataLoader): Validation data loader.
         resume (bool): Resume from latest checkpoint if found.
@@ -1006,8 +1006,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
     lambda_schedule_state = None
     if resume and ckpt_last.exists():
-        print(f"[GPT]: Loading model from checkpoint: {ckpt_last}")
-        loaded_model, start_epoch, best_val, opt_state, sch_state, lambda_schedule_state = GPT.load(ckpt_last, embedder=model.embedder, map_location=device)
+        print(f"[InterveneGPT]: Loading model from checkpoint: {ckpt_last}")
+        loaded_model, start_epoch, best_val, opt_state, sch_state, lambda_schedule_state = InterveneGPT.load(ckpt_last, embedder=model.embedder, map_location=device)
         model = loaded_model
         model.to(device)
         if opt_state is not None:
@@ -1415,10 +1415,10 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     Because the backbone is frozen, this phase converges quickly. Early stopping is
     applied against validation outcome loss. Checkpoints are saved in the same full-model
-    format as Phase 2, so GPT.load() works identically for both checkpoints.
+    format as Phase 2, so InterveneGPT.load() works identically for both checkpoints.
 
     Args:
-        model             : trained GPT (loaded from Phase-2 best checkpoint).
+        model             : trained InterveneGPT (loaded from Phase-2 best checkpoint).
         train_dl          : training DataLoader (same batched loader used in Phase 2).
         val_dl            : validation DataLoader.
         resume            : if True, look for a Phase-3 checkpoint and continue from it.
@@ -1490,7 +1490,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     if resume and ckpt_last.exists():
         print(f"[Phase-3]: Loading checkpoint: {ckpt_last}")
-        loaded_model, start_epoch, best_val, opt_state, _, _ = GPT.load(
+        loaded_model, start_epoch, best_val, opt_state, _, _ = InterveneGPT.load(
             ckpt_last, embedder=model.embedder, map_location=device
         )
         model = loaded_model
@@ -1553,7 +1553,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 batch = {k: v.to(device) for k, v in batch.items()}
 
                 # BF16 autocast wraps the forward (and gradient-checkpointed recompute
-                # inside GPT.forward also re-enters autocast for backward). Matches
+                # inside InterveneGPT.forward also re-enters autocast for backward). Matches
                 # Phase-2 precision regime and cuts activation memory roughly in half.
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                     logits, _, outcome_logits, _, _ = model(

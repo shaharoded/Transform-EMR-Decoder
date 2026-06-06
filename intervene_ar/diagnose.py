@@ -1,7 +1,7 @@
 """Standalone diagnostics for model research.
 
 Run:
-    python -m transform_emr.diagnose
+    python -m intervene_ar.diagnose
 """
 
 from __future__ import annotations
@@ -20,25 +20,25 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import cross_val_score
 
-from transform_emr.config.dataset_config import (
+from intervene_ar.config.dataset_config import (
     OUTCOMES,
     TAK_REPO_PATH,
     TERMINAL_OUTCOMES,
     TRAIN_CTX_DATA_FILE,
     TRAIN_TEMPORAL_DATA_FILE,
 )
-from transform_emr.config.model_config import (  
+from intervene_ar.config.model_config import (  
     CHECKPOINT_PATH,
     PHASE1_CHECKPOINT,
     PHASE2_CHECKPOINT,
     PHASE3_CHECKPOINT,
     TRAINING_SETTINGS,
 )
-from transform_emr.dataset import DataProcessor, EMRDataset, EMRTokenizer, collate_emr, get_dataloader  
-from transform_emr.embedder import EMREmbedding  
-from transform_emr.loss import MaskedFocalBCE  
-from transform_emr.transformer import GPT  
-from transform_emr.utils import (  
+from intervene_ar.dataset import DataProcessor, EMRDataset, EMRTokenizer, collate_emr, get_dataloader  
+from intervene_ar.embedder import EMREmbedding  
+from intervene_ar.loss import MaskedFocalBCE  
+from intervene_ar.transformer import InterveneGPT  
+from intervene_ar.utils import (  
     apply_masks_to_logits,
     build_luts,
     compute_legality_masks_tf,
@@ -262,10 +262,10 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     # Prefer Phase-3 (outcome head fine-tuned) — it matches the model evaluated in evaluation.py.
     # Fall back to Phase-2 if Phase-3 has not been trained yet.
     if Path(PHASE3_CHECKPOINT).exists():
-        model, *_ = GPT.load(PHASE3_CHECKPOINT, embedder=embedder)
+        model, *_ = InterveneGPT.load(PHASE3_CHECKPOINT, embedder=embedder)
         print("[Diag] Using Phase-3 checkpoint (outcome head fine-tuned — matches evaluation.py).")
     else:
-        model, *_ = GPT.load(PHASE2_CHECKPOINT, embedder=embedder)
+        model, *_ = InterveneGPT.load(PHASE2_CHECKPOINT, embedder=embedder)
         print("[Diag] Phase-3 not found — falling back to Phase-2 checkpoint.")
     model = model.to(device).eval()
 
@@ -656,7 +656,7 @@ def diagnose_generation_time(df: pd.DataFrame, max_duration_hours: float = 336.0
         mean. Also reports the fraction of patients that ran past the horizon.
 
     Args:
-        df (pd.DataFrame): Output of `transform_emr.inference.generate()`.
+        df (pd.DataFrame): Output of `intervene_ar.inference.generate()`.
         max_duration_hours (float): Training horizon (default 336 h = 14 days).
 
     Returns:
@@ -741,7 +741,7 @@ def _collect_val_batches(model, val_dl, n_batches: int = 1):
     Method: Run the model in eval mode (no autocast), keep float32 outputs on CPU.
 
     Args:
-        model: GPT, already on device, in eval mode.
+        model: InterveneGPT, already on device, in eval mode.
         val_dl (DataLoader): Validation dataloader.
         n_batches (int): Batches to consume.
 
@@ -804,7 +804,7 @@ def probe_dt_head(model, val_dl, n_batches: int = 1) -> dict:
         and per-patient std of predicted Δt.
 
     Args:
-        model: GPT in eval mode.
+        model: InterveneGPT in eval mode.
         val_dl (DataLoader): Validation dataloader.
         n_batches (int): Batches to consume.
 
@@ -875,7 +875,7 @@ def probe_terminal_logits(model, val_dl, tokenizer, n_batches: int = 1, top_k_sh
         print top-k logits at the last non-pad position per patient.
 
     Args:
-        model: GPT in eval mode.
+        model: InterveneGPT in eval mode.
         val_dl (DataLoader): Validation dataloader.
         tokenizer (EMRTokenizer): For token2id lookup.
         n_batches (int): Batches to consume.
@@ -946,7 +946,7 @@ def probe_outcome_label_alignment(model, val_dl, tokenizer, n_batches: int = 1,
         Compute mean-logit gap (pos − neg) and AUROC. Flip = gap < 0 or AUROC < 0.5.
 
     Args:
-        model: GPT in eval mode.
+        model: InterveneGPT in eval mode.
         val_dl (DataLoader): Validation dataloader.
         tokenizer (EMRTokenizer): For token2id lookup.
         n_batches (int): Batches to consume.
@@ -1028,7 +1028,7 @@ def probe_calibration_by_abs_time(model, val_dl, tokenizer, n_batches: int = 1,
         logit and AUROC averaged across all outcomes (48h forward window).
 
     Args:
-        model: GPT in eval mode.
+        model: InterveneGPT in eval mode.
         val_dl (DataLoader): Validation dataloader.
         tokenizer (EMRTokenizer): For outcome token ids.
         n_batches (int): Batches to consume.
@@ -1095,7 +1095,7 @@ def probe_legality_starvation(model, val_dl, tokenizer, n_batches: int = 1) -> d
         compute_legality_masks_tf and check whether the terminal id is illegal.
 
     Args:
-        model: GPT (uses its tokenizer/luts/device).
+        model: InterveneGPT (uses its tokenizer/luts/device).
         val_dl (DataLoader): Validation dataloader.
         tokenizer (EMRTokenizer): For token ids.
         n_batches (int): Batches to consume.
@@ -1165,7 +1165,7 @@ def probe_outcome_logit_distribution(model, val_dl, n_batches: int = 1) -> pd.Da
         positions, report mean / std / p99 / abs-max per outcome.
 
     Args:
-        model: GPT in eval mode.
+        model: InterveneGPT in eval mode.
         val_dl (DataLoader): Validation dataloader.
         n_batches (int): Batches to consume.
 

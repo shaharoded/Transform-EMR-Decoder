@@ -1,8 +1,8 @@
 import torch
 import pytest
 
-from transform_emr.embedder import EMREmbedding
-from transform_emr.dataset import EMRTokenizer
+from intervene_ar.embedder import EMREmbedding
+from intervene_ar.dataset import EMRTokenizer
 
 @pytest.fixture(scope="module")
 def mini_tokenizer():

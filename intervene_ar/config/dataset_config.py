@@ -4,7 +4,7 @@ import os
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 # Data file paths (relative to project root)
-TAK_REPO_PATH            = os.path.join(PROJECT_ROOT, 'transform_emr', 'config', 'tak-repo-portable.json')
+TAK_REPO_PATH            = os.path.join(PROJECT_ROOT, 'intervene_ar', 'config', 'tak-repo-portable.json')
 TRAIN_TEMPORAL_DATA_FILE = os.path.join(PROJECT_ROOT, 'data', 'train', 'temporal_data.csv')
 TRAIN_CTX_DATA_FILE      = os.path.join(PROJECT_ROOT, 'data', 'train', 'context_data.csv')
 TEST_TEMPORAL_DATA_FILE  = os.path.join(PROJECT_ROOT, 'data', 'test', 'temporal_data.csv')

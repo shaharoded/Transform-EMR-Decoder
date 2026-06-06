@@ -1,7 +1,7 @@
-# transform_emr/config/__init__.py
+# intervene_ar/config/__init__.py
 
-from transform_emr.config.model_config import *
-from transform_emr.config.dataset_config import TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE, TEST_TEMPORAL_DATA_FILE, TEST_CTX_DATA_FILE
+from intervene_ar.config.model_config import *
+from intervene_ar.config.dataset_config import TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE, TEST_TEMPORAL_DATA_FILE, TEST_CTX_DATA_FILE
 
 __all__ = [
     "MODEL_CONFIG",

@@ -1,12 +1,12 @@
 from torch.utils.data import DataLoader
 import os
-from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr
+from intervene_ar.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr
 import pandas as pd
 import pytest
 import json
 import torch
-from transform_emr.dataset import DataProcessor
-from transform_emr.config.dataset_config import RELEASE_TOKEN, DEATH_TOKEN, ADMISSION_TOKEN
+from intervene_ar.dataset import DataProcessor
+from intervene_ar.config.dataset_config import RELEASE_TOKEN, DEATH_TOKEN, ADMISSION_TOKEN
 
 # --- Mock TAK Repo Setup (JSON format) ---
 @pytest.fixture
