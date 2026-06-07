@@ -1,4 +1,6 @@
-# Event Prediction in EMRs
+# INTERVenE-ar — Autoregressive EMR Trajectory Generation with Outcome Risk Curves
+
+**INTERVenE** (**INTERV**al-based **E**MR transformer) is a model family for outcome prediction from temporal abstractions. The family has two variants — **INTERVenE-ar** (autoregressive trajectory generation) and **INTERVenE-enc** (bidirectional encoder for joint risk + time-to-event prediction) — sharing a common backbone of hierarchical interval tokens, temporal RoPE, and AdaLN-Zero patient conditioning. This repository hosts the **INTERVenE-ar** variant.
 
 This repository implements a three-phase deep learning pipeline for modeling longitudinal Electronic Medical Records (EMRs). The architecture combines temporal embeddings, patient context, and Transformer-based sequence modeling to predict or impute patient events over time, and to read complication-risk curves from a dedicated outcome head.
 
@@ -132,12 +134,15 @@ ckpt_path = p3_ckpt if p3_ckpt.exists() else p2_ckpt
 model, *_ = InterveneGPT.load(ckpt_path, embedder=embedder_model)
 model.eval()
 
-# Generate risk curves — one row per generated step, P_<outcome> columns per complication
-risk_df = generate(model, dataset_input, max_len=500, temperature=1.0, rep_decay=0.6,
-                   collect_risk_scores=True)
+# Generate risk curves — one row per generated step, P_<outcome> columns per complication.
+# Default `max_duration_hours=336.0` caps each trajectory at 14 days; `collect_risk_scores`
+# defaults to False (faster) so pass True to read the outcome head per step.
+risk_df = generate(model, dataset_input, max_duration_hours=336.0, max_len=500,
+                   temperature=1.0, rep_decay=0.6, collect_risk_scores=True)
 
 # Raw event stream only (no risk scores, faster)
-event_df = generate(model, dataset_input, max_len=500, temperature=1.0, rep_decay=0.6)
+event_df = generate(model, dataset_input, max_duration_hours=336.0, max_len=500,
+                    temperature=1.0, rep_decay=0.6)
 ```
 
 The returned `risk_df` has columns `{PatientId, Step, Token, IsInput, IsOutcome, IsTerminal, TimePoint, P_<outcome_name>, ...}`.
@@ -216,6 +221,7 @@ Remove-Item -Recurse -Force .\intervene_ar_temp
 
 ## 🔄 End-to-End Workflow
 
+```text
 Raw EMR Tables
 │
 ▼
@@ -233,6 +239,7 @@ Per-patient Event Tokenization (with normalized absolute timestamps)
 │
 ▼
 → Predict next medical events (token + time) and read complication risk curves from the outcome head (in `evaluation.ipynb`)
+```
 
 ---
 
@@ -265,10 +272,10 @@ Medical data varies in density and structure across patients. This dynamic prepr
 ⚙️ **Phase 1: Learning Events Representation**  
 Phase 1 learns a robust, patient-aware representation of their event sequences. It isolates the core structure of patient timelines without being confounded by the autoregressive depth of Transformers.
 The embedder uses:
-- 4 levels of tokens - The event token is seperated to 4 hierarichal components to impose similarity between tokens of the same domain: `GLUCOSE` -> `GLUCOSE_TREND` -> `GLUCOSE_TREND_Inc` -> `GLUCOSE_TREND_Inc_START`
+- 4 levels of token components - The event token is split into 4 hierarchical components to impose similarity between tokens of the same domain: `GLUCOSE` -> `GLUCOSE_TREND` -> `GLUCOSE_TREND_Inc` -> `GLUCOSE_TREND_Inc_START`
 - 1 level of time - ABS T from ADMISSION, to understand global patterns and relationships between non sequential events.
 
-This architecture constructs event representations by concatenating five hierarchical levels: Raw Concept, Concept, Value, Position, and Absolute Time. This creates a dense vector that captures the intrinsic hierarchy of medical concepts (e.g., Glucose_High is a child of Glucose) while explicitly binding them to their timestamp.
+This architecture constructs event representations by concatenating these five hierarchical levels: Raw Concept, Concept, Value, Position, and Absolute Time. This creates a dense vector that captures the intrinsic hierarchy of medical concepts (e.g., Glucose_High is a child of Glucose) while explicitly binding them to their timestamp.
 
 We choose concatenation (Early Fusion) for the temporal component-unlike the standard additive approach to preserve the integrity of the medical signal. By keeping the time dimensions separate from the concept dimensions in the input, the model can clearly distinguish the "what" from the "when". This ensures that the core identity of a pathology (e.g., Hyperglycemia) remains stable and recognizable ("Hyperglycemia is Hyperglycemia") regardless of its timing, while allowing the projection layer to learn how time modifies its clinical significance (e.g., Morning vs. Evening).
 
