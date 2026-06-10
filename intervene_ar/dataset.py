@@ -219,7 +219,7 @@ class DataProcessor:
         admission = self._patient_admission_time.rename("AdmissionTime").reset_index()
 
         qa_history_hours = (
-            float(self.max_input_days) * 24.0 if self.max_input_days else float(QA_HISTORY_HOURS_DEFAULT)
+            float(self.max_input_days) * 24.0 if self.max_input_days else float(OBSERVATION_WINDOW_HOURS)
         )
 
         qa = qa.merge(admission, on="PatientId", how="inner")
@@ -759,12 +759,21 @@ class EMRTokenizer:
         outcome_weights = torch.ones(len(token2id), dtype=torch.float32)
         all_outcomes = list(set(OUTCOMES + TERMINAL_OUTCOMES))
 
+        # Outcome support is measured only in the POST-observation portion of each
+        # hospitalization. The model is seeded with [0, OBSERVATION_WINDOW_HOURS] and
+        # asked to predict what happens after, so an outcome that fires only inside
+        # the seed window contributes no learnable signal to the outcome head.
+        # Denominator stays as full patient count (patients with no post-window events
+        # count as negatives).
         total_patients = df['PatientId'].nunique()
-        patient_tokens = df.groupby("PatientId")["PositionToken"].apply(set)
+        post_obs_df = df[df["TimePoint"] > OBSERVATION_WINDOW_HOURS]
+        patient_tokens = post_obs_df.groupby("PatientId")["PositionToken"].apply(set)
 
         # outcome_patient_ratios: name → prevalence ratio for outcomes that meet the threshold.
         # Keys of this dict are the canonical valid outcome list used by the InterveneGPT outcome head.
-        # Outcomes below the threshold are dropped here, printed, and excluded from the head.
+        # Outcomes below the threshold are demoted to regular LM tokens — they stay in
+        # token2id (so the backbone still sees and predicts them) but are excluded from
+        # the outcome head, CBM-forbid protection, and sampler upweighting.
         outcome_patient_ratios = {}
         dropped_outcomes = []
         for out_tok in all_outcomes:

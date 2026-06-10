@@ -11,25 +11,31 @@ TEST_TEMPORAL_DATA_FILE  = os.path.join(PROJECT_ROOT, 'data', 'test', 'temporal_
 TEST_CTX_DATA_FILE       = os.path.join(PROJECT_ROOT, 'data', 'test', 'context_data.csv')
 QA_DATA_FILE             = os.path.join(PROJECT_ROOT, 'data', 'source', 'qa_data.csv')
 
-# Define the prediction targets, <bot>, <eot> tokens to terminate the inference.
-# Outcome-snip (16 -> 11 head targets): five outcomes that never achieved
-# above-prevalence discrimination under any recipe across the P-/I-sequences
-# were removed as outcome-head targets — HYPEROSMOLALITY_EVENT, INFECTION_EVENT,
-# ACIDOSIS_EVENT, ATHEROSCLEROSIS_EVENT, ACUTE_RESPIRATORY_DISORDER_EVENT. Their
-# tokens REMAIN in the LM vocabulary (the tokenizer is built from training data,
-# not from this list), so their occurrences still shape backbone context; they
-# simply stop being head-BCE targets, CBM-forbid-protected, and sampler-upweighted.
+# Prediction targets = canonical "Complications" event family from the TAK repo
+# (Mediator/core/knowledge-base). The single source of truth is the TAK repo:
+# every TAK with family=='event' and category=='Complications' is listed here.
+# Outcomes that fail the OUTCOME_RARE_THRESHOLD_PCT prevalence check on the
+# post-observation window are demoted to regular LM tokens — they stay in the
+# tokenizer vocab (so the backbone still sees and next-token-predicts them),
+# they just stop being outcome-head targets / CBM-forbid-protected / sampler-
+# upweighted. DEATH_EVENT also appears in TERMINAL_OUTCOMES; listing it here
+# is harmless (set-union dedups it inside the tokenizer).
 OUTCOMES = [
-    "DISGLYCEMIA_EVENT_Hyperglycemia",
-    "DISGLYCEMIA_EVENT_Hypoglycemia",
-    "HYPEROSMOLALITY_EVENT",
-    "CARDIO-VASCULAR_DISORDER_EVENT",
-    "KIDNEY_COMPLICATION_EVENT",
-    "KETOACIDOSIS_EVENT",
     "ACIDOSIS_EVENT",
+    "ACUTE_RESPIRATORY_DISORDER_EVENT",
+    "CARDIO-VASCULAR_DISORDER_EVENT",
+    "DEATH_EVENT",
+    "DIABETIC_COMA_EVENT",
+    "HYPERGLYCEMIA_EVENT",
+    "HYPEROSMOLALITY_EVENT",
+    "HYPOGLYCEMIA_EVENT",
+    "INFECTION_EVENT",
+    "KETOACIDOSIS_EVENT",
+    "KIDNEY_COMPLICATION_EVENT",
+    "OTHER_COMPLICATION_EVENT",
+    "SEVERE_HYPERGLYCEMIA_EVENT",
+    "SEVERE_HYPOGLYCEMIA_EVENT",
 ]
-# Note: prediction targets are different from thesis dataset (Kinneret) due to different available prediction targets
-# KETOACIDOSIS_EVENT and ACIDOSIS_EVENT are available in the data, but low support will auto-reduct them (OUTCOME_RARE_THRESHOLD_PCT)
 
 ADMISSION_TOKEN = "ADMISSION_EVENT"
 DEATH_TOKEN = "DEATH_EVENT"
@@ -44,10 +50,12 @@ MEAL_TOKENS = ["MEAL_CONTEXT_Breakfast", "MEAL_CONTEXT_Lunch", "MEAL_CONTEXT_Din
 OUTCOME_RARE_THRESHOLD_PCT = 1.0
 
 USE_QA_DATA = False  # Phase D/E done; best model is M-256 non-QA
-# History window (hours from admission) used when aggregating QA ComplianceScore into
-# context features. At eval time DataProcessor overrides this with max_input_days * 24
-# so QA features match the k-day seed actually given to the model.
-QA_HISTORY_HOURS_DEFAULT = 48
+# Observation window (hours from admission) the model is seeded with. Same window is
+# used to (a) aggregate QA ComplianceScore into context features and (b) define the
+# "post-observation" range over which outcome support is measured for rare-outcome
+# demotion. At eval time DataProcessor overrides this with max_input_days * 24 so
+# QA features match the k-day seed actually given to the model.
+OBSERVATION_WINDOW_HOURS = 48
 
 # inclusion/exclusion criteria to filter all datasets.
 # %_PATTERN% events carry treatment-quality signal — keep them only when QA features
